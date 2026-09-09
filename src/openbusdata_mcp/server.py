@@ -459,8 +459,16 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
 
         try:
             z = zipfile.ZipFile(io.BytesIO(zip_resp.content))
+            xml_files = [n for n in z.namelist() if n.endswith(".xml")]
+            contents = [z.read(n).decode("utf-8", errors="ignore") for n in xml_files]
         except zipfile.BadZipFile:
-            return meta
+            # Some BODS datasets publish a bare TransXChange XML document
+            # instead of a zip container.
+            head = zip_resp.content[:200].lstrip()
+            if head.startswith(b"<?xml") or b"<TransXChange" in head:
+                contents = [zip_resp.content.decode("utf-8", errors="ignore")]
+            else:
+                return meta
 
         already = ds_id in writer.loaded_ids()
         if already and not force_reload:
@@ -470,12 +478,7 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
             writer.discard_dataset(ds_id)
         writer.ensure_schema()
 
-        xml_files = [n for n in z.namelist() if n.endswith(".xml")]
-        for fname in xml_files:
-            try:
-                content = z.read(fname).decode("utf-8", errors="ignore")
-            except Exception:
-                continue
+        for content in contents:
             stops, routes, journeys = parse_transxchange(content, operator)
             for stop in stops:
                 writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
