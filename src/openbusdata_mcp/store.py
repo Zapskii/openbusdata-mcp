@@ -418,9 +418,18 @@ class TimetableWriter:
 
     def add_journey(self, op: str, num: str, direction: str, code: str,
                     days: set, stops: list, ds_id: int):
+        from datetime import time as _t
+        norm = []
+        for st in stops:
+            st = dict(st)
+            for k in ("arrival", "departure"):
+                v = st.get(k)
+                if isinstance(v, _t):
+                    st[k] = v.isoformat()
+            norm.append(st)
         j = {"operator": op, "route_num": num, "direction": direction,
              "journey_code": code, "dataset_id": ds_id,
-             "days": sorted(days), "stops": stops}
+             "days": sorted(days), "stops": norm}
         self.conn.execute(
             "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
             "VALUES (?,?,?,?,?,?,?)",
