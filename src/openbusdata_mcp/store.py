@@ -334,6 +334,7 @@ class TimetableWriter:
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT);
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
+        CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
         """)
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
