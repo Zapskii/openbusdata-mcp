@@ -22,6 +22,7 @@ from typing import Any, Optional
 from urllib.parse import urljoin, urlencode
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, time, timezone
+from .store import TimetableStore, TimetableWriter
 from collections import defaultdict
 
 import httpx
@@ -221,6 +222,8 @@ class TimetableIndex:
 
 # Global index
 index = TimetableIndex()
+store = TimetableStore()
+writer = TimetableWriter()
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +436,7 @@ async def load_dataset(ds_id: int) -> dict:
     changed dataset goes through load_timetable_delta, which calls
     _load_dataset(force_reload=True) directly.
     """
-    if ds_id in index.loaded_datasets:
+    if ds_id in writer.loaded_ids():
         return {}
     return await _load_dataset(ds_id)
 
@@ -459,8 +462,13 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
         except zipfile.BadZipFile:
             return meta
 
+        already = ds_id in writer.loaded_ids()
+        if already and not force_reload:
+            return meta
+
         if force_reload:
-            index.discard_dataset(ds_id)
+            writer.discard_dataset(ds_id)
+        writer.ensure_schema()
 
         xml_files = [n for n in z.namelist() if n.endswith(".xml")]
         for fname in xml_files:
@@ -470,34 +478,32 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
                 continue
             stops, routes, journeys = parse_transxchange(content, operator)
             for stop in stops:
-                index.add_stop(stop)
+                writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
             for route in routes:
-                index.add_route(route)
+                # Legacy (untagged) journeys for this op+route are superseded
+                # by this tagged write.
+                writer.discard_untagged_for(route.operator, route.route_num)
+                writer.upsert_route(route.operator, route.route_num,
+                                    route.directions, route.stops, ds_id)
             for journey in journeys:
-                journey.dataset_id = ds_id
-                index.add_journey(journey)
+                writer.add_journey(
+                    journey.operator, journey.route_num, journey.direction,
+                    journey.journey_code, journey.days,
+                    [asdict(s) for s in journey.stops], ds_id)
 
-        index.loaded_datasets.add(ds_id)
-        index.dataset_meta[ds_id] = {
-            "modified": meta.get("modified"),
-            "operator": operator,
-        }
+        writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
+        writer.commit()  # one transaction per dataset: implicit checkpoint
         return meta
 
 
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
-    """Load all accessible timetable datasets and build indexes.
+    """Load all accessible timetable datasets into the SQLite index.
 
-    Resumes from a partial/complete cache: already-loaded datasets are
-    skipped, datasets withdrawn from the catalogue are purged, and progress
-    is checkpointed to disk every 100 datasets so an interrupted load
-    continues where it left off instead of restarting from zero.
+    Memory-flat (one XML file in RAM at a time) and resumable: each dataset
+    commits as its own transaction, so an interrupted load continues where
+    it left off. Datasets withdrawn from the catalogue are purged.
     """
-    if not force_refresh:
-        index.load_cache()
-
-    if force_refresh:
-        index.clear()
+    writer.ensure_schema()
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         all_ids: list[int] = []
@@ -520,14 +526,14 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     # Reconcile: purge datasets that disappeared from the catalogue.
     if not force_refresh and all_ids:
         known = set(all_ids)
-        for ds_id in [i for i in index.loaded_datasets if i not in known]:
-            index.discard_dataset(ds_id)
+        for ds_id in [i for i in writer.loaded_ids() if i not in known]:
+            writer.discard_dataset(ds_id)
 
     loaded = 0
     skipped = 0
     errors = 0
     for ds_id in all_ids:
-        if ds_id in index.loaded_datasets:
+        if ds_id in writer.loaded_ids():
             skipped += 1
             continue
         try:
@@ -535,13 +541,13 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             loaded += 1
         except Exception:
             errors += 1
-        if loaded % 100 == 0:
-            index.save_cache()  # checkpoint: partial progress survives a restart
+        # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
-    index.last_refresh = datetime.now(timezone.utc).isoformat()
-    index.save_cache()
+    writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
+    writer.commit()
+    j, s, r, d = writer.counts()
     return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
-            f"Total: {len(index.stops)} stops, {len(index.routes)} routes, {len(index.journeys)} journeys.")
+            f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets.")
 
 
 def _parse_bods_ts(value: Optional[str]) -> Optional[datetime]:
@@ -563,22 +569,20 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
       - re-downloads only datasets whose `modified` timestamp is newer than
         the reference time (default: the last successful refresh watermark),
         replacing their previous entries in place;
-      - purges datasets withdrawn from the catalogue (reconcile=true);
-      - checkpoints to disk as it goes.
+      - purges datasets withdrawn from the catalogue (reconcile=true).
 
     Falls back to a full load when no watermark exists (first ever run).
     Typical weekly delta touches ~15-20% of the catalogue, so minutes
     instead of hours.
     """
-    if not index.loaded_datasets:
-        index.load_cache()
-    if not index.loaded_datasets:
+    writer.ensure_schema()
+    if not writer.loaded_ids():
         # Nothing cached yet: a delta has nothing to diff against.
         return "No cached index yet - running full load first.\n" + await load_all_timetable_data()
 
     reference = (
         _parse_bods_ts(since)
-        or _parse_bods_ts(index.last_refresh)
+        or _parse_bods_ts(writer.last_refresh())
     )
     if reference is None:
         return ("No valid reference timestamp (pass since=YYYY-MM-DDTHH:MM:SS or complete a full "
@@ -611,8 +615,8 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     purged = 0
     errors = 0
     if reconcile:
-        for ds_id in [i for i in index.loaded_datasets if i not in catalog]:
-            index.discard_dataset(ds_id)
+        for ds_id in [i for i in writer.loaded_ids() if i not in catalog]:
+            writer.discard_dataset(ds_id)
             purged += 1
 
     for ds_id, entry in catalog.items():
@@ -624,16 +628,14 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                 updated += 1
             except Exception:
                 errors += 1
-            if updated % 100 == 0:
-                index.save_cache()
 
     if errors == 0:
-        index.last_refresh = sweep_start.isoformat()
-    index.save_cache()
+        writer.set_last_refresh(sweep_start.isoformat())
+        writer.commit()
+    j, s, r, d = writer.counts()
     return (f"Delta update: {updated} refreshed, {purged} purged, {errors} errors "
             f"(reference: {reference.isoformat()}). "
-            f"Total: {len(index.stops)} stops, {len(index.routes)} routes, "
-            f"{len(index.journeys)} journeys."
+            f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
             + ("" if errors == 0 else " Watermark NOT advanced - re-run to retry the failures."))
 
 
@@ -782,18 +784,12 @@ async def search_stops(query: str) -> str:
     Parameters:
       query: Substring to search for in stop names (case-insensitive).
     """
-    if not index.stops:
-        if not index.load_cache():
-            return "No timetable data loaded. Please call load_timetable_index() first."
-    query_lower = query.lower()
-    matches = []
-    for naptan, stop in index.stops.items():
-        if query_lower in stop.name.lower():
-            matches.append({"naptan": naptan, "name": stop.name})
-    matches.sort(key=lambda x: x["name"])
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    matches = store.search_stops(query)
     if not matches:
         return f'No stops found matching "{query}".'
-    return json.dumps(matches[:50], indent=2, ensure_ascii=False)
+    return json.dumps(matches, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -806,38 +802,16 @@ async def find_routes_between_stops(stop_a: str, stop_b: str) -> str:
       stop_a: First stop (NaPTAN code or name substring).
       stop_b: Second stop (NaPTAN code or name substring).
     """
-    if not index.stops:
-        if not index.load_cache():
-            return "No timetable data loaded. Please call load_timetable_index() first."
-    naptans_a = _resolve_stop(stop_a)
-    naptans_b = _resolve_stop(stop_b)
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    naptans_a = store.resolve_stop(stop_a)
+    naptans_b = store.resolve_stop(stop_b)
     if not naptans_a:
         return f'Could not resolve stop_a: "{stop_a}". Try search_stops().'
     if not naptans_b:
         return f'Could not resolve stop_b: "{stop_b}". Try search_stops().'
 
-    results = []
-    seen = set()
-    for na in naptans_a:
-        for nb in naptans_b:
-            routes_a = index.stop_to_routes.get(na, set())
-            routes_b = index.stop_to_routes.get(nb, set())
-            for route_key in routes_a & routes_b:
-                if route_key in seen:
-                    continue
-                seen.add(route_key)
-                route = index.routes[route_key]
-                try:
-                    idx_a = [i for i, s in enumerate(route.stops) if s in naptans_a][0]
-                    idx_b = [i for i, s in enumerate(route.stops) if s in naptans_b][0]
-                    direction = "A->B" if idx_a < idx_b else "B->A"
-                except IndexError:
-                    direction = "unknown"
-                results.append({
-                    "operator": route.operator, "route": route.route_num,
-                    "directions": sorted(route.directions), "stop_order": direction,
-                })
-    results.sort(key=lambda x: (x["operator"], x["route"]))
+    results = store.find_routes_between(naptans_a, naptans_b)
     return json.dumps(results, indent=2, ensure_ascii=False) if results else f"No single route serves both '{stop_a}' and '{stop_b}'."
 
 
@@ -851,17 +825,9 @@ async def get_route_stops(operator: str, route: str, direction: Optional[str] = 
       route: Route number/identifier.
       direction: Optional filter: 'inbound', 'outbound', or leave blank for all.
     """
-    if not index.routes:
-        if not index.load_cache():
-            return "No timetable data loaded. Please call load_timetable_index() first."
-    matches = []
-    for key, r in index.routes.items():
-        if route.lower() in r.route_num.lower() and operator.lower() in r.operator.lower():
-            if direction and direction.lower() not in [d.lower() for d in r.directions]:
-                continue
-            stop_names = [{"naptan": n, "name": index.stops.get(n, Stop(n, "Unknown")).name} for n in r.stops]
-            matches.append({"operator": r.operator, "route": r.route_num,
-                            "directions": sorted(r.directions), "stops": stop_names})
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    matches = store.get_route_stops(operator, route, direction)
     return json.dumps(matches, indent=2, ensure_ascii=False) if matches else f"No route found."
 
 
@@ -876,12 +842,11 @@ async def find_buses_by_arrival_time(stop_a: str, stop_b: str, arrive_by: str, d
       arrive_by: Target arrival time (HH:MM, 24h format).
       day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
     """
-    if not index.journeys:
-        if not index.load_cache():
-            return "No timetable data loaded. Please call load_timetable_index() first."
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
 
-    naptans_a = _resolve_stop(stop_a)
-    naptans_b = _resolve_stop(stop_b)
+    naptans_a = store.resolve_stop(stop_a)
+    naptans_b = store.resolve_stop(stop_b)
     if not naptans_a:
         return f'Could not resolve stop_a: "{stop_a}". Try search_stops().'
     if not naptans_b:
@@ -895,43 +860,8 @@ async def find_buses_by_arrival_time(stop_a: str, stop_b: str, arrive_by: str, d
         day = datetime.now().strftime("%a").lower()
     day = day.lower()[:3]
 
-    results = []
-    for journey in index.journeys:
-        if day not in journey.days:
-            continue
-
-        # Find stop indices
-        idx_a = None
-        idx_b = None
-        for i, js in enumerate(journey.stops):
-            if js.naptan in naptans_a:
-                idx_a = i
-            if js.naptan in naptans_b:
-                idx_b = i
-
-        if idx_a is None or idx_b is None or idx_a >= idx_b:
-            continue
-
-        arrival_at_b = journey.stops[idx_b].arrival
-        departure_from_a = journey.stops[idx_a].departure
-
-        if arrival_at_b is None:
-            continue
-
-        if arrival_at_b <= target_time:
-            results.append({
-                "operator": journey.operator,
-                "route": journey.route_num,
-                "direction": journey.direction,
-                "journey_code": journey.journey_code,
-                "board_at": index.stops.get(journey.stops[idx_a].naptan, Stop("", "Unknown")).name,
-                "depart": departure_from_a.isoformat() if departure_from_a else None,
-                "alight_at": index.stops.get(journey.stops[idx_b].naptan, Stop("", "Unknown")).name,
-                "arrive": arrival_at_b.isoformat(),
-            })
-
-    results.sort(key=lambda x: x["arrive"] or "")
-    return json.dumps(results[:20], indent=2, ensure_ascii=False) if results else f"No buses found arriving at '{stop_b}' by {arrive_by} on {day}."
+    results = store.find_buses_by_arrival_time(naptans_a, naptans_b, arrive_by, day)
+    return json.dumps(results, indent=2, ensure_ascii=False) if results else f"No buses found arriving at '{stop_b}' by {arrive_by} on {day}."
 
 
 @mcp.tool()
@@ -947,12 +877,11 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
       day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
       max_changes: Maximum number of bus changes (0 = direct only, 1 = one change). Default 1.
     """
-    if not index.journeys:
-        if not index.load_cache():
-            return "No timetable data loaded. Please call load_timetable_index() first."
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
 
-    naptans_a = _resolve_stop(stop_a)
-    naptans_b = _resolve_stop(stop_b)
+    naptans_a = store.resolve_stop(stop_a)
+    naptans_b = store.resolve_stop(stop_b)
     if not naptans_a:
         return f'Could not resolve stop_a: "{stop_a}". Try search_stops().'
     if not naptans_b:
@@ -965,99 +894,11 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
     if day is None:
         day = datetime.now().strftime("%a").lower()
     day = day.lower()[:3]
+    target_s = target_time.isoformat()
 
-    plans = []
-
-    # --- Direct journeys ---
-    for journey in index.journeys:
-        if day not in journey.days:
-            continue
-        idx_a = next((i for i, s in enumerate(journey.stops) if s.naptan in naptans_a), None)
-        idx_b = next((i for i, s in enumerate(journey.stops) if s.naptan in naptans_b), None)
-        if idx_a is None or idx_b is None or idx_a >= idx_b:
-            continue
-        arrival_at_b = journey.stops[idx_b].arrival
-        if arrival_at_b and arrival_at_b <= target_time:
-            plans.append({
-                "type": "direct",
-                "legs": [{
-                    "operator": journey.operator,
-                    "route": journey.route_num,
-                    "board": index.stops.get(journey.stops[idx_a].naptan, Stop("", "Unknown")).name,
-                    "depart": journey.stops[idx_a].departure.isoformat() if journey.stops[idx_a].departure else None,
-                    "alight": index.stops.get(journey.stops[idx_b].naptan, Stop("", "Unknown")).name,
-                    "arrive": arrival_at_b.isoformat(),
-                }],
-                "total_changes": 0,
-            })
-
+    plans = store.plan_direct(naptans_a, naptans_b, day, target_s)
     if max_changes >= 1:
-        # --- Single change ---
-        # Group journeys by the stops they serve for fast lookup
-        for j1 in index.journeys:
-            if day not in j1.days:
-                continue
-            idx_a1 = next((i for i, s in enumerate(j1.stops) if s.naptan in naptans_a), None)
-            if idx_a1 is None:
-                continue
-            arr_a1 = j1.stops[idx_a1].arrival or j1.stops[idx_a1].departure
-            if arr_a1 is None:
-                continue
-
-            # Every stop after A on j1 is a potential change point
-            for mid_idx in range(idx_a1 + 1, len(j1.stops)):
-                mid_naptan = j1.stops[mid_idx].naptan
-                mid_arrival = j1.stops[mid_idx].arrival
-                if mid_arrival is None:
-                    continue
-
-                # Find j2 that departs from mid_naptan and goes to B
-                for j2 in index.journeys:
-                    if day not in j2.days:
-                        continue
-                    if j2.operator == j1.operator and j2.route_num == j1.route_num and j2.direction == j1.direction:
-                        continue  # Same journey
-
-                    idx_mid2 = next((i for i, s in enumerate(j2.stops) if s.naptan == mid_naptan), None)
-                    idx_b2 = next((i for i, s in enumerate(j2.stops) if s.naptan in naptans_b), None)
-                    if idx_mid2 is None or idx_b2 is None or idx_mid2 >= idx_b2:
-                        continue
-
-                    dep_mid2 = j2.stops[idx_mid2].departure or j2.stops[idx_mid2].arrival
-                    arr_b2 = j2.stops[idx_b2].arrival
-                    if dep_mid2 is None or arr_b2 is None:
-                        continue
-
-                    # Connection time: must depart mid after arriving there
-                    if dep_mid2 < mid_arrival:
-                        continue
-
-                    # Must arrive at B by target
-                    if arr_b2 > target_time:
-                        continue
-
-                    plans.append({
-                        "type": "change",
-                        "legs": [
-                            {
-                                "operator": j1.operator,
-                                "route": j1.route_num,
-                                "board": index.stops.get(j1.stops[idx_a1].naptan, Stop("", "Unknown")).name,
-                                "depart": j1.stops[idx_a1].departure.isoformat() if j1.stops[idx_a1].departure else None,
-                                "alight": index.stops.get(mid_naptan, Stop("", "Unknown")).name,
-                                "arrive": mid_arrival.isoformat(),
-                            },
-                            {
-                                "operator": j2.operator,
-                                "route": j2.route_num,
-                                "board": index.stops.get(mid_naptan, Stop("", "Unknown")).name,
-                                "depart": dep_mid2.isoformat(),
-                                "alight": index.stops.get(j2.stops[idx_b2].naptan, Stop("", "Unknown")).name,
-                                "arrive": arr_b2.isoformat(),
-                            },
-                        ],
-                        "total_changes": 1,
-                    })
+        plans.extend(store.plan_one_change(naptans_a, naptans_b, day, target_s))
 
     # Deduplicate by journey codes
     seen = set()
@@ -1117,7 +958,9 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 def _resolve_stop(stop_query: str) -> set[str]:
-    """Resolve a stop query to a set of NaPTAN codes."""
+    """Resolve a stop query to a set of NaPTAN codes (SQLite-backed)."""
+    if store.exists():
+        return store.resolve_stop(stop_query)
     if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
         return {stop_query}
     query_lower = stop_query.lower()
@@ -1135,10 +978,12 @@ specs = load_specs()
 if specs:
     register_tools_from_specs(specs)
 
-if index.load_cache():
-    print(f"[OpenBusData MCP] Loaded timetable cache: {len(index.stops)} stops, {len(index.routes)} routes, {len(index.journeys)} journeys from {len(index.loaded_datasets)} datasets.", file=sys.stderr)
+writer.ensure_schema()
+_j, _s, _r, _d = writer.counts()
+if _d:
+    print(f"[OpenBusData MCP] SQLite index ready: {_s} stops, {_r} routes, {_j} journeys from {_d} datasets.", file=sys.stderr)
 else:
-    print("[OpenBusData MCP] No timetable cache found. Call load_timetable_index() to download and parse all timetable data.", file=sys.stderr)
+    print("[OpenBusData MCP] No timetable index yet. Call load_timetable_index() to download and parse all timetable data.", file=sys.stderr)
 
 
 def main():
