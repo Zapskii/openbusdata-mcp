@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin, urlencode
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from collections import defaultdict
 
 import httpx
@@ -47,7 +47,7 @@ mcp = FastMCP("openbusdata")
 # ---------------------------------------------------------------------------
 # Data structures for timetable parsing
 # ---------------------------------------------------------------------------
-@dataclass
+@dataclass(slots=True)
 class Stop:
     naptan: str
     name: str
@@ -55,7 +55,7 @@ class Stop:
     lon: Optional[float] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Route:
     operator: str
     route_num: str
@@ -63,14 +63,14 @@ class Route:
     stops: list = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class JourneyStop:
     naptan: str
     arrival: Optional[time] = None
     departure: Optional[time] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Journey:
     operator: str
     route_num: str
@@ -78,6 +78,7 @@ class Journey:
     journey_code: str
     stops: list[JourneyStop] = field(default_factory=list)
     days: set[str] = field(default_factory=set)  # mon, tue, wed, thu, fri, sat, sun
+    dataset_id: int = 0  # BODS dataset this journey came from (enables surgical purge)
 
 
 class TimetableIndex:
@@ -89,6 +90,12 @@ class TimetableIndex:
         self.stop_to_routes: dict[str, set[str]] = {}
         self.journeys: list[Journey] = []
         self.loaded_datasets: set[int] = set()
+        # Per-dataset provenance for incremental (diff) refreshes:
+        #   ds_id -> {"modified": "2026-09-01T06:00:00Z", "operator": "..."}
+        self.dataset_meta: dict[int, dict] = {}
+        # Timestamp of the last completed catalogue sweep (ISO, UTC). Delta loads
+        # use it as the "since" watermark.
+        self.last_refresh: Optional[str] = None
 
     def add_stop(self, stop: Stop):
         if stop.naptan not in self.stops:
@@ -128,6 +135,7 @@ class TimetableIndex:
                     "route_num": j.route_num,
                     "direction": j.direction,
                     "journey_code": j.journey_code,
+                    "dataset_id": j.dataset_id,
                     "stops": [
                         {"naptan": s.naptan,
                          "arrival": s.arrival.isoformat() if s.arrival else None,
@@ -139,9 +147,11 @@ class TimetableIndex:
                 for j in self.journeys
             ],
             "loaded_datasets": list(self.loaded_datasets),
+            "dataset_meta": self.dataset_meta,
+            "last_refresh": self.last_refresh,
         }
         with open(CACHE_DIR / "timetable_cache.json", "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
+            json.dump(cache, f)
 
     def load_cache(self) -> bool:
         cache_file = CACHE_DIR / "timetable_cache.json"
@@ -158,6 +168,8 @@ class TimetableIndex:
             }
             self.stop_to_routes = {k: set(v) for k, v in cache.get("stop_to_routes", {}).items()}
             self.loaded_datasets = set(cache.get("loaded_datasets", []))
+            self.dataset_meta = {int(k): v for k, v in cache.get("dataset_meta", {}).items()}
+            self.last_refresh = cache.get("last_refresh")
             self.journeys = []
             for j in cache.get("journeys", []):
                 stops = []
@@ -168,7 +180,8 @@ class TimetableIndex:
                 self.journeys.append(Journey(
                     operator=j["operator"], route_num=j["route_num"],
                     direction=j["direction"], journey_code=j["journey_code"],
-                    stops=stops, days=set(j.get("days", []))
+                    stops=stops, days=set(j.get("days", [])),
+                    dataset_id=int(j.get("dataset_id", 0)),
                 ))
             return True
         except Exception as e:
@@ -181,6 +194,29 @@ class TimetableIndex:
         self.stop_to_routes.clear()
         self.journeys.clear()
         self.loaded_datasets.clear()
+        self.dataset_meta.clear()
+        self.last_refresh = None
+
+    def discard_dataset(self, ds_id: int):
+        """Remove all index entries contributed by a single dataset.
+
+        Journeys are tagged with their source dataset, so they purge exactly.
+        stop_to_routes is rebuilt from surviving journeys. Route *data* entries
+        are left in place: they are merged state across datasets and
+        self-heal when a replacement dataset is re-downloaded (add_route keeps
+        the longest stop sequence). A route left behind by a withdrawn
+        dataset is undiscoverable (no stop_to_routes ref) and is fully
+        removed by the next force_refresh / reconcile rebuild.
+        """
+        self.loaded_datasets.discard(ds_id)
+        self.dataset_meta.pop(ds_id, None)
+        self.journeys = [j for j in self.journeys if j.dataset_id != ds_id]
+        remaining_route_keys: set[str] = {f"{j.operator}|{j.route_num}" for j in self.journeys}
+        self.stop_to_routes = {
+            k: routes & remaining_route_keys
+            for k, routes in self.stop_to_routes.items()
+            if routes & remaining_route_keys
+        }
 
 
 # Global index
@@ -391,10 +427,18 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 # Dataset loading
 # ---------------------------------------------------------------------------
 async def load_dataset(ds_id: int) -> dict:
-    """Download and parse a single timetable dataset. Returns metadata."""
+    """Download and parse a single timetable dataset. Returns metadata.
+
+    No-op when the dataset is already loaded (resume semantics); updating a
+    changed dataset goes through load_timetable_delta, which calls
+    _load_dataset(force_reload=True) directly.
+    """
     if ds_id in index.loaded_datasets:
         return {}
+    return await _load_dataset(ds_id)
 
+
+async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         meta_resp = await client.get(f"{BASE_URL}/api/v1/dataset/{ds_id}/?api_key={API_KEY}")
         if meta_resp.status_code != 200:
@@ -415,6 +459,9 @@ async def load_dataset(ds_id: int) -> dict:
         except zipfile.BadZipFile:
             return meta
 
+        if force_reload:
+            index.discard_dataset(ds_id)
+
         xml_files = [n for n in z.namelist() if n.endswith(".xml")]
         for fname in xml_files:
             try:
@@ -427,17 +474,27 @@ async def load_dataset(ds_id: int) -> dict:
             for route in routes:
                 index.add_route(route)
             for journey in journeys:
+                journey.dataset_id = ds_id
                 index.add_journey(journey)
 
         index.loaded_datasets.add(ds_id)
+        index.dataset_meta[ds_id] = {
+            "modified": meta.get("modified"),
+            "operator": operator,
+        }
         return meta
 
 
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
-    """Load all accessible timetable datasets and build indexes."""
-    if not force_refresh and index.load_cache():
-        return (f"Loaded {len(index.loaded_datasets)} datasets from cache "
-                f"({len(index.stops)} stops, {len(index.routes)} routes, {len(index.journeys)} journeys).")
+    """Load all accessible timetable datasets and build indexes.
+
+    Resumes from a partial/complete cache: already-loaded datasets are
+    skipped, datasets withdrawn from the catalogue are purged, and progress
+    is checkpointed to disk every 100 datasets so an interrupted load
+    continues where it left off instead of restarting from zero.
+    """
+    if not force_refresh:
+        index.load_cache()
 
     if force_refresh:
         index.clear()
@@ -460,18 +517,124 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
                 break
             offset += limit
 
+    # Reconcile: purge datasets that disappeared from the catalogue.
+    if not force_refresh and all_ids:
+        known = set(all_ids)
+        for ds_id in [i for i in index.loaded_datasets if i not in known]:
+            index.discard_dataset(ds_id)
+
     loaded = 0
+    skipped = 0
     errors = 0
     for ds_id in all_ids:
+        if ds_id in index.loaded_datasets:
+            skipped += 1
+            continue
         try:
             await load_dataset(ds_id)
             loaded += 1
         except Exception:
             errors += 1
+        if loaded % 100 == 0:
+            index.save_cache()  # checkpoint: partial progress survives a restart
 
+    index.last_refresh = datetime.now(timezone.utc).isoformat()
     index.save_cache()
-    return (f"Loaded {loaded} datasets ({errors} errors). "
+    return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
             f"Total: {len(index.stops)} stops, {len(index.routes)} routes, {len(index.journeys)} journeys.")
+
+
+def _parse_bods_ts(value: Optional[str]) -> Optional[datetime]:
+    """Parse a BODS modified timestamp (ISO 8601 with offset). None on failure."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
+    """Incrementally refresh the timetable index using the catalogue's
+    modifiedDate filter (a diff update instead of a full re-download).
+
+    One catalogue sweep, then:
+      - re-downloads only datasets whose `modified` timestamp is newer than
+        the reference time (default: the last successful refresh watermark),
+        replacing their previous entries in place;
+      - purges datasets withdrawn from the catalogue (reconcile=true);
+      - checkpoints to disk as it goes.
+
+    Falls back to a full load when no watermark exists (first ever run).
+    Typical weekly delta touches ~15-20% of the catalogue, so minutes
+    instead of hours.
+    """
+    if not index.loaded_datasets:
+        index.load_cache()
+    if not index.loaded_datasets:
+        # Nothing cached yet: a delta has nothing to diff against.
+        return "No cached index yet - running full load first.\n" + await load_all_timetable_data()
+
+    reference = (
+        _parse_bods_ts(since)
+        or _parse_bods_ts(index.last_refresh)
+    )
+    if reference is None:
+        return ("No valid reference timestamp (pass since=YYYY-MM-DDTHH:MM:SS or complete a full "
+                "load first to set the watermark).\n" + await load_all_timetable_data())
+
+    sweep_start = datetime.now(timezone.utc)
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        catalog: dict[int, dict] = {}
+        offset = 0
+        limit = 100
+        while True:
+            resp = await client.get(
+                f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
+            if resp.status_code != 200:
+                break
+            results = resp.json().get("results", [])
+            if not results:
+                break
+            for r in results:
+                catalog[r["id"]] = r
+            if len(results) < limit:
+                break
+            offset += limit
+
+    if not catalog:
+        return "Catalogue sweep failed (non-200 or empty) - watermark left untouched."
+
+    updated = 0
+    purged = 0
+    errors = 0
+    if reconcile:
+        for ds_id in [i for i in index.loaded_datasets if i not in catalog]:
+            index.discard_dataset(ds_id)
+            purged += 1
+
+    for ds_id, entry in catalog.items():
+        modified = _parse_bods_ts(entry.get("modified"))
+        # Unparseable/missing timestamps are treated as changed (conservative).
+        if modified is None or modified > reference:
+            try:
+                await _load_dataset(ds_id, force_reload=True)
+                updated += 1
+            except Exception:
+                errors += 1
+            if updated % 100 == 0:
+                index.save_cache()
+
+    if errors == 0:
+        index.last_refresh = sweep_start.isoformat()
+    index.save_cache()
+    return (f"Delta update: {updated} refreshed, {purged} purged, {errors} errors "
+            f"(reference: {reference.isoformat()}). "
+            f"Total: {len(index.stops)} stops, {len(index.routes)} routes, "
+            f"{len(index.journeys)} journeys."
+            + ("" if errors == 0 else " Watermark NOT advanced - re-run to retry the failures."))
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +753,24 @@ async def load_timetable_index(force_refresh: bool = False) -> str:
       force_refresh: If true, re-download all data instead of using cache.
     """
     return await load_all_timetable_data(force_refresh=force_refresh)
+
+
+@mcp.tool()
+async def load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
+    """
+    Incrementally refresh the timetable index using the catalogue's
+    modifiedDate filter: re-download only datasets changed since the last
+    refresh (default watermark; pass an ISO timestamp to override) and
+    purge datasets withdrawn from the catalogue. Minutes instead of hours
+    versus a full load. No-op fallback to a full load if no cache exists.
+
+    Parameters:
+      since: Optional ISO timestamp (YYYY-MM-DDTHH:MM:SS). Empty = use the
+             watermark left by the last full load / delta.
+      reconcile: If true (default), also purge datasets that vanished from
+                 the catalogue.
+    """
+    return await _load_timetable_delta(since=since, reconcile=reconcile)
 
 
 @mcp.tool()
