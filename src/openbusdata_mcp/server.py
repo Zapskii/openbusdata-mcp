@@ -649,7 +649,14 @@ def load_specs() -> dict[str, Any]:
     specs = {}
     for yml_file in sorted(SPECS_DIR.glob("*.yml")):
         with open(yml_file, "r", encoding="utf-8") as f:
-            specs[yml_file.stem] = yaml.safe_load(f)
+            spec = yaml.safe_load(f)
+        # Some BODS specs lack a servers block while their paths are already
+        # absolute (/api/v1/...). The tool URL builder prepends base_path, so
+        # defaulting to "/api/v1/" would double-prefix ("/api/v1/api/v1/…").
+        # Anchor every spec explicitly to the site root.
+        if "servers" not in spec:
+            spec["servers"] = [{"url": "/"}]
+        specs[yml_file.stem] = spec
     return specs
 
 
