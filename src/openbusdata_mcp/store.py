@@ -470,6 +470,13 @@ class TimetableWriter:
         self.conn.executemany(
             "INSERT OR IGNORE INTO stop_to_routes VALUES (?,?)",
             [(n, key) for n in stop_list])
+        if stop_list:
+            marks = ",".join("?" * len(stop_list))
+            self.conn.execute(
+                f"DELETE FROM stop_to_routes WHERE key=? AND naptan NOT IN ({marks})",
+                [key] + list(stop_list))
+        else:
+            self.conn.execute("DELETE FROM stop_to_routes WHERE key=?", (key,))
 
     def add_journey(self, op: str, num: str, direction: str, code: str,
                     days: set, stops: list, ds_id: int):
