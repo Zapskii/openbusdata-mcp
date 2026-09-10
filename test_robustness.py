@@ -359,4 +359,16 @@ s = server._format_failed(long)
 assert "0, 1, 2" in s and "(+5 more)" in s, s
 print("10. _format_failed helper: OK")
 
+# --- Test 11: parse_transxchange handles namespaced and bare XML
+ns_xml = ('<TransXChange xmlns="http://www.transxchange.org.uk/">'
+          '<StopPoints><AnnotatedStopPointRef><StopPointRef>010A</StopPointRef>'
+          '<CommonName>Alpha</CommonName></AnnotatedStopPointRef></StopPoints>'
+          '</TransXChange>')
+stops, routes, journeys = server.parse_transxchange(ns_xml, "Op")
+assert stops and stops[0].naptan == "010A", f"namespaced parse failed: {stops}"
+bare = "<TransXChange><StopPoints><AnnotatedStopPointRef><StopPointRef>010B</StopPointRef><CommonName>Beta</CommonName></AnnotatedStopPointRef></StopPoints></TransXChange>"
+stops, _, _ = server.parse_transxchange(bare, "Op")
+assert stops and stops[0].naptan == "010B", f"bare parse failed: {stops}"
+print("11. namespace from root.tag: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")

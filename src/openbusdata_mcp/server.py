@@ -157,9 +157,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
     except ET.ParseError:
         return [], [], []
 
-    ns = ""
-    if 'xmlns="' in content:
-        ns = content.split('xmlns="')[1].split('"')[0]
+    ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
 
     q = lambda tag: _get_ns(tag, ns)
 
