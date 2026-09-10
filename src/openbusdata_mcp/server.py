@@ -875,14 +875,14 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
             ns = "http://www.siri.org.uk/siri"
+            def get_text(tag):
+                el = mvj.find(f"{{{ns}}}{tag}")
+                return el.text if el is not None else "N/A"
             buses = []
             for activity in root.iter(f"{{{ns}}}VehicleActivity"):
                 mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
                 if mvj is None:
                     continue
-                def get_text(tag):
-                    el = mvj.find(f"{{{ns}}}{tag}")
-                    return el.text if el is not None else "N/A"
                 loc = mvj.find(f"{{{ns}}}VehicleLocation")
                 lat = lon = "N/A"
                 if loc is not None:
