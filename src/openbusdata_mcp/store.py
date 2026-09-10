@@ -84,13 +84,14 @@ class TimetableStore:
         return [{"naptan": n, "name": name} for n, name in rows]
 
     def resolve_stop(self, stop_query: str) -> set[str]:
-        """Digits = literal NaPTAN, else substring match (capped)."""
-        if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
-            return {stop_query}
+        """NaPTAN-shaped input = literal, else substring match (capped)."""
+        q = stop_query.strip()
+        if q.isdigit() or (len(q) >= 4 and q[:2].isdigit() and q.isalnum()):
+            return {q}
         return {r[0] for r in self.conn.execute(
             "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             f"LIMIT {MAX_RESOLVE}",
-            (f"%{_like_escape(stop_query.lower())}%",))}
+            (f"%{_like_escape(q.lower())}%",))}
 
     def stop_name(self, naptan: str) -> str:
         row = self.conn.execute(

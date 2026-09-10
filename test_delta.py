@@ -135,4 +135,12 @@ assert "0PCT" in {s["naptan"] for s in store2.search_stops("bus stop")}
 assert store2.resolve_stop("Under_Score") == {"0UND"}, "resolve_stop wildcards"
 print("9. LIKE wildcard escaping: OK")
 
+# --- Test 10: short alphanumeric NaPTANs resolve literally
+writer.add_stop("010A", "Alpha Stop")
+writer.add_stop("010B", "Beta Stop")
+writer.commit()
+assert store2.resolve_stop("010A") == {"010A"}, "short NaPTAN fell through to fuzzy match"
+assert store2.resolve_stop("Oaks Cross") != {"Oaks Cross"}, "name query treated as literal"
+print("10. short NaPTAN literal resolution: OK")
+
 print("ALL UNIT TESTS PASS")
