@@ -389,6 +389,30 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             await client.aclose()
 
 
+async def _sweep_catalogue(client: httpx.AsyncClient) -> tuple[dict[int, dict], bool]:
+    """Sweep the BODS catalogue, returning ({id: entry}, complete).
+
+    complete is True only when the sweep finished normally (empty or short
+    page); False when it broke on a non-200 page (partial view).
+    """
+    catalog: dict[int, dict] = {}
+    offset = 0
+    limit = 100
+    while True:
+        resp = await client.get(
+            f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
+        if resp.status_code != 200:
+            return catalog, False
+        results = resp.json().get("results", [])
+        if not results:
+            return catalog, True
+        for r in results:
+            catalog[r["id"]] = r
+        if len(results) < limit:
+            return catalog, True
+        offset += limit
+
+
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
     """Load all accessible timetable datasets into the SQLite index.
 
@@ -399,25 +423,8 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     writer.ensure_schema()
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        all_ids: list[int] = []
-        offset = 0
-        limit = 100
-        sweep_complete = False
-        while True:
-            resp = await client.get(f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                sweep_complete = True
-                break
-            for r in results:
-                all_ids.append(r["id"])
-            if len(results) < limit:
-                sweep_complete = True
-                break
-            offset += limit
+        catalog, sweep_complete = await _sweep_catalogue(client)
+        all_ids = list(catalog)
 
     # Reconcile: purge datasets that disappeared from the catalogue. Only when
     # the sweep completed — a partial sweep (broke on a non-200 page) has only
@@ -512,22 +519,7 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     sweep_start = datetime.now(timezone.utc)
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        catalog: dict[int, dict] = {}
-        offset = 0
-        limit = 100
-        while True:
-            resp = await client.get(
-                f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
-            if resp.status_code != 200:
-                break
-            results = resp.json().get("results", [])
-            if not results:
-                break
-            for r in results:
-                catalog[r["id"]] = r
-            if len(results) < limit:
-                break
-            offset += limit
+        catalog, _ = await _sweep_catalogue(client)
 
     if not catalog:
         return "Catalogue sweep failed (non-200 or empty) - watermark left untouched."

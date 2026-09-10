@@ -333,4 +333,22 @@ asyncio.run(server.load_all_timetable_data(force_refresh=True))
 assert 2 in w.loaded_ids(), "partial sweep purged a dataset still in the catalogue"
 print("21. partial catalogue sweep does not purge loaded datasets: OK")
 
+# --- Test 9: _sweep_catalogue paginates and returns ({id: entry}, complete)
+class _PagedClient(_FakeClient):
+    def __init__(self, **kw):
+        self.calls = 0
+    async def get(self, url):
+        self.calls += 1
+        if self.calls == 1:
+            return _Resp(200, b'{"results":[{"id":1},{"id":2}]}')
+        return _Resp(200, b'{"results":[]}')
+
+server.httpx.AsyncClient = _PagedClient
+async def _sweep():
+    async with server.httpx.AsyncClient() as c:
+        return await server._sweep_catalogue(c)
+cat, complete = asyncio.run(_sweep())
+assert set(cat) == {1, 2} and complete, (cat, complete)
+print("9. _sweep_catalogue pagination: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")
