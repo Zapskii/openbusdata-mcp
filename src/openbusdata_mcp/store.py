@@ -170,6 +170,15 @@ class TimetableStore:
             "FROM journeys WHERE id=?", (jid,)).fetchone()
         return self._journey_row_to_out(row) if row else None
 
+    def _fetch_journeys(self, jids: list[int]) -> dict[int, dict]:
+        if not jids:
+            return {}
+        marks = ",".join("?" * len(jids))
+        rows = self.conn.execute(
+            f"SELECT id, ds_id, op, route, direction, code, days, json "
+            f"FROM journeys WHERE id IN ({marks})", jids).fetchall()
+        return {r[0]: self._journey_row_to_out(r) for r in rows}
+
     def _journeys_touching(self, naptans: set) -> list[int]:
         """Journey ids whose stop list contains ANY of naptans (indexed)."""
         if not naptans:
@@ -198,10 +207,7 @@ class TimetableStore:
         target_s = target
         out = []
         # Candidate journeys: touch B stop set at all (smaller set usually)
-        for jid in self._journeys_touching(naptans_b):
-            j = self._fetch_journey(jid)
-            if j is None:
-                continue
+        for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
             if day not in j["days"]:
                 continue
             idx_a = idx_b = None
@@ -214,12 +220,15 @@ class TimetableStore:
                 continue
             arr_b = j["stops"][idx_b].get("arrival")
             if arr_b and arr_b[:8] <= target_s:
+                names = self.stop_names_bulk(
+                    [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
                 dep_a = j["stops"][idx_a].get("departure")
                 out.append({
                     "operator": j["operator"], "route": j["route"],
                     "direction": j["direction"], "journey_code": j["journey_code"],
-                    "board_at": self.stop_name(j["stops"][idx_a]["naptan"]),
-                    "depart": dep_a, "alight_at": self.stop_name(j["stops"][idx_b]["naptan"]),
+                    "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
+                    "depart": dep_a,
+                    "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
                     "arrive": arr_b})
         out.sort(key=lambda x: x["arrive"] or "")
         return out[:20]
@@ -227,10 +236,7 @@ class TimetableStore:
     def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
                     target_s: str) -> list[dict]:
         plans = []
-        for jid in self._journeys_touching(naptans_b):
-            j = self._fetch_journey(jid)
-            if j is None:
-                continue
+        for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
             if day not in j["days"]:
                 continue
             idx_a = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_a), None)
@@ -239,7 +245,8 @@ class TimetableStore:
                 continue
             arr_b = j["stops"][idx_b].get("arrival")
             if arr_b and arr_b[:8] <= target_s:
-                names = self.stop_names_bulk([j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
+                names = self.stop_names_bulk(
+                    [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
                 plans.append({
                     "type": "direct",
                     "legs": [{
@@ -254,11 +261,7 @@ class TimetableStore:
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:
         plans = []
-        # Leg 1: from A to some mid stop
-        for jid1 in self._journeys_touching(naptans_a):
-            j1 = self._fetch_journey(jid1)
-            if j1 is None:
-                continue
+        for jid1, j1 in self._fetch_journeys(self._journeys_touching(naptans_a)).items():
             if day not in j1["days"]:
                 continue
             idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in naptans_a), None)
@@ -272,11 +275,8 @@ class TimetableStore:
                 mid_arr = mid.get("arrival")
                 if mid_arr is None:
                     continue
-                # Leg 2 candidates: depart mid after mid_arr, reach B by target
-                for jid2 in self._journeys_departing(mid["naptan"], mid_arr[:8]):
-                    j2 = self._fetch_journey(jid2)
-                    if j2 is None:
-                        continue
+                for jid2, j2 in self._fetch_journeys(
+                        self._journeys_departing(mid["naptan"], mid_arr[:8])).items():
                     if j2["id"] == j1["id"]:
                         continue
                     if day not in j2["days"]:

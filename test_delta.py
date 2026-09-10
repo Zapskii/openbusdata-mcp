@@ -193,4 +193,16 @@ assert ids, "indexed lookup returned nothing"
 assert store2._journeys_touching({"010B"}) == store2._journeys_touching({"010B"}), "nondeterministic"
 print("13. _journeys_touching via index: OK")
 
+# --- Test 14: _fetch_journeys batches (results match per-id fetch)
+writer.add_journey("Op", "14", "outbound", "J14", {"mon"},
+                   [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+ids = store2._journeys_touching({"010A"})
+batch = store2._fetch_journeys(ids)
+assert set(batch) == set(ids), "batch fetch missing ids"
+for jid in ids:
+    assert batch[jid]["journey_code"] == store2._fetch_journey(jid)["journey_code"]
+print("14. _fetch_journeys batch: OK")
+
 print("ALL UNIT TESTS PASS")
