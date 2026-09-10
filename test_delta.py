@@ -256,4 +256,12 @@ batch = store2._fetch_journeys(ids)
 assert set(batch) == set(ids), "chunked fetch missing ids"
 print("22. _fetch_journeys chunks past the variable limit: OK")
 
+# --- Test 16: get_route_stops direction filter matches parsed directions
+writer.upsert_route("Op", "16", {"inbound", "outbound"}, ["010A", "010B"], 99)
+writer.commit()
+assert len(store2.get_route_stops("Op", "16", "inbound")) == 1
+assert len(store2.get_route_stops("Op", "16", "outbound")) == 1
+assert len(store2.get_route_stops("Op", "16")) == 1  # no filter -> all
+print("16. direction filter on parsed JSON: OK")
+
 print("ALL UNIT TESTS PASS")

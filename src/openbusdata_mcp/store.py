@@ -137,20 +137,19 @@ class TimetableStore:
     def get_route_stops(self, operator: str, route: str,
                         direction: Optional[str] = None) -> list[dict]:
         q = (f"%{route.lower()}%", f"%{operator.lower()}%")
-        extra, args = "", list(q)
-        if direction:
-            extra = " AND LOWER(directions) LIKE ?"
-            args.append(f'%"{direction.lower()}"%')
         rows = self.conn.execute(
-            f"SELECT op, num, directions, stops FROM routes "
-            f"WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?{extra}", args).fetchall()
+            "SELECT op, num, directions, stops FROM routes "
+            "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
         matches = []
         for op, num, directions, stops in rows:
+            dirs = json.loads(directions)
+            if direction and direction.lower() not in [d.lower() for d in dirs]:
+                continue
             stop_list = json.loads(stops)
             names = self.stop_names_bulk(stop_list)
             matches.append({
                 "operator": op, "route": num,
-                "directions": sorted(json.loads(directions)),
+                "directions": sorted(dirs),
                 "stops": [{"naptan": n, "name": names.get(n, "Unknown")}
                           for n in stop_list]})
         return matches
