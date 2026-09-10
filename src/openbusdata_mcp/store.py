@@ -29,8 +29,8 @@ def _parse_time(text: str):
 class TimetableStore:
     """Query interface over index.db. Mirrors TimetableIndex semantics."""
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = Path(db_path) if db_path else DB_PATH
         self._conn: Optional[sqlite3.Connection] = None
 
     @property
@@ -311,8 +311,8 @@ class TimetableWriter:
     dataset — checkpointing is implicit.
     """
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = Path(db_path) if db_path else DB_PATH
         self._conn: Optional[sqlite3.Connection] = None
 
     @property

@@ -22,6 +22,8 @@ mcp_servers:
       - run
       - -i
       - --rm
+      - --memory
+      - 1g
       - -e
       - OPENBUS_API_KEY
       - -v
@@ -93,7 +95,10 @@ reconcile=true)`:
 - Sweeps the BODS catalogue, re-downloads only datasets with `modified` newer
   than the watermark (`meta.last_refresh` in index.db) and purges withdrawn
   datasets. Weekly churn is ~15–20% → minutes, not hours.
-- Watermark advances only on a fully clean run; a failed run leaves it alone.
+- **Watermark policy:** advances when errors ≤ max(2, 1% of refreshed) — a
+  permanently-broken dataset no longer freezes the watermark. Every failure is
+  logged to stderr (`[loader] dataset N failed: …`) and the run summary lists
+  failed dataset IDs; over-budget runs leave the watermark untouched.
 - Falls back to a full load if no watermark/cache exists.
 - Manual override: `since=YYYY-MM-DDTHH:MM:SS`; `force_refresh: true` on
   `load_all_timetable_data` re-downloads everything.
@@ -109,7 +114,10 @@ that talks to the travel agent on Sunday (e.g. "run the weekly bus data delta")
 |---|---|
 | `index.db` | **Live** SQLite index, 3.48 GB — 941 datasets, 889,864 journeys, 253,493 stops, 7,442 routes (Sep 9 full load) |
 | `index.db-shm/-wal` | SQLite WAL sidecars (empty when quiescent) |
-| `timetable_cache.json` | **Legacy**, 2.5 GB, dead since the SQLite migration — safe to delete to reclaim 2.5 GB |
+
+(The legacy `timetable_cache.json` was deleted on Sep 10 — 2.5 GB reclaimed. The
+`save_cache`/`load_cache` JSON methods were removed from the server in the same
+cleanup; pre-SQLite scripts live in `dev-legacy/`.)
 
 SQLite schema (created by `store.py`, migrated from the legacy JSON cache by
 `convert_to_sqlite.py`): `stops`, `routes`, `journeys` (+ `journey_stops`),

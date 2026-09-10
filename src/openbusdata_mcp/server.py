@@ -121,73 +121,7 @@ class TimetableIndex:
     def add_journey(self, journey: Journey):
         self.journeys.append(journey)
 
-    def save_cache(self):
-        cache = {
-            "stops": {k: asdict(v) for k, v in self.stops.items()},
-            "routes": {
-                k: {"operator": v.operator, "route_num": v.route_num,
-                    "directions": list(v.directions), "stops": v.stops}
-                for k, v in self.routes.items()
-            },
-            "stop_to_routes": {k: list(v) for k, v in self.stop_to_routes.items()},
-            "journeys": [
-                {
-                    "operator": j.operator,
-                    "route_num": j.route_num,
-                    "direction": j.direction,
-                    "journey_code": j.journey_code,
-                    "dataset_id": j.dataset_id,
-                    "stops": [
-                        {"naptan": s.naptan,
-                         "arrival": s.arrival.isoformat() if s.arrival else None,
-                         "departure": s.departure.isoformat() if s.departure else None}
-                        for s in j.stops
-                    ],
-                    "days": list(j.days),
-                }
-                for j in self.journeys
-            ],
-            "loaded_datasets": list(self.loaded_datasets),
-            "dataset_meta": self.dataset_meta,
-            "last_refresh": self.last_refresh,
-        }
-        with open(CACHE_DIR / "timetable_cache.json", "w", encoding="utf-8") as f:
-            json.dump(cache, f)
 
-    def load_cache(self) -> bool:
-        cache_file = CACHE_DIR / "timetable_cache.json"
-        if not cache_file.exists():
-            return False
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            self.stops = {k: Stop(**v) for k, v in cache.get("stops", {}).items()}
-            self.routes = {
-                k: Route(operator=v["operator"], route_num=v["route_num"],
-                         directions=set(v.get("directions", [])), stops=v.get("stops", []))
-                for k, v in cache.get("routes", {}).items()
-            }
-            self.stop_to_routes = {k: set(v) for k, v in cache.get("stop_to_routes", {}).items()}
-            self.loaded_datasets = set(cache.get("loaded_datasets", []))
-            self.dataset_meta = {int(k): v for k, v in cache.get("dataset_meta", {}).items()}
-            self.last_refresh = cache.get("last_refresh")
-            self.journeys = []
-            for j in cache.get("journeys", []):
-                stops = []
-                for s in j.get("stops", []):
-                    arr = time.fromisoformat(s["arrival"]) if s.get("arrival") else None
-                    dep = time.fromisoformat(s["departure"]) if s.get("departure") else None
-                    stops.append(JourneyStop(naptan=s["naptan"], arrival=arr, departure=dep))
-                self.journeys.append(Journey(
-                    operator=j["operator"], route_num=j["route_num"],
-                    direction=j["direction"], journey_code=j["journey_code"],
-                    stops=stops, days=set(j.get("days", [])),
-                    dataset_id=int(j.get("dataset_id", 0)),
-                ))
-            return True
-        except Exception as e:
-            print(f"Cache load failed: {e}", file=sys.stderr)
-            return False
 
     def clear(self):
         self.stops.clear()

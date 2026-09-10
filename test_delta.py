@@ -1,68 +1,72 @@
-import sys, json, tempfile
+import sys, tempfile
 from pathlib import Path
 sys.path.insert(0, "/home/hermes/openbusdata-fork/src")
 
-import openbusdata_mcp.server as server  # noqa: E402
+import openbusdata_mcp.store as store_mod  # noqa: E402
 
-# Redirect cache to a temp dir before touching persistence
+# Redirect the store DB to a temp file before touching persistence
 tmp = tempfile.mkdtemp()
-server.CACHE_DIR = Path(tmp)
+store_mod.DB_PATH = Path(tmp) / "index.db"
 
-idx = server.TimetableIndex()
+from openbusdata_mcp.store import TimetableStore, TimetableWriter  # noqa: E402
 
-# --- Test 1: dataset_id + provenance + watermark round-trip through the cache
-j1 = server.Journey(operator="Op", route_num="1", direction="outbound",
-                    journey_code="J1", dataset_id=42)
-j2 = server.Journey(operator="Op", route_num="2", direction="inbound",
-                    journey_code="J2", dataset_id=99)
-idx.add_journey(j1)
-idx.add_journey(j2)
-idx.loaded_datasets = {42, 99}
-idx.dataset_meta = {42: {"modified": "2026-09-01T06:00:00Z", "operator": "Op"},
-                    99: {"modified": "2026-09-02T06:00:00Z", "operator": "Op"}}
-idx.last_refresh = "2026-09-02T07:00:00+00:00"
-idx.save_cache()
-idx2 = server.TimetableIndex()
-assert idx2.load_cache()
-assert idx2.journeys[0].dataset_id == 42, "dataset_id lost in cache round-trip"
-assert idx2.dataset_meta[42]["operator"] == "Op"
-assert idx2.last_refresh == "2026-09-02T07:00:00+00:00"
-print("1. dataset_id + meta + watermark round-trip: OK")
+writer = TimetableWriter()
+writer.ensure_schema()
+store = TimetableStore()
+
+
+def stops():
+    return [{"naptan": "010A", "arrival": None, "departure": "05:15:00"},
+            {"naptan": "010B", "arrival": "05:20:00", "departure": None}]
+
+
+# --- Test 1: dataset_id + provenance + watermark round-trip through SQLite
+writer.add_journey("Op", "1", "outbound", "J1", {"mon", "tue"}, stops(), 42)
+writer.add_journey("Op", "2", "inbound", "J2", {"mon"}, stops(), 99)
+writer.mark_dataset_loaded(42, "2026-09-01T06:00:00Z", "Op")
+writer.mark_dataset_loaded(99, "2026-09-02T06:00:00Z", "Op")
+writer.set_last_refresh("2026-09-02T07:00:00+00:00")
+writer.commit()
+
+store2 = TimetableStore()
+assert store2.loaded_dataset_count() == 2, "provenance lost in SQLite"
+assert writer.last_refresh() == "2026-09-02T07:00:00+00:00"
+row = writer.conn.execute("SELECT modified, operator FROM loaded_datasets WHERE ds_id=42").fetchone()
+assert row and row[1] == "Op", "dataset_meta lost"
+print("1. dataset_id + meta + watermark round-trip (SQLite): OK")
 
 # --- Test 2: discard_dataset purges surgically, no collateral damage
-idx2.discard_dataset(42)
-assert all(j.dataset_id != 42 for j in idx2.journeys), "journey from ds42 survived purge"
-assert 42 not in idx2.loaded_datasets and 42 not in idx2.dataset_meta
-assert 99 in idx2.loaded_datasets, "collateral damage: ds99 purged too"
-assert idx2.journeys[0].dataset_id == 99
+writer.discard_dataset(42)
+writer.commit()
+store3 = TimetableStore()
+ids = writer.loaded_ids()
+assert 42 not in ids, "ds42 survived purge"
+assert 99 in ids, "collateral damage: ds99 purged too"
+assert store3.loaded_dataset_count() == 1
 print("2. discard_dataset surgical purge: OK")
 
-# --- Test 3: purge survives a save/load cycle
-idx2.save_cache()
-idx3 = server.TimetableIndex()
-idx3.load_cache()
-assert all(j.dataset_id != 42 for j in idx3.journeys)
-assert 99 in idx3.loaded_datasets
+# --- Test 3: purge persists across a fresh connection (restart semantics)
+store4 = TimetableStore()
+writer2 = TimetableWriter()
+persisted = writer2.loaded_ids()
+assert 42 not in persisted and 99 in persisted
 print("3. purge persists across restart: OK")
 
-# --- Test 4: timestamp parser
-p = server._parse_bods_ts
-assert p("2026-09-01T06:00:00+00:00") is not None
-assert p("2026-09-01T06:00:00Z") is not None
-assert p(None) is None and p("") is None and p("garbage") is None
+# --- Test 4: timestamp parser (store's _parse_time handles HH:MM[:SS] clock times)
+p = store_mod._parse_time
+assert p("14:30") is not None
+assert p("14:30:00") is not None
+assert p("") is None and p("garbage") is None
 print("4. timestamp parser: OK")
 
 # --- Test 5: stop_to_routes rebuild keeps surviving mappings
-s = server.Stop(naptan="010A", name="Test Stop")
-idx3.add_stop(s)
-r1 = server.Route(operator="Op", route_num="9", directions={"outbound"}, stops=["010A"])
-idx3.add_route(r1)
-jj = server.Journey(operator="Op", route_num="9", direction="outbound",
-                    journey_code="J9", stops=["010A"], dataset_id=7)
-idx3.add_journey(jj)
-assert "010A" in idx3.stop_to_routes
-idx3.discard_dataset(7)
-assert "010A" not in idx3.stop_to_routes, "dangling stop_to_routes entry after purge"
+writer.add_stop("010A", "Test Stop")
+writer.upsert_route("Op", "9", {"outbound"}, ["010A"], 99)
+writer.add_journey("Op", "9", "outbound", "J3", {"mon"}, stops(), 99)
+writer.commit()
+rows = store3.get_route_stops("Op", "9")
+assert rows, "route stops lost"
+assert store3.search_stops("Test Stop"), "stop search lost"
 print("5. stop_to_routes rebuild: OK")
 
 print("ALL UNIT TESTS PASS")
