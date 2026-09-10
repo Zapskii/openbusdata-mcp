@@ -38,7 +38,7 @@ def _parse_time(text: str) -> Optional[str]:
         s = int(parts[2]) if len(parts) > 2 else 0
     except (ValueError, IndexError):
         return None
-    if len(parts) > 3 or h < 0 or m > 59 or s > 59:
+    if len(parts) > 3 or h < 0 or m < 0 or m > 59 or s < 0 or s > 59:
         return None
     return f"{h:02d}:{m:02d}:{s:02d}"
 

@@ -148,4 +148,11 @@ assert store2.find_routes_between(set(), {"010A"}) == []
 assert store2._journeys_touching(set()) == []
 print("11. empty-set guards: OK")
 
+# --- Test 18: negative minutes/seconds are rejected
+p = store_mod._parse_time
+assert p("10:-5") is None, "negative minutes accepted"
+assert p("10:30:-5") is None, "negative seconds accepted"
+assert p("10:30:00") == "10:30:00"
+print("18. negative time components rejected: OK")
+
 print("ALL UNIT TESTS PASS")
