@@ -162,4 +162,21 @@ assert len(a) + len(b) < 999, f"combined params {len(a) + len(b)} >= 999"
 store2.find_routes_between(a, b)  # must not raise "too many SQL variables"
 print("19. combined IN-clause params capped: OK")
 
+# --- Test 12: journey_stops table is populated and purged with its journeys
+# NOTE: uses unique naptans (12A/12B) — '010A' is shared by surviving ds99
+# journeys from earlier tests, so a purge assertion on it could never reach 0.
+writer.add_journey("Op", "12", "outbound", "J12", {"mon"},
+                   [{"naptan": "12A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "12B", "arrival": "09:10:00", "departure": None}], 42)
+writer.commit()
+n = writer.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
+assert n >= 1, "journey_stops not populated"
+writer.discard_dataset(42)
+writer.commit()
+n = writer.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
+assert n == 0, "journey_stops not purged with dataset"
+print("12. journey_stops populated + purged: OK")
+
 print("ALL UNIT TESTS PASS")

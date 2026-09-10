@@ -361,6 +361,8 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS loaded_datasets (
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT);
+        CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
+        CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
@@ -458,10 +460,13 @@ class TimetableWriter:
         j = {"operator": op, "route_num": num, "direction": direction,
              "journey_code": code, "dataset_id": ds_id,
              "days": sorted(days), "stops": [dict(st) for st in stops]}
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
             "VALUES (?,?,?,?,?,?,?)",
             (ds_id, op, num, direction, code, json.dumps(sorted(days)), json.dumps(j)))
+        self.conn.executemany(
+            "INSERT INTO journey_stops VALUES (?,?)",
+            [(s["naptan"], cur.lastrowid) for s in stops])
 
     def commit(self):
         self.conn.commit()
@@ -483,6 +488,10 @@ class TimetableWriter:
         insert supersedes the old rows, which cannot be purged by ds_id.
         """
         self.conn.execute(
+            "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
+            (op, route_num))
+        self.conn.execute(
             "DELETE FROM journeys WHERE ds_id=0 AND op=? AND route=?",
             (op, route_num))
 
@@ -499,6 +508,9 @@ class TimetableWriter:
         and is fully removed by the next full rebuild. The caller owns the
         transaction: purge + rewrite must commit together.
         """
+        self.conn.execute(
+            "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
         self.conn.execute(
             "DELETE FROM stop_to_routes WHERE key NOT IN "
