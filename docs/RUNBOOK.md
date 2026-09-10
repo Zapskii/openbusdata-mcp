@@ -149,7 +149,7 @@ EOF
 
 # Unit + E2E (from the repo):
 cd /home/hermes/openbusdata-fork
-~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml python test_delta.py   # 5/5
+~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml --with pytest pytest -q   # 37/37
 ~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml python e2e_sqlite.py  # vs real index
 ```
 
