@@ -47,9 +47,16 @@ class TimetableStore:
     def loaded_dataset_count(self) -> int:
         if not self.exists():
             return 0
-        v = self.conn.execute(
-            "SELECT v FROM meta WHERE k='loaded_datasets'").fetchone()
-        return len(json.loads(v[0])) if v else 0
+        # Source of truth is the loaded_datasets TABLE (populated by the
+        # writer / promoted from the legacy JSON watermark). The meta key
+        # only exists on converter-era DBs and is stale after deltas.
+        try:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM loaded_datasets").fetchone()[0]
+        except Exception:
+            v = self.conn.execute(
+                "SELECT v FROM meta WHERE k='loaded_datasets'").fetchone()
+            return len(json.loads(v[0])) if v else 0
 
     # -- stops --------------------------------------------------------------
     def search_stops(self, query: str, limit: int = 50) -> list[dict]:
