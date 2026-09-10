@@ -11,10 +11,10 @@ API key is read from the OPENBUS_API_KEY environment variable.
 
 import os
 import sys
+import tempfile
 import yaml
 import json
 import zipfile
-import io
 import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
@@ -313,10 +313,14 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
     """Returns meta on success, None on failure (caller counts errors).
 
     Reuses `client` if given; otherwise owns and closes a private one.
+    The zip is streamed to a seekable temp file (never held in RAM whole).
     """
     owns = client is None
     if owns:
         client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(tmp_fd)  # we only need the path; open it normally below
+    z = None
     try:
         meta_resp = await client.get(f"{BASE_URL}/api/v1/dataset/{ds_id}/?api_key={API_KEY}")
         if meta_resp.status_code != 200:
@@ -328,19 +332,28 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
         if not download_url:
             return meta  # not a timetable dataset; nothing to load
 
-        zip_resp = await client.get(f"{download_url}?api_key={API_KEY}")
-        if zip_resp.status_code != 200 or len(zip_resp.content) < 100:
+        size = 0
+        async with client.stream("GET", f"{download_url}?api_key={API_KEY}") as resp:
+            if resp.status_code != 200:
+                return None
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.aiter_bytes():
+                    f.write(chunk)
+                    size += len(chunk)
+        if size < 100:
             return None
 
         try:
-            z = zipfile.ZipFile(io.BytesIO(zip_resp.content))
+            z = zipfile.ZipFile(tmp_path)
             contents = _xml_contents(z)
         except zipfile.BadZipFile:
             # Some BODS datasets publish a bare TransXChange XML document
             # instead of a zip container.
-            head = zip_resp.content[:200].lstrip()
-            if head.startswith(b"<?xml") or b"<TransXChange" in head:
-                contents = iter([zip_resp.content.decode("utf-8", errors="ignore")])
+            with open(tmp_path, "rb") as f:
+                head = f.read(200)
+            if head.lstrip().startswith(b"<?xml") or b"<TransXChange" in head:
+                with open(tmp_path, "rb") as f:
+                    contents = iter([f.read().decode("utf-8", errors="ignore")])
             else:
                 return None
 
@@ -381,6 +394,9 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             raise
         return meta
     finally:
+        if z is not None:
+            z.close()
+        os.unlink(tmp_path)
         if owns:
             await client.aclose()
 
