@@ -205,4 +205,16 @@ for jid in ids:
     assert batch[jid]["journey_code"] == store2._fetch_journey(jid)["journey_code"]
 print("14. _fetch_journeys batch: OK")
 
+# --- Test 15: _candidate_journeys yields the same journeys both tools use
+# NOTE: uses unique naptans (15A/15B) — '010A'/'010B' are shared by surviving
+# ds99 journeys from earlier tests, so a len==1 assertion could never hold.
+writer.add_journey("Op", "15", "outbound", "J15", {"mon"},
+                   [{"naptan": "15A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "15B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+cands = list(store2._candidate_journeys({"15A"}, {"15B"}, "mon", "09:30:00"))
+assert len(cands) == 1 and cands[0][0]["journey_code"] == "J15"
+assert list(store2._candidate_journeys({"15A"}, {"15B"}, "tue", "09:30:00")) == []
+print("15. _candidate_journeys shared helper: OK")
+
 print("ALL UNIT TESTS PASS")

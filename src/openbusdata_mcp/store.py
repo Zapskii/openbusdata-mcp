@@ -199,43 +199,9 @@ class TimetableStore:
             ") ORDER BY id", (naptan, after)).fetchall()
         return [r[0] for r in rows]
 
-    def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
-                                   arrive_by: str, day: str) -> list[dict]:
-        target = _parse_time(arrive_by)
-        if target is None:
-            return []
-        target_s = target
-        out = []
-        # Candidate journeys: touch B stop set at all (smaller set usually)
-        for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
-            if day not in j["days"]:
-                continue
-            idx_a = idx_b = None
-            for i, s in enumerate(j["stops"]):
-                if s["naptan"] in naptans_a:
-                    idx_a = i
-                if s["naptan"] in naptans_b:
-                    idx_b = i
-            if idx_a is None or idx_b is None or idx_a >= idx_b:
-                continue
-            arr_b = j["stops"][idx_b].get("arrival")
-            if arr_b and arr_b[:8] <= target_s:
-                names = self.stop_names_bulk(
-                    [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-                dep_a = j["stops"][idx_a].get("departure")
-                out.append({
-                    "operator": j["operator"], "route": j["route"],
-                    "direction": j["direction"], "journey_code": j["journey_code"],
-                    "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                    "depart": dep_a,
-                    "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                    "arrive": arr_b})
-        out.sort(key=lambda x: x["arrive"] or "")
-        return out[:20]
-
-    def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
-                    target_s: str) -> list[dict]:
-        plans = []
+    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
+        """Yield (journey, idx_a, idx_b) for journeys boarding in A, alighting in B,
+        running on day, arriving at B by target_s."""
         for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
             if day not in j["days"]:
                 continue
@@ -245,17 +211,43 @@ class TimetableStore:
                 continue
             arr_b = j["stops"][idx_b].get("arrival")
             if arr_b and arr_b[:8] <= target_s:
-                names = self.stop_names_bulk(
-                    [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-                plans.append({
-                    "type": "direct",
-                    "legs": [{
-                        "operator": j["operator"], "route": j["route"],
-                        "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                        "depart": j["stops"][idx_a].get("departure"),
-                        "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                        "arrive": arr_b}],
-                    "total_changes": 0})
+                yield j, idx_a, idx_b
+
+    def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
+                                   arrive_by: str, day: str) -> list[dict]:
+        target = _parse_time(arrive_by)
+        if target is None:
+            return []
+        target_s = target
+        out = []
+        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+            names = self.stop_names_bulk(
+                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
+            out.append({
+                "operator": j["operator"], "route": j["route"],
+                "direction": j["direction"], "journey_code": j["journey_code"],
+                "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
+                "depart": j["stops"][idx_a].get("departure"),
+                "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
+                "arrive": j["stops"][idx_b].get("arrival")})
+        out.sort(key=lambda x: x["arrive"] or "")
+        return out[:20]
+
+    def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
+                    target_s: str) -> list[dict]:
+        plans = []
+        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+            names = self.stop_names_bulk(
+                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
+            plans.append({
+                "type": "direct",
+                "legs": [{
+                    "operator": j["operator"], "route": j["route"],
+                    "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
+                    "depart": j["stops"][idx_a].get("departure"),
+                    "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
+                    "arrive": j["stops"][idx_b].get("arrival")}],
+                "total_changes": 0})
         return plans
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
