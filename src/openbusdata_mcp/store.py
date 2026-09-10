@@ -109,6 +109,8 @@ class TimetableStore:
     # -- routes -------------------------------------------------------------
     def find_routes_between(self, naptans_a: set, naptans_b: set) -> list[dict]:
         """Routes serving both stop sets, with A->B / B->A ordering."""
+        if not naptans_a or not naptans_b:
+            return []
         rows = self.conn.execute("""
             SELECT r.key, r.op, r.num, r.directions, r.stops FROM routes r
             WHERE r.key IN (SELECT key FROM stop_to_routes WHERE naptan IN (%s))
@@ -170,7 +172,8 @@ class TimetableStore:
 
     def _journeys_touching(self, naptans: set) -> list[int]:
         """Journey ids whose stop list contains ANY of naptans."""
-        # journeys has no stop index table; use json1 EXISTS over stops json
+        if not naptans:
+            return []
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(
             f"SELECT id FROM journeys WHERE EXISTS ("

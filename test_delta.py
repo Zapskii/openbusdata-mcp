@@ -143,4 +143,9 @@ assert store2.resolve_stop("010A") == {"010A"}, "short NaPTAN fell through to fu
 assert store2.resolve_stop("Oaks Cross") != {"Oaks Cross"}, "name query treated as literal"
 print("10. short NaPTAN literal resolution: OK")
 
+# --- Test 11: empty stop sets return empty, not SQL errors
+assert store2.find_routes_between(set(), {"010A"}) == []
+assert store2._journeys_touching(set()) == []
+print("11. empty-set guards: OK")
+
 print("ALL UNIT TESTS PASS")
