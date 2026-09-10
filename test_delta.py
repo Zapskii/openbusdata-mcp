@@ -217,4 +217,10 @@ assert len(cands) == 1 and cands[0][0]["journey_code"] == "J15"
 assert list(store2._candidate_journeys({"15A"}, {"15B"}, "tue", "09:30:00")) == []
 print("15. _candidate_journeys shared helper: OK")
 
+# --- Test 20: discard_dataset surviving-key scan uses the j_oproute index
+plan = writer.conn.execute(
+    "EXPLAIN QUERY PLAN SELECT DISTINCT op, route FROM journeys").fetchall()
+assert any("j_oproute" in str(row) for row in plan), f"index not used: {plan}"
+print("20. discard_dataset index-only scan: OK")
+
 print("ALL UNIT TESTS PASS")

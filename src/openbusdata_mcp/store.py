@@ -502,7 +502,9 @@ class TimetableWriter:
             "DELETE FROM journey_stops WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
+        # Surviving route keys via an index-only scan on journeys(op, route)
+        # (j_oproute index) instead of a full-table scan + expression eval.
         self.conn.execute(
-            "DELETE FROM stop_to_routes WHERE key NOT IN "
-            "(SELECT DISTINCT op || '|' || route FROM journeys)")
+            "DELETE FROM stop_to_routes WHERE key NOT IN ("
+            "SELECT op || '|' || route FROM (SELECT DISTINCT op, route FROM journeys))")
         self.conn.execute("DELETE FROM loaded_datasets WHERE ds_id=?", (ds_id,))
