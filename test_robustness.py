@@ -242,4 +242,35 @@ assert w.conn.execute("SELECT COUNT(*) FROM journeys WHERE ds_id=2").fetchone()[
     "journeys lost to a partial purge"
 print("13. mid-rewrite failure rolls back purge: OK")
 
+# --- Test 21: a partial catalogue sweep must not purge loaded datasets
+# A sweep that breaks on a non-200 page has only seen part of the catalogue;
+# datasets missing from that partial view may still be live, so reconcile
+# must not purge them (self-healing re-download would fix it, but it leaves
+# the index incomplete during a force_refresh rebuild).
+w = TimetableWriter(); w.ensure_schema()
+w.add_journey("Op", "2", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 2)
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+
+_PARTIAL_PAGE = json.dumps(
+    {"results": [{"id": 1000 + i, "modified": "2026-09-01T00:00:00Z"}
+                 for i in range(100)]}).encode()
+
+class _PartialSweepClient(_FakeClient):
+    """First catalogue page full (100 results), second page 500s."""
+    async def get(self, url):
+        if "/dataset/?" in url and "offset=0" in url:
+            return _Resp(200, _PARTIAL_PAGE)
+        if "/dataset/?" in url:
+            return _Resp(500, b"")
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _PartialSweepClient
+asyncio.run(server.load_all_timetable_data(force_refresh=True))
+assert 2 in w.loaded_ids(), "partial sweep purged a dataset still in the catalogue"
+print("21. partial catalogue sweep does not purge loaded datasets: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")

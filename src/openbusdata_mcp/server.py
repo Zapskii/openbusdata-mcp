@@ -386,6 +386,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
         all_ids: list[int] = []
         offset = 0
         limit = 100
+        sweep_complete = False
         while True:
             resp = await client.get(f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
             if resp.status_code != 200:
@@ -393,15 +394,21 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             data = resp.json()
             results = data.get("results", [])
             if not results:
+                sweep_complete = True
                 break
             for r in results:
                 all_ids.append(r["id"])
             if len(results) < limit:
+                sweep_complete = True
                 break
             offset += limit
 
-    # Reconcile: purge datasets that disappeared from the catalogue.
-    if all_ids:
+    # Reconcile: purge datasets that disappeared from the catalogue. Only when
+    # the sweep completed — a partial sweep (broke on a non-200 page) has only
+    # seen part of the catalogue, so it must not purge datasets that may still
+    # be live (self-healing re-download would fix it, but it leaves the index
+    # temporarily incomplete during a force_refresh rebuild).
+    if all_ids and sweep_complete:
         known = set(all_ids)
         for ds_id in [i for i in writer.loaded_ids() if i not in known]:
             writer.discard_dataset(ds_id)
