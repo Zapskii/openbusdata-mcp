@@ -352,10 +352,19 @@ class TimetableWriter:
         row = self.conn.execute(
             "SELECT v FROM meta WHERE k='dataset_meta'").fetchone()
         if row:
-            for ds_id_str, m in json.loads(row[0]).items():
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO loaded_datasets VALUES (?,?,?)",
-                    (int(ds_id_str), m.get("modified"), m.get("operator")))
+            try:
+                legacy_meta = json.loads(row[0])
+            except (ValueError, TypeError):
+                legacy_meta = {}
+            for ds_id_str, m in legacy_meta.items():
+                # Junk keys (non-numeric ds ids, non-dict values) must not
+                # abort the schema upgrade — skip them.
+                try:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO loaded_datasets VALUES (?,?,?)",
+                        (int(ds_id_str), m.get("modified"), m.get("operator")))
+                except (ValueError, TypeError, AttributeError):
+                    continue
             self.conn.execute("DELETE FROM meta WHERE k='dataset_meta'")
         else:
             # Converted-by-script DBs: watermark lives in meta.loaded_datasets.
