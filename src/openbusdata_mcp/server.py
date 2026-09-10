@@ -535,6 +535,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     loaded = 0
     skipped = 0
     errors = 0
+    failed_ids: list[int] = []
     for ds_id in all_ids:
         if ds_id in writer.loaded_ids():
             skipped += 1
@@ -542,15 +543,24 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
         try:
             await load_dataset(ds_id)
             loaded += 1
-        except Exception:
+        except Exception as e:
             errors += 1
+            failed_ids.append(ds_id)
+            print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
         # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
     j, s, r, d = writer.counts()
+    failed_note = ""
+    if failed_ids:
+        shown = ", ".join(str(i) for i in failed_ids[:20])
+        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
+        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
     return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
-            f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets.")
+            f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
+            + failed_note)
 
 
 def _parse_bods_ts(value: Optional[str]) -> Optional[datetime]:
@@ -617,6 +627,7 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     updated = 0
     purged = 0
     errors = 0
+    failed_ids: list[int] = []
     if reconcile:
         for ds_id in [i for i in writer.loaded_ids() if i not in catalog]:
             writer.discard_dataset(ds_id)
@@ -629,17 +640,27 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
             try:
                 await _load_dataset(ds_id, force_reload=True)
                 updated += 1
-            except Exception:
+            except Exception as e:
                 errors += 1
+                failed_ids.append(ds_id)
+                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
 
     if errors == 0:
         writer.set_last_refresh(sweep_start.isoformat())
         writer.commit()
     j, s, r, d = writer.counts()
+    failed_note = ""
+    if failed_ids:
+        shown = ", ".join(str(i) for i in failed_ids[:20])
+        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
+        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
     return (f"Delta update: {updated} refreshed, {purged} purged, {errors} errors "
             f"(reference: {reference.isoformat()}). "
             f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
-            + ("" if errors == 0 else " Watermark NOT advanced - re-run to retry the failures."))
+            + (" Watermark NOT advanced - re-run to retry the failures."
+               if errors else "")
+            + failed_note)
 
 
 # ---------------------------------------------------------------------------
