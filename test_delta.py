@@ -341,18 +341,24 @@ def test_24_fts_search_and_like_fallback(writer, store):
     writer.add_stop("S2", "Oakscross Road")
     writer.add_stop("S3", "100% Bus Stop")
     writer.add_stop("S4", "Under_Score Stop")
+    writer.add_stop("S5", "Common Roadside")
     writer.commit()
     # FTS5 token+prefix: "oaks" matches both "Oaks" and "Oakscross".
     assert {s["naptan"] for s in store.search_stops("oaks")} == {"S1", "S2"}
     # FTS5 AND: both tokens must match.
     assert {s["naptan"] for s in store.search_stops("bus stop")} == {"S3"}
+    # FTS5 prefix matching: "road"* matches "Roadside" (LIKE '%common road%' would not).
+    assert {s["naptan"] for s in store.search_stops("common road")} == {"S5"}
+    # FTS5-locking: tokens present but not a contiguous substring, so LIKE
+    # '%road common%' cannot match — only the FTS5 token+prefix path returns S5.
+    assert {s["naptan"] for s in store.search_stops("road common")} == {"S5"}
     # LIKE fallback: mid-token substring FTS5 cannot express.
     assert {s["naptan"] for s in store.search_stops("kscr")} == {"S2"}
     # Untokenizable input -> LIKE fallback (wildcards match literally).
     assert {s["naptan"] for s in store.search_stops("%")} == {"S3"}
     assert {s["naptan"] for s in store.search_stops("_")} == {"S4"}
     # Short query (< 2 chars) -> LIKE directly (substring, not prefix).
-    assert {s["naptan"] for s in store.search_stops("o")} == {"S1", "S2", "S3", "S4"}
+    assert {s["naptan"] for s in store.search_stops("o")} == {"S1", "S2", "S3", "S4", "S5"}
     # resolve_stop: FTS5 path (capped) and NaPTAN literal unchanged.
     assert store.resolve_stop("oaks") == {"S1", "S2"}
     assert store.resolve_stop("010A") == {"010A"}
