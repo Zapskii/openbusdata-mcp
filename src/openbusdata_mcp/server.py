@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin, urlencode
+from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, time, timezone
 from .store import TimetableStore, TimetableWriter
@@ -672,7 +672,9 @@ def register_tools_from_specs(specs: dict[str, Any]):
                         url_path = bp.rstrip("/") + path_tpl
                         for p in params_def:
                             if p["in"] == "path" and p["name"] in kwargs:
-                                url_path = url_path.replace(f"{{{p['name']}}}", str(kwargs[p["name"]]))
+                                url_path = url_path.replace(
+                                    f"{{{p['name']}}}",
+                                    quote(str(kwargs[p["name"]]), safe=""))
                         full_url = urljoin(BASE_URL + "/", url_path.lstrip("/"))
                         query = {}
                         for p in params_def:
@@ -700,7 +702,8 @@ def register_tools_from_specs(specs: dict[str, Any]):
                                 except Exception:
                                     return resp.text
                         except httpx.HTTPStatusError as e:
-                            return f"HTTP Error {e.response.status_code}: {e.response.text}"
+                            return (f"HTTP Error {e.response.status_code}: "
+                                    f"{e.response.text[:500]}")
                         except Exception as e:
                             return f"Error: {type(e).__name__}: {str(e)}"
                     return tool_func
