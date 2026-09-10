@@ -15,6 +15,20 @@ def _like_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _fts_query(query: str) -> Optional[str]:
+    """Build an FTS5 MATCH expression from user input, or None if untokenizable.
+
+    Each whitespace token becomes a quoted prefix term, AND-joined. Tokens with
+    no alphanumeric characters (bare '%', '_', '\', quotes) tokenize to nothing
+    in FTS5, so they return None and the caller falls back to LIKE.
+    """
+    tokens = [t for t in query.strip().lower().split() if t]
+    tokens = [t for t in tokens if any(c.isalnum() for c in t)]
+    if not tokens:
+        return None
+    return " AND ".join(f'"{t.replace(chr(34), chr(34) * 2)}"*' for t in tokens)
+
+
 # Cap on how many NaPTANs a fuzzy stop query may resolve to: resolved sets
 # feed `IN (...)` clauses built from `?` placeholders, and find_routes_between
 # binds BOTH sets in one query, so the combined count must stay under SQLite's
@@ -76,18 +90,38 @@ class TimetableStore:
             return len(json.loads(v[0])) if v else 0
 
     # -- stops --------------------------------------------------------------
-    def search_stops(self, query: str, limit: int = 50) -> list[dict]:
+    def _search_stops_like(self, query: str, limit: int = 50) -> list[dict]:
         q = f"%{_like_escape(query.lower())}%"
         rows = self.conn.execute(
             "SELECT naptan, name FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             "ORDER BY name LIMIT ?", (q, limit)).fetchall()
         return [{"naptan": n, "name": name} for n, name in rows]
 
+    def search_stops(self, query: str, limit: int = 50) -> list[dict]:
+        q = query.strip()
+        if len(q) < 2:
+            return self._search_stops_like(q, limit)   # short queries: LIKE directly
+        fts = _fts_query(q)
+        if fts:
+            rows = self.conn.execute(
+                "SELECT naptan, name FROM stops_fts WHERE stops_fts MATCH ? "
+                "ORDER BY rank LIMIT ?", (fts, limit)).fetchall()
+            if rows:
+                return [{"naptan": n, "name": name} for n, name in rows]
+        return self._search_stops_like(q, limit)        # FTS5 empty -> LIKE fallback
+
     def resolve_stop(self, stop_query: str) -> set[str]:
-        """NaPTAN-shaped input = literal, else substring match (capped)."""
+        """NaPTAN-shaped input = literal, else FTS5 match (capped), else LIKE."""
         q = stop_query.strip()
         if q.isdigit() or (len(q) >= 4 and q[:2].isdigit() and q.isalnum()):
             return {q}
+        fts = _fts_query(q)
+        if fts:
+            rows = self.conn.execute(
+                "SELECT naptan FROM stops_fts WHERE stops_fts MATCH ? LIMIT ?",
+                (fts, MAX_RESOLVE)).fetchall()
+            if rows:
+                return {r[0] for r in rows}
         return {r[0] for r in self.conn.execute(
             "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             f"LIMIT {MAX_RESOLVE}",
@@ -369,6 +403,17 @@ class TimetableWriter:
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
+        CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
+            name, naptan UNINDEXED, tokenize='unicode61');
+        CREATE TRIGGER IF NOT EXISTS stops_fts_ai AFTER INSERT ON stops BEGIN
+            INSERT INTO stops_fts(rowid, name, naptan) VALUES (new.rowid, new.name, new.naptan);
+        END;
+        CREATE TRIGGER IF NOT EXISTS stops_fts_ad AFTER DELETE ON stops BEGIN
+            DELETE FROM stops_fts WHERE rowid = old.rowid;
+        END;
+        CREATE TRIGGER IF NOT EXISTS stops_fts_au AFTER UPDATE ON stops BEGIN
+            UPDATE stops_fts SET name = new.name, naptan = new.naptan WHERE rowid = old.rowid;
+        END;
         """)
         # One-time backfill: journey_stops only gets populated by add_journey,
         # so a DB upgraded in place (journeys already present) would have an
@@ -383,6 +428,17 @@ class TimetableWriter:
                 "FROM journeys j, json_each(j.json, '$.stops')")
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('journey_stops_backfilled', '1')")
+        # One-time backfill: stops_fts only gets populated by the triggers, so
+        # a DB upgraded in place (stops already present) would have an empty
+        # FTS index and every FTS search would silently return nothing.
+        # Backfill from stops once, keyed on a meta flag so it never re-runs.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='stops_fts_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT OR REPLACE INTO stops_fts(rowid, name, naptan) "
+                "SELECT rowid, name, naptan FROM stops")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('stops_fts_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:

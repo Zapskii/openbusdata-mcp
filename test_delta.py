@@ -297,3 +297,62 @@ def test_17_upsert_route_prunes_stale_refs(writer, store):
     refs = {r[0] for r in writer.conn.execute(
         "SELECT naptan FROM stop_to_routes WHERE key='Op|18'").fetchall()}
     assert refs == {"010A"}, f"stale refs not pruned: {refs}"
+
+
+# --- Test 23: stops_fts backfill + trigger sync keep the FTS index current
+def test_23_fts_backfill_and_trigger_sync():
+    # Simulate a pre-FTS DB: stops present, no stops_fts, no backfill flag.
+    _bk = Path(tempfile.mkdtemp()) / "fts.db"
+    w2 = TimetableWriter(_bk)
+    w2.conn.execute(
+        "CREATE TABLE stops (naptan TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL)")
+    w2.conn.execute("INSERT INTO stops VALUES ('F1','Alpha Road',NULL,NULL)")
+    w2.conn.execute("INSERT INTO stops VALUES ('F2','Beta Lane',NULL,NULL)")
+    w2.conn.commit()
+    w2.ensure_schema()
+    n = w2.conn.execute("SELECT COUNT(*) FROM stops_fts").fetchone()[0]
+    assert n == 2, f"backfill missing: {n}"
+    # Flag prevents re-running the backfill.
+    w2.ensure_schema()
+    n = w2.conn.execute("SELECT COUNT(*) FROM stops_fts").fetchone()[0]
+    assert n == 2, "backfill re-ran"
+    # Insert trigger (add_stop -> INSERT ... ON CONFLICT DO UPDATE).
+    w2.add_stop("F3", "Gamma Way")
+    w2.conn.commit()
+    n = w2.conn.execute("SELECT COUNT(*) FROM stops_fts").fetchone()[0]
+    assert n == 3, "insert trigger missed"
+    # Update trigger (conflict path fires the UPDATE trigger).
+    w2.add_stop("F1", "Alpha Road North")
+    w2.conn.commit()
+    row = w2.conn.execute(
+        "SELECT name FROM stops_fts WHERE rowid="
+        "(SELECT rowid FROM stops WHERE naptan='F1')").fetchone()
+    assert row and row[0] == "Alpha Road North", "update trigger missed"
+    # Delete trigger.
+    w2.conn.execute("DELETE FROM stops WHERE naptan='F2'")
+    w2.conn.commit()
+    n = w2.conn.execute("SELECT COUNT(*) FROM stops_fts").fetchone()[0]
+    assert n == 2, "delete trigger missed"
+
+
+# --- Test 24: search_stops uses FTS5 (token+prefix) with a LIKE fallback
+def test_24_fts_search_and_like_fallback(writer, store):
+    writer.add_stop("S1", "Oaks Cross")
+    writer.add_stop("S2", "Oakscross Road")
+    writer.add_stop("S3", "100% Bus Stop")
+    writer.add_stop("S4", "Under_Score Stop")
+    writer.commit()
+    # FTS5 token+prefix: "oaks" matches both "Oaks" and "Oakscross".
+    assert {s["naptan"] for s in store.search_stops("oaks")} == {"S1", "S2"}
+    # FTS5 AND: both tokens must match.
+    assert {s["naptan"] for s in store.search_stops("bus stop")} == {"S3"}
+    # LIKE fallback: mid-token substring FTS5 cannot express.
+    assert {s["naptan"] for s in store.search_stops("kscr")} == {"S2"}
+    # Untokenizable input -> LIKE fallback (wildcards match literally).
+    assert {s["naptan"] for s in store.search_stops("%")} == {"S3"}
+    assert {s["naptan"] for s in store.search_stops("_")} == {"S4"}
+    # Short query (< 2 chars) -> LIKE directly (substring, not prefix).
+    assert {s["naptan"] for s in store.search_stops("o")} == {"S1", "S2", "S3", "S4"}
+    # resolve_stop: FTS5 path (capped) and NaPTAN literal unchanged.
+    assert store.resolve_stop("oaks") == {"S1", "S2"}
+    assert store.resolve_stop("010A") == {"010A"}
