@@ -18,7 +18,7 @@ import io
 import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -305,6 +305,13 @@ async def load_dataset(ds_id: int, client: Optional[httpx.AsyncClient] = None) -
     return await _load_dataset(ds_id, client=client)
 
 
+def _xml_contents(z: zipfile.ZipFile) -> Iterator[str]:
+    """Yield each .xml member's decoded text, one at a time."""
+    for name in z.namelist():
+        if name.endswith(".xml"):
+            yield z.read(name).decode("utf-8", errors="ignore")
+
+
 async def _load_dataset(ds_id: int, force_reload: bool = False,
                         client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
     """Returns meta on success, None on failure (caller counts errors).
@@ -331,14 +338,13 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
 
         try:
             z = zipfile.ZipFile(io.BytesIO(zip_resp.content))
-            xml_files = [n for n in z.namelist() if n.endswith(".xml")]
-            contents = [z.read(n).decode("utf-8", errors="ignore") for n in xml_files]
+            contents = _xml_contents(z)
         except zipfile.BadZipFile:
             # Some BODS datasets publish a bare TransXChange XML document
             # instead of a zip container.
             head = zip_resp.content[:200].lstrip()
             if head.startswith(b"<?xml") or b"<TransXChange" in head:
-                contents = [zip_resp.content.decode("utf-8", errors="ignore")]
+                contents = iter([zip_resp.content.decode("utf-8", errors="ignore")])
             else:
                 return None
 

@@ -189,6 +189,18 @@ asyncio.run(_run())
 assert _CountingClient.instances == 1, f"expected 1 client, got {_CountingClient.instances}"
 print("7. _load_dataset reuses shared client: OK")
 
+# --- Test 8: _xml_contents yields one XML at a time
+import zipfile as _zf
+buf = io.BytesIO()
+with _zf.ZipFile(buf, "w") as z:
+    z.writestr("a.xml", "<A/>")
+    z.writestr("b.txt", "not xml")
+    z.writestr("c.xml", "<C/>")
+buf.seek(0)
+z = _zf.ZipFile(buf)
+assert list(server._xml_contents(z)) == ["<A/>", "<C/>"], "non-xml leaked or order wrong"
+print("8. _xml_contents lazy generator: OK")
+
 # --- Test 12: force_refresh purges datasets withdrawn from the catalogue
 class _CatClient(_FakeClient):
     async def get(self, url):
