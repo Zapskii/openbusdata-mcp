@@ -120,4 +120,19 @@ assert not writer.conn.execute(
     "dead route still discoverable"
 print("8. discard_dataset route semantics: OK")
 
+# --- Test 9: LIKE wildcards in user queries match literally
+writer.add_stop("0PCT", "100% Bus Stop")
+writer.add_stop("0UND", "Under_Score Stop")
+writer.add_stop("0BSL", "Back\\slash Stop")
+writer.commit()
+assert {s["naptan"] for s in store2.search_stops("%")} == {"0PCT"}, \
+    "bare % acted as a wildcard"
+assert {s["naptan"] for s in store2.search_stops("_")} == {"0UND"}, \
+    "bare _ acted as a wildcard"
+assert {s["naptan"] for s in store2.search_stops("% Bus")} == {"0PCT"}
+assert {s["naptan"] for s in store2.search_stops("\\")} == {"0BSL"}
+assert "0PCT" in {s["naptan"] for s in store2.search_stops("bus stop")}
+assert store2.resolve_stop("Under_Score") == {"0UND"}, "resolve_stop wildcards"
+print("9. LIKE wildcard escaping: OK")
+
 print("ALL UNIT TESTS PASS")

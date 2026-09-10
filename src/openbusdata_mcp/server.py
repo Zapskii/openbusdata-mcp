@@ -84,80 +84,9 @@ class Journey:
     dataset_id: int = 0  # BODS dataset this journey came from (enables surgical purge)
 
 
-class TimetableIndex:
-    """In-memory index of all parsed timetable data."""
-
-    def __init__(self):
-        self.stops: dict[str, Stop] = {}
-        self.routes: dict[str, Route] = {}
-        self.stop_to_routes: dict[str, set[str]] = {}
-        self.journeys: list[Journey] = []
-        self.loaded_datasets: set[int] = set()
-        # Per-dataset provenance for incremental (diff) refreshes:
-        #   ds_id -> {"modified": "2026-09-01T06:00:00Z", "operator": "..."}
-        self.dataset_meta: dict[int, dict] = {}
-        # Timestamp of the last completed catalogue sweep (ISO, UTC). Delta loads
-        # use it as the "since" watermark.
-        self.last_refresh: Optional[str] = None
-
-    def add_stop(self, stop: Stop):
-        if stop.naptan not in self.stops:
-            self.stops[stop.naptan] = stop
-        else:
-            if not self.stops[stop.naptan].name:
-                self.stops[stop.naptan].name = stop.name
-
-    def add_route(self, route: Route):
-        key = f"{route.operator}|{route.route_num}"
-        if key not in self.routes:
-            self.routes[key] = route
-        else:
-            self.routes[key].directions |= route.directions
-            if len(route.stops) > len(self.routes[key].stops):
-                self.routes[key].stops = route.stops
-        for naptan in route.stops:
-            if naptan not in self.stop_to_routes:
-                self.stop_to_routes[naptan] = set()
-            self.stop_to_routes[naptan].add(key)
-
-    def add_journey(self, journey: Journey):
-        self.journeys.append(journey)
-
-
-
-    def clear(self):
-        self.stops.clear()
-        self.routes.clear()
-        self.stop_to_routes.clear()
-        self.journeys.clear()
-        self.loaded_datasets.clear()
-        self.dataset_meta.clear()
-        self.last_refresh = None
-
-    def discard_dataset(self, ds_id: int):
-        """Remove all index entries contributed by a single dataset.
-
-        Journeys are tagged with their source dataset, so they purge exactly.
-        stop_to_routes is rebuilt from surviving journeys. Route *data* entries
-        are left in place: they are merged state across datasets and
-        self-heal when a replacement dataset is re-downloaded (add_route keeps
-        the longest stop sequence). A route left behind by a withdrawn
-        dataset is undiscoverable (no stop_to_routes ref) and is fully
-        removed by the next force_refresh / reconcile rebuild.
-        """
-        self.loaded_datasets.discard(ds_id)
-        self.dataset_meta.pop(ds_id, None)
-        self.journeys = [j for j in self.journeys if j.dataset_id != ds_id]
-        remaining_route_keys: set[str] = {f"{j.operator}|{j.route_num}" for j in self.journeys}
-        self.stop_to_routes = {
-            k: routes & remaining_route_keys
-            for k, routes in self.stop_to_routes.items()
-            if routes & remaining_route_keys
-        }
-
-
-# Global index
-index = TimetableIndex()
+# All queryable state lives in the SQLite store; the in-memory index that
+# predated it (and its discard_dataset merge semantics) is preserved in
+# TimetableWriter.discard_dataset.
 store = TimetableStore()
 writer = TimetableWriter()
 
@@ -933,23 +862,6 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
             return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _resolve_stop(stop_query: str) -> set[str]:
-    """Resolve a stop query to a set of NaPTAN codes (SQLite-backed)."""
-    if store.exists():
-        return store.resolve_stop(stop_query)
-    if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
-        return {stop_query}
-    query_lower = stop_query.lower()
-    matches = set()
-    for naptan, stop in index.stops.items():
-        if query_lower in stop.name.lower():
-            matches.add(naptan)
-    return matches
 
 
 # ---------------------------------------------------------------------------

@@ -3,19 +3,27 @@
 Runs once on a quiet host (peak ~9.5 GB RSS for the JSON parse). After this,
 the SQLite file is the durable index; the JSON cache is retired.
 """
+import argparse
 import json
 import os
 import resource
 import sqlite3
 import time
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--input", default="/data/timetable_cache.json",
+                    help="Path to the legacy timetable_cache.json")
+parser.add_argument("--output", default="/data/index.db",
+                    help="Path of the SQLite index.db to create")
+args = parser.parse_args()
+
 t0 = time.time()
 print("parsing 2.5GB json (peak ~9.5GB RSS, host quiet)...", flush=True)
-with open("/data/timetable_cache.json", encoding="utf-8") as f:
+with open(args.input, encoding="utf-8") as f:
     cache = json.load(f)
 print(f"parsed {time.time() - t0:.0f}s, peak {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}MB", flush=True)
 
-db = sqlite3.connect("/data/index.db")
+db = sqlite3.connect(args.output)
 db.execute("PRAGMA journal_mode=OFF")
 db.execute("PRAGMA synchronous=OFF")
 db.executescript("""
@@ -53,7 +61,7 @@ db.executemany(
      ("last_refresh", cache.get("last_refresh") or "")])
 db.commit()
 
-print(f"DB: {os.path.getsize('/data/index.db') // 1000000}MB, "
+print(f"DB: {os.path.getsize(args.output) // 1000000}MB, "
       f"{time.time() - t0:.0f}s total, peak {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}MB",
       flush=True)
 print("MIGRATION COMPLETE", flush=True)
