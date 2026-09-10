@@ -171,4 +171,18 @@ assert "operatorRef=A%26B" in captured[0], captured[0]
 assert "lineRef=1%202" in captured[0], captured[0]
 print("6. live-buses params URL-encoded: OK")
 
+# --- Test 12: force_refresh purges datasets withdrawn from the catalogue
+class _CatClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/?" in url:
+            return _Resp(200, b'{"results":[{"id":1}]}')
+        return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+
+w = TimetableWriter(); w.ensure_schema()
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+server.httpx.AsyncClient = _CatClient
+asyncio.run(server.load_all_timetable_data(force_refresh=True))
+assert 2 not in w.loaded_ids(), "withdrawn dataset not purged on force_refresh"
+print("12. force_refresh reconciles withdrawn datasets: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")

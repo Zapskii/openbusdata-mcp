@@ -394,7 +394,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             offset += limit
 
     # Reconcile: purge datasets that disappeared from the catalogue.
-    if not force_refresh and all_ids:
+    if all_ids:
         known = set(all_ids)
         for ds_id in [i for i in writer.loaded_ids() if i not in known]:
             writer.discard_dataset(ds_id)
