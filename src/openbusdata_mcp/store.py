@@ -1,6 +1,6 @@
 """SQLite-backed timetable store: disk-backed index for openbusdata-mcp.
 
-Replaces the in-memory TimetableIndex for query tools. Same tool output
+Replaces the in-memory timetable index for query tools. Same tool output
 shapes, but memory is O(query) instead of O(entire UK timetable).
 """
 import json
@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path.home() / ".cache" / "openbusdata" / "index.db"
+
+def _like_escape(text: str) -> str:
+    """Escape LIKE wildcards so user input matches literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 # Cap on how many NaPTANs a fuzzy stop query may resolve to: resolved sets
 # feed `IN (...)` clauses built from `?` placeholders, and past SQLite's
@@ -39,7 +44,7 @@ def _parse_time(text: str) -> Optional[str]:
 
 
 class TimetableStore:
-    """Query interface over index.db. Mirrors TimetableIndex semantics."""
+    """Read-only query interface over index.db."""
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = Path(db_path) if db_path else DB_PATH
@@ -72,9 +77,9 @@ class TimetableStore:
 
     # -- stops --------------------------------------------------------------
     def search_stops(self, query: str, limit: int = 50) -> list[dict]:
-        q = f"%{query.lower()}%"
+        q = f"%{_like_escape(query.lower())}%"
         rows = self.conn.execute(
-            "SELECT naptan, name FROM stops WHERE LOWER(name) LIKE ? "
+            "SELECT naptan, name FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             "ORDER BY name LIMIT ?", (q, limit)).fetchall()
         return [{"naptan": n, "name": name} for n, name in rows]
 
@@ -83,9 +88,9 @@ class TimetableStore:
         if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
             return {stop_query}
         return {r[0] for r in self.conn.execute(
-            "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? "
+            "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             f"LIMIT {MAX_RESOLVE}",
-            (f"%{stop_query.lower()}%",))}
+            (f"%{_like_escape(stop_query.lower())}%",))}
 
     def stop_name(self, naptan: str) -> str:
         row = self.conn.execute(
@@ -414,8 +419,7 @@ class TimetableWriter:
 
     def upsert_route(self, op: str, num: str, directions: set, stop_list: list,
                      ds_id: int):
-        """Merge semantics from TimetableIndex.add_route: union directions,
-        keep the longest stop sequence."""
+        """Merge semantics: union directions, keep the longest stop sequence."""
         key = f"{op}|{num}"
         dirs_json = json.dumps(sorted(directions))
         stops_json = json.dumps(stop_list)
