@@ -137,20 +137,19 @@ class TimetableStore:
     def get_route_stops(self, operator: str, route: str,
                         direction: Optional[str] = None) -> list[dict]:
         q = (f"%{route.lower()}%", f"%{operator.lower()}%")
-        extra, args = "", list(q)
-        if direction:
-            extra = " AND LOWER(directions) LIKE ?"
-            args.append(f'%"{direction.lower()}"%')
         rows = self.conn.execute(
-            f"SELECT op, num, directions, stops FROM routes "
-            f"WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?{extra}", args).fetchall()
+            "SELECT op, num, directions, stops FROM routes "
+            "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
         matches = []
         for op, num, directions, stops in rows:
+            dirs = json.loads(directions)
+            if direction and direction.lower() not in [d.lower() for d in dirs]:
+                continue
             stop_list = json.loads(stops)
             names = self.stop_names_bulk(stop_list)
             matches.append({
                 "operator": op, "route": num,
-                "directions": sorted(json.loads(directions)),
+                "directions": sorted(dirs),
                 "stops": [{"naptan": n, "name": names.get(n, "Unknown")}
                           for n in stop_list]})
         return matches
@@ -471,6 +470,13 @@ class TimetableWriter:
         self.conn.executemany(
             "INSERT OR IGNORE INTO stop_to_routes VALUES (?,?)",
             [(n, key) for n in stop_list])
+        if stop_list:
+            marks = ",".join("?" * len(stop_list))
+            self.conn.execute(
+                f"DELETE FROM stop_to_routes WHERE key=? AND naptan NOT IN ({marks})",
+                [key] + list(stop_list))
+        else:
+            self.conn.execute("DELETE FROM stop_to_routes WHERE key=?", (key,))
 
     def add_journey(self, op: str, num: str, direction: str, code: str,
                     days: set, stops: list, ds_id: int):

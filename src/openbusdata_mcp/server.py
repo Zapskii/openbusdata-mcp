@@ -157,9 +157,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
     except ET.ParseError:
         return [], [], []
 
-    ns = ""
-    if 'xmlns="' in content:
-        ns = content.split('xmlns="')[1].split('"')[0]
+    ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
 
     q = lambda tag: _get_ns(tag, ns)
 
@@ -168,14 +166,12 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
     journeys: list[Journey] = []
 
     # --- Extract StopPoints ---
-    stop_map: dict[str, str] = {}
     for asp in root.iter(q("AnnotatedStopPointRef")):
         ref_elem = asp.find(q("StopPointRef"))
         name_elem = asp.find(q("CommonName"))
         if ref_elem is not None:
             naptan = ref_elem.text
             name = name_elem.text if name_elem is not None else "Unknown"
-            stop_map[naptan] = name
             stops.append(Stop(naptan=naptan, name=name))
 
     # --- Extract JourneyPatternSections with timing ---
@@ -389,6 +385,30 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             await client.aclose()
 
 
+async def _sweep_catalogue(client: httpx.AsyncClient) -> tuple[dict[int, dict], bool]:
+    """Sweep the BODS catalogue, returning ({id: entry}, complete).
+
+    complete is True only when the sweep finished normally (empty or short
+    page); False when it broke on a non-200 page (partial view).
+    """
+    catalog: dict[int, dict] = {}
+    offset = 0
+    limit = 100
+    while True:
+        resp = await client.get(
+            f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
+        if resp.status_code != 200:
+            return catalog, False
+        results = resp.json().get("results", [])
+        if not results:
+            return catalog, True
+        for r in results:
+            catalog[r["id"]] = r
+        if len(results) < limit:
+            return catalog, True
+        offset += limit
+
+
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
     """Load all accessible timetable datasets into the SQLite index.
 
@@ -399,25 +419,8 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     writer.ensure_schema()
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        all_ids: list[int] = []
-        offset = 0
-        limit = 100
-        sweep_complete = False
-        while True:
-            resp = await client.get(f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                sweep_complete = True
-                break
-            for r in results:
-                all_ids.append(r["id"])
-            if len(results) < limit:
-                sweep_complete = True
-                break
-            offset += limit
+        catalog, sweep_complete = await _sweep_catalogue(client)
+        all_ids = list(catalog)
 
     # Reconcile: purge datasets that disappeared from the catalogue. Only when
     # the sweep completed — a partial sweep (broke on a non-200 page) has only
@@ -461,14 +464,18 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
     j, s, r, d = writer.counts()
-    failed_note = ""
-    if failed_ids:
-        shown = ", ".join(str(i) for i in failed_ids[:20])
-        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
-        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
+    failed_note = _format_failed(failed_ids)
     return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
             f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
             + failed_note)
+
+
+def _format_failed(failed_ids: list[int]) -> str:
+    if not failed_ids:
+        return ""
+    shown = ", ".join(str(i) for i in failed_ids[:20])
+    more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
+    return f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
 
 
 def _parse_bods_ts(value: Optional[str]) -> Optional[datetime]:
@@ -512,22 +519,7 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     sweep_start = datetime.now(timezone.utc)
 
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        catalog: dict[int, dict] = {}
-        offset = 0
-        limit = 100
-        while True:
-            resp = await client.get(
-                f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
-            if resp.status_code != 200:
-                break
-            results = resp.json().get("results", [])
-            if not results:
-                break
-            for r in results:
-                catalog[r["id"]] = r
-            if len(results) < limit:
-                break
-            offset += limit
+        catalog, _ = await _sweep_catalogue(client)
 
     if not catalog:
         return "Catalogue sweep failed (non-200 or empty) - watermark left untouched."
@@ -570,11 +562,7 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         writer.set_last_refresh(sweep_start.isoformat())
         writer.commit()
     j, s, r, d = writer.counts()
-    failed_note = ""
-    if failed_ids:
-        shown = ", ".join(str(i) for i in failed_ids[:20])
-        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
-        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
+    failed_note = _format_failed(failed_ids)
     watermark_note = ""
     if errors > error_budget:
         watermark_note = (f" Watermark NOT advanced (errors {errors} > budget {error_budget}) "
@@ -887,14 +875,14 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
             ns = "http://www.siri.org.uk/siri"
+            def get_text(tag):
+                el = mvj.find(f"{{{ns}}}{tag}")
+                return el.text if el is not None else "N/A"
             buses = []
             for activity in root.iter(f"{{{ns}}}VehicleActivity"):
                 mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
                 if mvj is None:
                     continue
-                def get_text(tag):
-                    el = mvj.find(f"{{{ns}}}{tag}")
-                    return el.text if el is not None else "N/A"
                 loc = mvj.find(f"{{{ns}}}VehicleLocation")
                 lat = lon = "N/A"
                 if loc is not None:

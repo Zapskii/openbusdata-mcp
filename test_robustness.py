@@ -333,4 +333,42 @@ asyncio.run(server.load_all_timetable_data(force_refresh=True))
 assert 2 in w.loaded_ids(), "partial sweep purged a dataset still in the catalogue"
 print("21. partial catalogue sweep does not purge loaded datasets: OK")
 
+# --- Test 9: _sweep_catalogue paginates and returns ({id: entry}, complete)
+class _PagedClient(_FakeClient):
+    def __init__(self, **kw):
+        self.calls = 0
+    async def get(self, url):
+        self.calls += 1
+        if self.calls == 1:
+            return _Resp(200, b'{"results":[{"id":1},{"id":2}]}')
+        return _Resp(200, b'{"results":[]}')
+
+server.httpx.AsyncClient = _PagedClient
+async def _sweep():
+    async with server.httpx.AsyncClient() as c:
+        return await server._sweep_catalogue(c)
+cat, complete = asyncio.run(_sweep())
+assert set(cat) == {1, 2} and complete, (cat, complete)
+print("9. _sweep_catalogue pagination: OK")
+
+# --- Test 10: _format_failed truncates and formats
+assert server._format_failed([]) == ""
+assert server._format_failed([1, 2]) == " Failed dataset IDs: [1, 2] (details on stderr)."
+long = list(range(25))
+s = server._format_failed(long)
+assert "0, 1, 2" in s and "(+5 more)" in s, s
+print("10. _format_failed helper: OK")
+
+# --- Test 11: parse_transxchange handles namespaced and bare XML
+ns_xml = ('<TransXChange xmlns="http://www.transxchange.org.uk/">'
+          '<StopPoints><AnnotatedStopPointRef><StopPointRef>010A</StopPointRef>'
+          '<CommonName>Alpha</CommonName></AnnotatedStopPointRef></StopPoints>'
+          '</TransXChange>')
+stops, routes, journeys = server.parse_transxchange(ns_xml, "Op")
+assert stops and stops[0].naptan == "010A", f"namespaced parse failed: {stops}"
+bare = "<TransXChange><StopPoints><AnnotatedStopPointRef><StopPointRef>010B</StopPointRef><CommonName>Beta</CommonName></AnnotatedStopPointRef></StopPoints></TransXChange>"
+stops, _, _ = server.parse_transxchange(bare, "Op")
+assert stops and stops[0].naptan == "010B", f"bare parse failed: {stops}"
+print("11. namespace from root.tag: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")
