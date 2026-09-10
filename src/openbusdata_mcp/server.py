@@ -847,7 +847,8 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
       operator_ref: Operator NOC code (e.g. ARBB, SCCM, CBBH).
       line_ref: Route number (e.g. 12, MK1, 100).
     """
-    full_url = f"{BASE_URL}/api/v1/datafeed/?operatorRef={operator_ref}&lineRef={line_ref}&api_key={API_KEY}"
+    query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
+    full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(full_url)

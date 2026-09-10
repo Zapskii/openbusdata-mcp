@@ -163,4 +163,12 @@ assert {p["legs"][0]["operator"] for p in plans} == {"OpOne", "OpTwo"}, \
     "dedup collapsed distinct operators"
 print("5. plan dedup keeps distinct operators: OK")
 
+# --- Test 6: live-buses URL params are percent-encoded
+captured.clear()
+server.httpx.AsyncClient = _FakeClient
+result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
+assert "operatorRef=A%26B" in captured[0], captured[0]
+assert "lineRef=1%202" in captured[0], captured[0]
+print("6. live-buses params URL-encoded: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")
