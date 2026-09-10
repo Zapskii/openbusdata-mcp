@@ -223,4 +223,22 @@ plan = writer.conn.execute(
 assert any("j_oproute" in str(row) for row in plan), f"index not used: {plan}"
 print("20. discard_dataset index-only scan: OK")
 
+# --- Test 21: ensure_schema backfills journey_stops for pre-existing journeys
+# A pre-Phase-2 DB has journeys but no journey_stops rows and no backfill flag;
+# ensure_schema must populate the index table once (in-place upgrade, no rebuild).
+_bk = Path(tempfile.mkdtemp()) / "upgrade.db"
+w2 = TimetableWriter(_bk)
+w2.ensure_schema()
+w2.add_journey("Op", "21", "outbound", "J21", {"mon"},
+               [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 5)
+w2.conn.execute("DELETE FROM journey_stops")  # simulate a pre-Phase-2 DB
+w2.conn.execute("DELETE FROM meta WHERE k='journey_stops_backfilled'")
+w2.conn.commit()
+w2.ensure_schema()  # must backfill
+n = w2.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE journey_id=1").fetchone()[0]
+assert n == 2, f"backfill missing: {n}"
+print("21. ensure_schema backfills journey_stops: OK")
+
 print("ALL UNIT TESTS PASS")

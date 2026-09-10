@@ -353,10 +353,24 @@ class TimetableWriter:
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT);
         CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
         CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
+        CREATE INDEX IF NOT EXISTS js_j ON journey_stops(journey_id);
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
         """)
+        # One-time backfill: journey_stops only gets populated by add_journey,
+        # so a DB upgraded in place (journeys already present) would have an
+        # empty index table and every stop->journey query would silently return
+        # nothing. Backfill from the stored stops JSON once, keyed on a meta
+        # flag so it never re-runs.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stops_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO journey_stops (naptan, journey_id) "
+                "SELECT json_extract(value, '$.naptan'), j.id "
+                "FROM journeys j, json_each(j.json, '$.stops')")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('journey_stops_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
