@@ -242,6 +242,36 @@ assert w.conn.execute("SELECT COUNT(*) FROM journeys WHERE ds_id=2").fetchone()[
     "journeys lost to a partial purge"
 print("13. mid-rewrite failure rolls back purge: OK")
 
+# --- Test 20: watermark stays put when soft failures exceed the delta budget
+# Task 1.1's core guarantee: failed downloads must not let the delta watermark
+# advance past datasets that never refreshed. 3 soft failures (zip 404s) with
+# 0 updated -> budget = max(2, 0) = 2 -> 3 > 2 -> watermark must NOT move.
+w = TimetableWriter(); w.ensure_schema()
+for _ds, _rt in ((2, "2"), (3, "3"), (4, "4")):
+    w.add_journey("Op", _rt, "outbound", f"J{_ds}", {"mon"},
+                  [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                   {"naptan": "010B", "arrival": "09:10:00", "departure": None}], _ds)
+    w.mark_dataset_loaded(_ds, "2026-01-01T00:00:00Z", "Op")
+w.set_last_refresh("2026-01-01T00:00:00Z"); w.commit()
+
+class _DeltaFailClient(_FakeClient):
+    """Catalogue + per-dataset meta OK, every zip download 404s."""
+    async def get(self, url):
+        if "/dataset/?" in url:
+            return _Resp(200, b'{"results":[{"id":2,"modified":"2026-09-01T00:00:00Z"},'
+                               b'{"id":3,"modified":"2026-09-01T00:00:00Z"},'
+                               b'{"id":4,"modified":"2026-09-01T00:00:00Z"}]}')
+        if any(f"/dataset/{i}/" in url for i in (2, 3, 4)):
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _DeltaFailClient
+before = w.last_refresh()
+asyncio.run(server._load_timetable_delta())
+assert w.last_refresh() == before, \
+    f"watermark advanced despite 3 errors > budget 2: {before} -> {w.last_refresh()}"
+print("20. watermark held when soft failures exceed the delta budget: OK")
+
 # --- Test 21: a partial catalogue sweep must not purge loaded datasets
 # A sweep that breaks on a non-200 page has only seen part of the catalogue;
 # datasets missing from that partial view may still be live, so reconcile
