@@ -468,14 +468,18 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
     j, s, r, d = writer.counts()
-    failed_note = ""
-    if failed_ids:
-        shown = ", ".join(str(i) for i in failed_ids[:20])
-        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
-        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
+    failed_note = _format_failed(failed_ids)
     return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
             f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
             + failed_note)
+
+
+def _format_failed(failed_ids: list[int]) -> str:
+    if not failed_ids:
+        return ""
+    shown = ", ".join(str(i) for i in failed_ids[:20])
+    more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
+    return f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
 
 
 def _parse_bods_ts(value: Optional[str]) -> Optional[datetime]:
@@ -562,11 +566,7 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         writer.set_last_refresh(sweep_start.isoformat())
         writer.commit()
     j, s, r, d = writer.counts()
-    failed_note = ""
-    if failed_ids:
-        shown = ", ".join(str(i) for i in failed_ids[:20])
-        more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
-        failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
+    failed_note = _format_failed(failed_ids)
     watermark_note = ""
     if errors > error_budget:
         watermark_note = (f" Watermark NOT advanced (errors {errors} > budget {error_budget}) "

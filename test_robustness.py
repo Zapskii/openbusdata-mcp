@@ -351,4 +351,12 @@ cat, complete = asyncio.run(_sweep())
 assert set(cat) == {1, 2} and complete, (cat, complete)
 print("9. _sweep_catalogue pagination: OK")
 
+# --- Test 10: _format_failed truncates and formats
+assert server._format_failed([]) == ""
+assert server._format_failed([1, 2]) == " Failed dataset IDs: [1, 2] (details on stderr)."
+long = list(range(25))
+s = server._format_failed(long)
+assert "0, 1, 2" in s and "(+5 more)" in s, s
+print("10. _format_failed helper: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")
