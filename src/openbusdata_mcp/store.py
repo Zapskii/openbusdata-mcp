@@ -16,10 +16,10 @@ def _like_escape(text: str) -> str:
 
 
 # Cap on how many NaPTANs a fuzzy stop query may resolve to: resolved sets
-# feed `IN (...)` clauses built from `?` placeholders, and past SQLite's
-# 999-variable limit the query fails outright. Name-substring matches are
-# fuzzy anyway — the caller's results degrade gracefully past the cap.
-MAX_RESOLVE = 500
+# feed `IN (...)` clauses built from `?` placeholders, and find_routes_between
+# binds BOTH sets in one query, so the combined count must stay under SQLite's
+# 999-variable limit (pre-3.32). 400 + 400 = 800 < 999.
+MAX_RESOLVE = 400
 
 
 def _parse_time(text: str) -> Optional[str]:

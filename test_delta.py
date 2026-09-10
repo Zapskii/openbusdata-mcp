@@ -155,4 +155,11 @@ assert p("10:30:-5") is None, "negative seconds accepted"
 assert p("10:30:00") == "10:30:00"
 print("18. negative time components rejected: OK")
 
+# --- Test 19: find_routes_between stays under the SQLite variable limit
+a = store2.resolve_stop("Common Road")
+b = store2.resolve_stop("Common Road")
+assert len(a) + len(b) < 999, f"combined params {len(a) + len(b)} >= 999"
+store2.find_routes_between(a, b)  # must not raise "too many SQL variables"
+print("19. combined IN-clause params capped: OK")
+
 print("ALL UNIT TESTS PASS")
