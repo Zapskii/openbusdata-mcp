@@ -233,7 +233,10 @@ def test_15_candidate_journeys_shared_helper(writer, store):
 
 # --- Test 20: discard_dataset surviving-key scan uses the j_oproute index
 def test_20_discard_dataset_index_only_scan(writer, store):
-    writer.add_journey("Op", "20", "outbound", "J20", {"mon"}, stops(), 99)
+    # Seed enough journeys that the planner must choose the covering
+    # j_oproute index for the DISTINCT scan (robust across SQLite versions).
+    for i in range(300):
+        writer.add_journey("Op", f"20-{i}", "outbound", f"J{i}", {"mon"}, stops(), 99)
     writer.commit()
     plan = writer.conn.execute(
         "EXPLAIN QUERY PLAN SELECT DISTINCT op, route FROM journeys").fetchall()
