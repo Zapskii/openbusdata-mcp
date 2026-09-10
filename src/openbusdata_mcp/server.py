@@ -342,27 +342,34 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> Optional[dict
         # ensure_schema commits, so it runs BEFORE the purge to keep purge +
         # rewrite inside the single per-dataset transaction closed below.
         writer.ensure_schema()
-        if force_reload:
-            writer.discard_dataset(ds_id)
+        try:
+            if force_reload:
+                writer.discard_dataset(ds_id)
 
-        for content in contents:
-            stops, routes, journeys = parse_transxchange(content, operator)
-            for stop in stops:
-                writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
-            for route in routes:
-                # Legacy (untagged) journeys for this op+route are superseded
-                # by this tagged write.
-                writer.discard_untagged_for(route.operator, route.route_num)
-                writer.upsert_route(route.operator, route.route_num,
-                                    route.directions, route.stops, ds_id)
-            for journey in journeys:
-                writer.add_journey(
-                    journey.operator, journey.route_num, journey.direction,
-                    journey.journey_code, journey.days,
-                    [asdict(s) for s in journey.stops], ds_id)
+            for content in contents:
+                stops, routes, journeys = parse_transxchange(content, operator)
+                for stop in stops:
+                    writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
+                for route in routes:
+                    # Legacy (untagged) journeys for this op+route are superseded
+                    # by this tagged write.
+                    writer.discard_untagged_for(route.operator, route.route_num)
+                    writer.upsert_route(route.operator, route.route_num,
+                                        route.directions, route.stops, ds_id)
+                for journey in journeys:
+                    writer.add_journey(
+                        journey.operator, journey.route_num, journey.direction,
+                        journey.journey_code, journey.days,
+                        [asdict(s) for s in journey.stops], ds_id)
 
-        writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
-        writer.commit()  # one transaction per dataset: implicit checkpoint
+            writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
+            writer.commit()  # one transaction per dataset: implicit checkpoint
+        except Exception:
+            # A failure mid-rewrite must not leave the purge uncommitted:
+            # the next ensure_schema() would commit it, persisting a partial
+            # purge. Roll the whole purge + rewrite back and re-raise.
+            writer.conn.rollback()
+            raise
         return meta
 
 

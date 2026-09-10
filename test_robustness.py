@@ -185,4 +185,61 @@ asyncio.run(server.load_all_timetable_data(force_refresh=True))
 assert 2 not in w.loaded_ids(), "withdrawn dataset not purged on force_refresh"
 print("12. force_refresh reconciles withdrawn datasets: OK")
 
+# --- Test 13: mid-rewrite failure rolls back the purge
+w = TimetableWriter(); w.ensure_schema()
+w.add_journey("Op", "2", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 2)
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+
+# The rewrite must reach writer.add_journey for the injected failure to fire
+# mid-write, so the zip carries a TransXChange with one real journey.
+_JOURNEY_XML = b"""<TransXChange>
+  <PublishedLineName>2</PublishedLineName>
+  <JourneyPatternSection id="jps1">
+    <JourneyPatternTimingLink>
+      <From><StopPointRef>010A</StopPointRef></From>
+      <To><StopPointRef>010B</StopPointRef></To>
+      <RunTime>PT10M</RunTime>
+    </JourneyPatternTimingLink>
+  </JourneyPatternSection>
+  <JourneyPattern id="jp1">
+    <Direction>outbound</Direction>
+    <JourneyPatternSectionRefs>jps1</JourneyPatternSectionRefs>
+  </JourneyPattern>
+  <VehicleJourney>
+    <VehicleJourneyCode>J2</VehicleJourneyCode>
+    <JourneyPatternRef>jp1</JourneyPatternRef>
+    <DepartureTime>09:00:00</DepartureTime>
+    <OperatingProfile><RegularDayType><DaysOfWeek><Monday/></DaysOfWeek></RegularDayType></OperatingProfile>
+  </VehicleJourney>
+</TransXChange>"""
+
+class _ZipJourneyClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(200, _make_zip(_JOURNEY_XML))
+
+server.httpx.AsyncClient = _ZipJourneyClient
+orig_add = server.writer.add_journey
+def _boom(*a, **k):
+    raise RuntimeError("disk full")
+server.writer.add_journey = _boom
+try:
+    try:
+        asyncio.run(server._load_dataset(2, force_reload=True))
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError:
+        pass
+finally:
+    server.writer.add_journey = orig_add
+# The next ensure_schema() is what would commit the orphaned purge
+# transaction; after a rollback it must find the dataset intact.
+server.writer.ensure_schema()
+assert 2 in w.loaded_ids(), "purge not rolled back after mid-rewrite failure"
+assert w.conn.execute("SELECT COUNT(*) FROM journeys WHERE ds_id=2").fetchone()[0] == 1, \
+    "journeys lost to a partial purge"
+print("13. mid-rewrite failure rolls back purge: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")
