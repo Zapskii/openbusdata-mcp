@@ -646,7 +646,12 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                 print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
                       file=sys.stderr, flush=True)
 
-    if errors == 0:
+    # Watermark policy: advance when the run is essentially clean. A single
+    # permanently-broken dataset must not freeze the watermark forever (that
+    # would re-download the whole catalogue every run); failures stay listed
+    # above and are retried next sweep since their `modified` stays > reference.
+    error_budget = max(2, int(updated * 0.01))
+    if errors <= error_budget:
         writer.set_last_refresh(sweep_start.isoformat())
         writer.commit()
     j, s, r, d = writer.counts()
@@ -655,12 +660,14 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         shown = ", ".join(str(i) for i in failed_ids[:20])
         more = f" (+{len(failed_ids) - 20} more)" if len(failed_ids) > 20 else ""
         failed_note = f" Failed dataset IDs: [{shown}{more}] (details on stderr)."
+    watermark_note = ""
+    if errors > error_budget:
+        watermark_note = (f" Watermark NOT advanced (errors {errors} > budget {error_budget}) "
+                          "- re-run to retry the failures.")
     return (f"Delta update: {updated} refreshed, {purged} purged, {errors} errors "
             f"(reference: {reference.isoformat()}). "
             f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."
-            + (" Watermark NOT advanced - re-run to retry the failures."
-               if errors else "")
-            + failed_note)
+            + watermark_note + failed_note)
 
 
 # ---------------------------------------------------------------------------
