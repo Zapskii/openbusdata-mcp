@@ -1,6 +1,6 @@
 import sys, tempfile
 from pathlib import Path
-sys.path.insert(0, "/home/hermes/openbusdata-fork/src")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import openbusdata_mcp.store as store_mod  # noqa: E402
 
@@ -68,5 +68,56 @@ rows = store3.get_route_stops("Op", "9")
 assert rows, "route stops lost"
 assert store3.search_stops("Test Stop"), "stop search lost"
 print("5. stop_to_routes rebuild: OK")
+
+# --- Test 6: post-midnight (24:00+) times survive unclamped, ordering intact
+p = store_mod._parse_time
+assert p("24:05") == "24:05:00", "post-midnight time clamped"
+assert p("23:59") == "23:59:00"
+assert p("25:70") is None and p("23:60") is None, "bad minutes/seconds accepted"
+assert p("garbage") is None and p("") is None
+writer.add_stop("010A", "Night A")
+writer.add_stop("010B", "Night B")
+writer.add_journey("Op", "N1", "outbound", "JN", {"sat"},
+                   [{"naptan": "010A", "arrival": None, "departure": "24:05:00"},
+                    {"naptan": "010B", "arrival": "24:30:00", "departure": None}], 99)
+writer.commit()
+buses = store2.find_buses_by_arrival_time({"010A"}, {"010B"}, "24:45", "sat")
+assert buses and buses[0]["arrive"] == "24:30:00", "post-midnight bus lost"
+assert not store2.find_buses_by_arrival_time({"010A"}, {"010B"}, "23:45", "sat"), \
+    "24:30 arrival matched a 23:45 target"
+print("6. post-midnight 24:00+ times: OK")
+
+# --- Test 7: fuzzy stop resolution is capped (SQLite 999-variable guard)
+for i in range(600):
+    writer.add_stop(f"9{i:04d}", f"Common Road {i}")
+writer.commit()
+resolved = store2.resolve_stop("Common Road")
+assert len(resolved) <= store_mod.MAX_RESOLVE, "resolve_stop unbounded"
+assert store2.resolve_stop("90599") == {"90599"}, "literal NaPTAN path broken"
+print("7. resolve_stop capped: OK")
+
+# --- Test 8: discard keeps routes served by other datasets, self-heals dead ones
+writer.add_journey("Op", "Shared", "outbound", "JS", {"mon"}, stops(), 99)
+writer.add_journey("Op", "Shared", "outbound", "JS2", {"mon"}, stops(), 42)
+writer.upsert_route("Op", "Shared", {"outbound"}, ["010A", "010B"], 42)
+writer.upsert_route("Op", "Gone", {"outbound"}, ["010A"], 42)
+writer.add_journey("Op", "Gone", "outbound", "JG", {"mon"}, stops(), 42)
+writer.mark_dataset_loaded(42, "2026-09-03T06:00:00Z", "Op")
+writer.commit()
+writer.discard_dataset(42)
+writer.commit()
+assert writer.conn.execute(
+    "SELECT 1 FROM routes WHERE key='Op|Shared'").fetchone(), \
+    "route row deleted though ds99 still serves it"
+assert writer.conn.execute(
+    "SELECT COUNT(*) FROM stop_to_routes WHERE key='Op|Shared'").fetchone()[0] == 2, \
+    "discoverability lost for a surviving shared route"
+assert writer.conn.execute(
+    "SELECT 1 FROM routes WHERE key='Op|Gone'").fetchone(), \
+    "dead route row should self-heal via re-download, not delete"
+assert not writer.conn.execute(
+    "SELECT 1 FROM stop_to_routes WHERE key='Op|Gone'").fetchone(), \
+    "dead route still discoverable"
+print("8. discard_dataset route semantics: OK")
 
 print("ALL UNIT TESTS PASS")

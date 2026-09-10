@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, time, timezone
-from .store import TimetableStore, TimetableWriter
+from datetime import datetime, timedelta, timezone
+from .store import TimetableStore, TimetableWriter, _parse_time
 from collections import defaultdict
 
 import httpx
@@ -67,8 +67,10 @@ class Route:
 @dataclass(slots=True)
 class JourneyStop:
     naptan: str
-    arrival: Optional[time] = None
-    departure: Optional[time] = None
+    # Normalized 'HH:MM:SS' strings, hours NOT clamped at 24 (service-day
+    # times past midnight publish as 24:00+); string ordering is the clock.
+    arrival: Optional[str] = None
+    departure: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -190,18 +192,13 @@ def _parse_duration(text: str) -> timedelta:
     return total
 
 
-def _parse_time(text: str) -> Optional[time]:
-    """Parse HH:MM or HH:MM:SS."""
-    if not text:
-        return None
-    parts = text.strip().split(":")
-    try:
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
-        s = int(parts[2]) if len(parts) > 2 else 0
-        return time(hour=h % 24, minute=m, second=s)
-    except (ValueError, IndexError):
-        return None
+def _fmt_seconds(total: int) -> str:
+    """Render seconds since the start of the service day as 'HH:MM:SS'.
+
+    Hours are NOT wrapped at 24: a journey departing 24:05 must stay
+    '25:10:30' after 1h10m of runtime, or arrival comparisons break.
+    """
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
 
 
 def _parse_days(op_profile) -> set[str]:
@@ -335,9 +332,11 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
         op_profile = vj.find(q("OperatingProfile"))
         days = _parse_days(op_profile)
 
-        # Build stop schedule by accumulating run times
+        # Build stop schedule by accumulating run times as seconds since the
+        # start of the service day (no 24-hour wraparound — see _fmt_seconds)
+        h, m, s = (int(x) for x in dep_time.split(":"))
+        current_seconds = h * 3600 + m * 60 + s
         journey_stops: list[JourneyStop] = []
-        current_time = datetime.combine(datetime.today(), dep_time)
 
         for sid in jp_data["section_ids"]:
             if sid not in jps_links:
@@ -345,10 +344,12 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
             for i, (from_ref, to_ref, runtime) in enumerate(jps_links[sid]):
                 if i == 0 and not journey_stops:
                     # First stop
-                    journey_stops.append(JourneyStop(naptan=from_ref, departure=current_time.time()))
+                    journey_stops.append(JourneyStop(
+                        naptan=from_ref, departure=_fmt_seconds(current_seconds)))
                 # Travel to next stop
-                current_time += runtime
-                journey_stops.append(JourneyStop(naptan=to_ref, arrival=current_time.time()))
+                current_seconds += int(runtime.total_seconds())
+                journey_stops.append(JourneyStop(
+                    naptan=to_ref, arrival=_fmt_seconds(current_seconds)))
 
         if len(journey_stops) >= 2:
             journeys.append(Journey(
@@ -408,9 +409,11 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
         if already and not force_reload:
             return meta
 
+        # ensure_schema commits, so it runs BEFORE the purge to keep purge +
+        # rewrite inside the single per-dataset transaction closed below.
+        writer.ensure_schema()
         if force_reload:
             writer.discard_dataset(ds_id)
-        writer.ensure_schema()
 
         for content in contents:
             stops, routes, journeys = parse_transxchange(content, operator)
@@ -465,6 +468,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
         known = set(all_ids)
         for ds_id in [i for i in writer.loaded_ids() if i not in known]:
             writer.discard_dataset(ds_id)
+        writer.commit()
 
     loaded = 0
     skipped = 0
@@ -566,6 +570,8 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         for ds_id in [i for i in writer.loaded_ids() if i not in catalog]:
             writer.discard_dataset(ds_id)
             purged += 1
+        if purged:
+            writer.commit()
 
     for ds_id, entry in catalog.items():
         modified = _parse_bods_ts(entry.get("modified"))
@@ -869,7 +875,7 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
     if day is None:
         day = datetime.now().strftime("%a").lower()
     day = day.lower()[:3]
-    target_s = target_time.isoformat()
+    target_s = target_time  # normalized 'HH:MM:SS' string from _parse_time
 
     plans = store.plan_direct(naptans_a, naptans_b, day, target_s)
     if max_changes >= 1:
@@ -884,7 +890,7 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
             seen.add(key)
             deduped.append(plan)
 
-    deduped.sort(key=lambda p: p["legs"][-1]["arrive"])
+    deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
     return json.dumps(deduped[:15], indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
 
 

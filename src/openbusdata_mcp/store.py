@@ -5,15 +5,25 @@ shapes, but memory is O(query) instead of O(entire UK timetable).
 """
 import json
 import sqlite3
-from datetime import time as _time
 from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path.home() / ".cache" / "openbusdata" / "index.db"
 
+# Cap on how many NaPTANs a fuzzy stop query may resolve to: resolved sets
+# feed `IN (...)` clauses built from `?` placeholders, and past SQLite's
+# 999-variable limit the query fails outright. Name-substring matches are
+# fuzzy anyway — the caller's results degrade gracefully past the cap.
+MAX_RESOLVE = 500
 
-def _parse_time(text: str):
-    """Parse HH:MM or HH:MM:SS (same semantics as server._parse_time)."""
+
+def _parse_time(text: str) -> Optional[str]:
+    """Parse HH:MM or HH:MM:SS into a normalized 'HH:MM:SS' string.
+
+    Hours are NOT clamped at 24: TransXChange publishes post-midnight
+    services as 24:00+, and stop times are compared as strings everywhere
+    (Python slices and SQL >=), so '24:05:00' > '23:59:59' must hold.
+    """
     if not text:
         return None
     parts = text.strip().split(":")
@@ -21,9 +31,11 @@ def _parse_time(text: str):
         h = int(parts[0])
         m = int(parts[1]) if len(parts) > 1 else 0
         s = int(parts[2]) if len(parts) > 2 else 0
-        return _time(hour=h % 24, minute=m, second=s)
     except (ValueError, IndexError):
         return None
+    if len(parts) > 3 or h < 0 or m > 59 or s > 59:
+        return None
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 class TimetableStore:
@@ -67,11 +79,12 @@ class TimetableStore:
         return [{"naptan": n, "name": name} for n, name in rows]
 
     def resolve_stop(self, stop_query: str) -> set[str]:
-        """Mirror _resolve_stop: digits = literal NaPTAN, else substring."""
+        """Digits = literal NaPTAN, else substring match (capped)."""
         if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
             return {stop_query}
         return {r[0] for r in self.conn.execute(
-            "SELECT naptan FROM stops WHERE LOWER(name) LIKE ?",
+            "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? "
+            f"LIMIT {MAX_RESOLVE}",
             (f"%{stop_query.lower()}%",))}
 
     def stop_name(self, naptan: str) -> str:
@@ -175,7 +188,7 @@ class TimetableStore:
         target = _parse_time(arrive_by)
         if target is None:
             return []
-        target_s = target.isoformat()
+        target_s = target
         out = []
         # Candidate journeys: touch B stop set at all (smaller set usually)
         for jid in self._journeys_touching(naptans_b):
@@ -434,18 +447,9 @@ class TimetableWriter:
 
     def add_journey(self, op: str, num: str, direction: str, code: str,
                     days: set, stops: list, ds_id: int):
-        from datetime import time as _t
-        norm = []
-        for st in stops:
-            st = dict(st)
-            for k in ("arrival", "departure"):
-                v = st.get(k)
-                if isinstance(v, _t):
-                    st[k] = v.isoformat()
-            norm.append(st)
         j = {"operator": op, "route_num": num, "direction": direction,
              "journey_code": code, "dataset_id": ds_id,
-             "days": sorted(days), "stops": norm}
+             "days": sorted(days), "stops": [dict(st) for st in stops]}
         self.conn.execute(
             "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
             "VALUES (?,?,?,?,?,?,?)",
@@ -475,11 +479,20 @@ class TimetableWriter:
             (op, route_num))
 
     def discard_dataset(self, ds_id: int):
-        """Surgical purge: journeys + this dataset's route contributions."""
+        """Purge one dataset's journeys + route discoverability (no commit).
+
+        Journeys are tagged with their source dataset, so they purge exactly.
+        Route *rows* are merged state across datasets — the ds_id column only
+        records the LAST contributor — so deleting by ds_id would drop routes
+        still served by a surviving dataset. Instead, route rows are left in
+        place and a route with no surviving journeys becomes undiscoverable
+        (its stop_to_routes refs go); it self-heals when a replacement
+        dataset is re-downloaded (upsert keeps the longest stop sequence),
+        and is fully removed by the next full rebuild. The caller owns the
+        transaction: purge + rewrite must commit together.
+        """
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
-        self.conn.execute("DELETE FROM routes WHERE ds_id=?", (ds_id,))
-        # stop_to_routes entries pointing at now-dead routes
         self.conn.execute(
-            "DELETE FROM stop_to_routes WHERE key NOT IN (SELECT key FROM routes)")
+            "DELETE FROM stop_to_routes WHERE key NOT IN "
+            "(SELECT DISTINCT op || '|' || route FROM journeys)")
         self.conn.execute("DELETE FROM loaded_datasets WHERE ds_id=?", (ds_id,))
-        self.conn.commit()
