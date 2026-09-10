@@ -3,7 +3,6 @@ FROM python:3.11-slim
 # See fork repo / Dockerfile.rationale in the patch commit for bug details.
 ENV PYTHONUNBUFFERED=1
 COPY . /build
-COPY bootstrap_chunked.py /bootstrap_chunked.py
 RUN pip install --no-cache-dir /build "mcp<2"
 # Timetable index cache (heavy first download) survives restarts via volume:
 #   -v openbusdata-cache:/root/.cache/openbusdata
