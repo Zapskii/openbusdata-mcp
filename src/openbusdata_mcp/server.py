@@ -408,7 +408,12 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             skipped += 1
             continue
         try:
-            await load_dataset(ds_id)
+            # force_refresh bypasses the resume guard in load_dataset: purge +
+            # rewrite through _load_dataset(force_reload=True) directly.
+            if force_refresh:
+                await _load_dataset(ds_id, force_reload=True)
+            else:
+                await load_dataset(ds_id)
             loaded += 1
         except Exception as e:
             errors += 1
