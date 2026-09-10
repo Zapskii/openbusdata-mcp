@@ -107,4 +107,41 @@ row = writer.conn.execute("SELECT k FROM meta WHERE k='dataset_meta'").fetchone(
 assert row is None, "legacy meta key not consumed"
 print("3. legacy meta promotion guards junk keys: OK")
 
+# --- Test 4: soft failures are counted as errors, not loaded
+import io, zipfile
+
+def _make_zip(xml: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("a.xml", xml)
+    return buf.getvalue()
+
+class _Resp:
+    def __init__(self, status_code=200, content=b"{}"):
+        self.status_code = status_code
+        self.content = content
+        self.text = content.decode("utf-8", "ignore")
+    def json(self):
+        return json.loads(self.content)
+
+class _ZipFailClient(_FakeClient):
+    """meta OK, zip download 404s -> _load_dataset must return None."""
+    async def get(self, url):
+        if "/dataset/1/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _ZipFailClient
+assert asyncio.run(server._load_dataset(1)) is None, "404 zip not reported as failure"
+
+class _ZipOkClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
+
+server.httpx.AsyncClient = _ZipOkClient
+assert asyncio.run(server._load_dataset(2)) is not None, "good zip not reported as success"
+print("4. soft failures counted as errors: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")

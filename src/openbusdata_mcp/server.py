@@ -293,7 +293,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 # ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
-async def load_dataset(ds_id: int) -> dict:
+async def load_dataset(ds_id: int) -> Optional[dict]:
     """Download and parse a single timetable dataset. Returns metadata.
 
     No-op when the dataset is already loaded (resume semantics); updating a
@@ -305,21 +305,22 @@ async def load_dataset(ds_id: int) -> dict:
     return await _load_dataset(ds_id)
 
 
-async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
+async def _load_dataset(ds_id: int, force_reload: bool = False) -> Optional[dict]:
+    """Returns meta on success, None on failure (caller counts errors)."""
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         meta_resp = await client.get(f"{BASE_URL}/api/v1/dataset/{ds_id}/?api_key={API_KEY}")
         if meta_resp.status_code != 200:
-            return {}
+            return None
         meta = meta_resp.json()
 
         operator = meta.get("operatorName", "Unknown")
         download_url = meta.get("url")
         if not download_url:
-            return meta
+            return meta  # not a timetable dataset; nothing to load
 
         zip_resp = await client.get(f"{download_url}?api_key={API_KEY}")
         if zip_resp.status_code != 200 or len(zip_resp.content) < 100:
-            return meta
+            return None
 
         try:
             z = zipfile.ZipFile(io.BytesIO(zip_resp.content))
@@ -332,7 +333,7 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
             if head.startswith(b"<?xml") or b"<TransXChange" in head:
                 contents = [zip_resp.content.decode("utf-8", errors="ignore")]
             else:
-                return meta
+                return None
 
         already = ds_id in writer.loaded_ids()
         if already and not force_reload:
@@ -411,10 +412,14 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             # force_refresh bypasses the resume guard in load_dataset: purge +
             # rewrite through _load_dataset(force_reload=True) directly.
             if force_refresh:
-                await _load_dataset(ds_id, force_reload=True)
+                result = await _load_dataset(ds_id, force_reload=True)
             else:
-                await load_dataset(ds_id)
-            loaded += 1
+                result = await load_dataset(ds_id)
+            if result is None:
+                errors += 1
+                failed_ids.append(ds_id)
+            else:
+                loaded += 1
         except Exception as e:
             errors += 1
             failed_ids.append(ds_id)
@@ -512,8 +517,12 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         # Unparseable/missing timestamps are treated as changed (conservative).
         if modified is None or modified > reference:
             try:
-                await _load_dataset(ds_id, force_reload=True)
-                updated += 1
+                result = await _load_dataset(ds_id, force_reload=True)
+                if result is None:
+                    errors += 1
+                    failed_ids.append(ds_id)
+                else:
+                    updated += 1
             except Exception as e:
                 errors += 1
                 failed_ids.append(ds_id)
