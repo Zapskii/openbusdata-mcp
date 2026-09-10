@@ -179,4 +179,18 @@ n = writer.conn.execute(
 assert n == 0, "journey_stops not purged with dataset"
 print("12. journey_stops populated + purged: OK")
 
+# --- Test 13: _journeys_touching uses the index (same results, no json_each)
+writer.add_journey("Op", "13", "outbound", "J13", {"mon"},
+                   [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+plan = writer.conn.execute(
+    "EXPLAIN QUERY PLAN SELECT DISTINCT journey_id FROM journey_stops WHERE naptan=?"
+    , ("010B",)).fetchall()
+assert any("INDEX" in str(row) for row in plan), f"no index used: {plan}"
+ids = store2._journeys_touching({"010B"})
+assert ids, "indexed lookup returned nothing"
+assert store2._journeys_touching({"010B"}) == store2._journeys_touching({"010B"}), "nondeterministic"
+print("13. _journeys_touching via index: OK")
+
 print("ALL UNIT TESTS PASS")

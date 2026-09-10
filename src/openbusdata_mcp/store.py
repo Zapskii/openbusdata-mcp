@@ -171,14 +171,12 @@ class TimetableStore:
         return self._journey_row_to_out(row) if row else None
 
     def _journeys_touching(self, naptans: set) -> list[int]:
-        """Journey ids whose stop list contains ANY of naptans."""
+        """Journey ids whose stop list contains ANY of naptans (indexed)."""
         if not naptans:
             return []
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(
-            f"SELECT id FROM journeys WHERE EXISTS ("
-            f"  SELECT 1 FROM json_each(journeys.json, '$.stops') "
-            f"  WHERE json_extract(value, '$.naptan') IN ({marks}))",
+            f"SELECT DISTINCT journey_id FROM journey_stops WHERE naptan IN ({marks})",
             list(naptans)).fetchall()
         return [r[0] for r in rows]
 
