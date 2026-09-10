@@ -293,7 +293,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 # ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
-async def load_dataset(ds_id: int) -> Optional[dict]:
+async def load_dataset(ds_id: int, client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
     """Download and parse a single timetable dataset. Returns metadata.
 
     No-op when the dataset is already loaded (resume semantics); updating a
@@ -302,12 +302,19 @@ async def load_dataset(ds_id: int) -> Optional[dict]:
     """
     if ds_id in writer.loaded_ids():
         return {}
-    return await _load_dataset(ds_id)
+    return await _load_dataset(ds_id, client=client)
 
 
-async def _load_dataset(ds_id: int, force_reload: bool = False) -> Optional[dict]:
-    """Returns meta on success, None on failure (caller counts errors)."""
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+async def _load_dataset(ds_id: int, force_reload: bool = False,
+                        client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
+    """Returns meta on success, None on failure (caller counts errors).
+
+    Reuses `client` if given; otherwise owns and closes a private one.
+    """
+    owns = client is None
+    if owns:
+        client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+    try:
         meta_resp = await client.get(f"{BASE_URL}/api/v1/dataset/{ds_id}/?api_key={API_KEY}")
         if meta_resp.status_code != 200:
             return None
@@ -371,6 +378,9 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> Optional[dict
             writer.conn.rollback()
             raise
         return meta
+    finally:
+        if owns:
+            await client.aclose()
 
 
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
@@ -418,28 +428,29 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     skipped = 0
     errors = 0
     failed_ids: list[int] = []
-    for ds_id in all_ids:
-        if not force_refresh and ds_id in writer.loaded_ids():
-            skipped += 1
-            continue
-        try:
-            # force_refresh bypasses the resume guard in load_dataset: purge +
-            # rewrite through _load_dataset(force_reload=True) directly.
-            if force_refresh:
-                result = await _load_dataset(ds_id, force_reload=True)
-            else:
-                result = await load_dataset(ds_id)
-            if result is None:
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for ds_id in all_ids:
+            if not force_refresh and ds_id in writer.loaded_ids():
+                skipped += 1
+                continue
+            try:
+                # force_refresh bypasses the resume guard in load_dataset: purge +
+                # rewrite through _load_dataset(force_reload=True) directly.
+                if force_refresh:
+                    result = await _load_dataset(ds_id, force_reload=True, client=client)
+                else:
+                    result = await load_dataset(ds_id, client=client)
+                if result is None:
+                    errors += 1
+                    failed_ids.append(ds_id)
+                else:
+                    loaded += 1
+            except Exception as e:
                 errors += 1
                 failed_ids.append(ds_id)
-            else:
-                loaded += 1
-        except Exception as e:
-            errors += 1
-            failed_ids.append(ds_id)
-            print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
-                  file=sys.stderr, flush=True)
-        # No explicit checkpoints needed: every dataset commit IS a checkpoint.
+                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+            # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
@@ -526,22 +537,23 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         if purged:
             writer.commit()
 
-    for ds_id, entry in catalog.items():
-        modified = _parse_bods_ts(entry.get("modified"))
-        # Unparseable/missing timestamps are treated as changed (conservative).
-        if modified is None or modified > reference:
-            try:
-                result = await _load_dataset(ds_id, force_reload=True)
-                if result is None:
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for ds_id, entry in catalog.items():
+            modified = _parse_bods_ts(entry.get("modified"))
+            # Unparseable/missing timestamps are treated as changed (conservative).
+            if modified is None or modified > reference:
+                try:
+                    result = await _load_dataset(ds_id, force_reload=True, client=client)
+                    if result is None:
+                        errors += 1
+                        failed_ids.append(ds_id)
+                    else:
+                        updated += 1
+                except Exception as e:
                     errors += 1
                     failed_ids.append(ds_id)
-                else:
-                    updated += 1
-            except Exception as e:
-                errors += 1
-                failed_ids.append(ds_id)
-                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
-                      file=sys.stderr, flush=True)
+                    print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                          file=sys.stderr, flush=True)
 
     # Watermark policy: advance when the run is essentially clean. A single
     # permanently-broken dataset must not freeze the watermark forever (that

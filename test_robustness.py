@@ -44,6 +44,9 @@ class _FakeClient:
     async def __aexit__(self, *exc):
         return False
 
+    async def aclose(self):
+        pass
+
     async def get(self, url):
         captured.append(url)
         return _FakeResp()
@@ -170,6 +173,21 @@ result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
 assert "operatorRef=A%26B" in captured[0], captured[0]
 assert "lineRef=1%202" in captured[0], captured[0]
 print("6. live-buses params URL-encoded: OK")
+
+# --- Test 7: _load_dataset reuses a caller-supplied client (no new one)
+class _CountingClient(_FakeClient):
+    instances = 0
+    def __init__(self, **kw):
+        _CountingClient.instances += 1
+        super().__init__(**kw)
+
+server.httpx.AsyncClient = _CountingClient
+async def _run():
+    async with server.httpx.AsyncClient() as client:
+        return await server._load_dataset(2, client=client)
+asyncio.run(_run())
+assert _CountingClient.instances == 1, f"expected 1 client, got {_CountingClient.instances}"
+print("7. _load_dataset reuses shared client: OK")
 
 # --- Test 12: force_refresh purges datasets withdrawn from the catalogue
 class _CatClient(_FakeClient):
