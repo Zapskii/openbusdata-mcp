@@ -144,4 +144,23 @@ server.httpx.AsyncClient = _ZipOkClient
 assert asyncio.run(server._load_dataset(2)) is not None, "good zip not reported as success"
 print("4. soft failures counted as errors: OK")
 
+# --- Test 5: plan_journey dedup keeps distinct operators on the same route
+# Seed two journeys: same route number + depart, different operators.
+w = TimetableWriter()
+w.ensure_schema()
+w.add_stop("010A", "A St"); w.add_stop("010B", "B St")
+w.add_journey("OpOne", "1", "outbound", "J1", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 1)
+w.add_journey("OpTwo", "1", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:12:00", "departure": None}], 2)
+w.commit()
+result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0))
+plans = json.loads(result)
+assert len(plans) == 2, f"expected 2 distinct plans, got {len(plans)}"
+assert {p["legs"][0]["operator"] for p in plans} == {"OpOne", "OpTwo"}, \
+    "dedup collapsed distinct operators"
+print("5. plan dedup keeps distinct operators: OK")
+
 print("ALL ROBUSTNESS TESTS PASS")

@@ -824,11 +824,12 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
     if max_changes >= 1:
         plans.extend(store.plan_one_change(naptans_a, naptans_b, day, target_s))
 
-    # Deduplicate by journey codes
+    # Deduplicate by journey codes (operator + route + depart per leg)
     seen = set()
     deduped = []
     for plan in plans:
-        key = tuple(leg.get("route", "") + "@" + (leg.get("depart") or "") for leg in plan["legs"])
+        key = tuple(leg.get("operator", "") + "@" + leg.get("route", "") + "@" + (leg.get("depart") or "")
+                    for leg in plan["legs"])
         if key not in seen:
             seen.add(key)
             deduped.append(plan)
