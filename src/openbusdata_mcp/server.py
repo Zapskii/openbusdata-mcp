@@ -404,7 +404,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     errors = 0
     failed_ids: list[int] = []
     for ds_id in all_ids:
-        if ds_id in writer.loaded_ids():
+        if not force_refresh and ds_id in writer.loaded_ids():
             skipped += 1
             continue
         try:
