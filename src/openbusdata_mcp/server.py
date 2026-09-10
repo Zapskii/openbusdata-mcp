@@ -168,14 +168,12 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
     journeys: list[Journey] = []
 
     # --- Extract StopPoints ---
-    stop_map: dict[str, str] = {}
     for asp in root.iter(q("AnnotatedStopPointRef")):
         ref_elem = asp.find(q("StopPointRef"))
         name_elem = asp.find(q("CommonName"))
         if ref_elem is not None:
             naptan = ref_elem.text
             name = name_elem.text if name_elem is not None else "Unknown"
-            stop_map[naptan] = name
             stops.append(Stop(naptan=naptan, name=name))
 
     # --- Extract JourneyPatternSections with timing ---
