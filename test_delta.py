@@ -135,4 +135,125 @@ assert "0PCT" in {s["naptan"] for s in store2.search_stops("bus stop")}
 assert store2.resolve_stop("Under_Score") == {"0UND"}, "resolve_stop wildcards"
 print("9. LIKE wildcard escaping: OK")
 
+# --- Test 10: short alphanumeric NaPTANs resolve literally
+writer.add_stop("010A", "Alpha Stop")
+writer.add_stop("010B", "Beta Stop")
+writer.commit()
+assert store2.resolve_stop("010A") == {"010A"}, "short NaPTAN fell through to fuzzy match"
+assert store2.resolve_stop("Oaks Cross") != {"Oaks Cross"}, "name query treated as literal"
+print("10. short NaPTAN literal resolution: OK")
+
+# --- Test 11: empty stop sets return empty, not SQL errors
+assert store2.find_routes_between(set(), {"010A"}) == []
+assert store2._journeys_touching(set()) == []
+print("11. empty-set guards: OK")
+
+# --- Test 18: negative minutes/seconds are rejected
+p = store_mod._parse_time
+assert p("10:-5") is None, "negative minutes accepted"
+assert p("10:30:-5") is None, "negative seconds accepted"
+assert p("10:30:00") == "10:30:00"
+print("18. negative time components rejected: OK")
+
+# --- Test 19: find_routes_between stays under the SQLite variable limit
+a = store2.resolve_stop("Common Road")
+b = store2.resolve_stop("Common Road")
+assert len(a) + len(b) < 999, f"combined params {len(a) + len(b)} >= 999"
+store2.find_routes_between(a, b)  # must not raise "too many SQL variables"
+print("19. combined IN-clause params capped: OK")
+
+# --- Test 12: journey_stops table is populated and purged with its journeys
+# NOTE: uses unique naptans (12A/12B) — '010A' is shared by surviving ds99
+# journeys from earlier tests, so a purge assertion on it could never reach 0.
+writer.add_journey("Op", "12", "outbound", "J12", {"mon"},
+                   [{"naptan": "12A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "12B", "arrival": "09:10:00", "departure": None}], 42)
+writer.commit()
+n = writer.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
+assert n >= 1, "journey_stops not populated"
+writer.discard_dataset(42)
+writer.commit()
+n = writer.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
+assert n == 0, "journey_stops not purged with dataset"
+print("12. journey_stops populated + purged: OK")
+
+# --- Test 13: _journeys_touching uses the index (same results, no json_each)
+writer.add_journey("Op", "13", "outbound", "J13", {"mon"},
+                   [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+plan = writer.conn.execute(
+    "EXPLAIN QUERY PLAN SELECT DISTINCT journey_id FROM journey_stops WHERE naptan=?"
+    , ("010B",)).fetchall()
+assert any("INDEX" in str(row) for row in plan), f"no index used: {plan}"
+ids = store2._journeys_touching({"010B"})
+assert ids, "indexed lookup returned nothing"
+assert store2._journeys_touching({"010B"}) == store2._journeys_touching({"010B"}), "nondeterministic"
+print("13. _journeys_touching via index: OK")
+
+# --- Test 14: _fetch_journeys batches (results match per-id fetch)
+writer.add_journey("Op", "14", "outbound", "J14", {"mon"},
+                   [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+ids = store2._journeys_touching({"010A"})
+batch = store2._fetch_journeys(ids)
+assert set(batch) == set(ids), "batch fetch missing ids"
+for jid in ids:
+    assert batch[jid]["journey_code"] == store2._fetch_journey(jid)["journey_code"]
+print("14. _fetch_journeys batch: OK")
+
+# --- Test 15: _candidate_journeys yields the same journeys both tools use
+# NOTE: uses unique naptans (15A/15B) — '010A'/'010B' are shared by surviving
+# ds99 journeys from earlier tests, so a len==1 assertion could never hold.
+writer.add_journey("Op", "15", "outbound", "J15", {"mon"},
+                   [{"naptan": "15A", "arrival": None, "departure": "09:00:00"},
+                    {"naptan": "15B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+cands = list(store2._candidate_journeys({"15A"}, {"15B"}, "mon", "09:30:00"))
+assert len(cands) == 1 and cands[0][0]["journey_code"] == "J15"
+assert list(store2._candidate_journeys({"15A"}, {"15B"}, "tue", "09:30:00")) == []
+print("15. _candidate_journeys shared helper: OK")
+
+# --- Test 20: discard_dataset surviving-key scan uses the j_oproute index
+plan = writer.conn.execute(
+    "EXPLAIN QUERY PLAN SELECT DISTINCT op, route FROM journeys").fetchall()
+assert any("j_oproute" in str(row) for row in plan), f"index not used: {plan}"
+print("20. discard_dataset index-only scan: OK")
+
+# --- Test 21: ensure_schema backfills journey_stops for pre-existing journeys
+# A pre-Phase-2 DB has journeys but no journey_stops rows and no backfill flag;
+# ensure_schema must populate the index table once (in-place upgrade, no rebuild).
+_bk = Path(tempfile.mkdtemp()) / "upgrade.db"
+w2 = TimetableWriter(_bk)
+w2.ensure_schema()
+w2.add_journey("Op", "21", "outbound", "J21", {"mon"},
+               [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 5)
+w2.conn.execute("DELETE FROM journey_stops")  # simulate a pre-Phase-2 DB
+w2.conn.execute("DELETE FROM meta WHERE k='journey_stops_backfilled'")
+w2.conn.commit()
+w2.ensure_schema()  # must backfill
+n = w2.conn.execute(
+    "SELECT COUNT(*) FROM journey_stops WHERE journey_id=1").fetchone()[0]
+assert n == 2, f"backfill missing: {n}"
+print("21. ensure_schema backfills journey_stops: OK")
+
+# --- Test 22: _fetch_journeys chunks past SQLite's variable limit
+# 501 ids cross the 500-id chunk boundary; all must come back without
+# "too many SQL variables".
+for _i in range(501):
+    writer.add_journey("Op", "22", "outbound", f"J22_{_i}", {"mon"},
+                       [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+ids = [r[0] for r in writer.conn.execute(
+    "SELECT id FROM journeys WHERE route='22'")]
+assert len(ids) == 501
+batch = store2._fetch_journeys(ids)
+assert set(batch) == set(ids), "chunked fetch missing ids"
+print("22. _fetch_journeys chunks past the variable limit: OK")
+
 print("ALL UNIT TESTS PASS")

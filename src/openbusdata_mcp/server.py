@@ -18,7 +18,7 @@ import io
 import xml.etree.ElementTree as ET
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -293,7 +293,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 # ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
-async def load_dataset(ds_id: int) -> dict:
+async def load_dataset(ds_id: int, client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
     """Download and parse a single timetable dataset. Returns metadata.
 
     No-op when the dataset is already loaded (resume semantics); updating a
@@ -302,37 +302,51 @@ async def load_dataset(ds_id: int) -> dict:
     """
     if ds_id in writer.loaded_ids():
         return {}
-    return await _load_dataset(ds_id)
+    return await _load_dataset(ds_id, client=client)
 
 
-async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+def _xml_contents(z: zipfile.ZipFile) -> Iterator[str]:
+    """Yield each .xml member's decoded text, one at a time."""
+    for name in z.namelist():
+        if name.endswith(".xml"):
+            yield z.read(name).decode("utf-8", errors="ignore")
+
+
+async def _load_dataset(ds_id: int, force_reload: bool = False,
+                        client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
+    """Returns meta on success, None on failure (caller counts errors).
+
+    Reuses `client` if given; otherwise owns and closes a private one.
+    """
+    owns = client is None
+    if owns:
+        client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+    try:
         meta_resp = await client.get(f"{BASE_URL}/api/v1/dataset/{ds_id}/?api_key={API_KEY}")
         if meta_resp.status_code != 200:
-            return {}
+            return None
         meta = meta_resp.json()
 
         operator = meta.get("operatorName", "Unknown")
         download_url = meta.get("url")
         if not download_url:
-            return meta
+            return meta  # not a timetable dataset; nothing to load
 
         zip_resp = await client.get(f"{download_url}?api_key={API_KEY}")
         if zip_resp.status_code != 200 or len(zip_resp.content) < 100:
-            return meta
+            return None
 
         try:
             z = zipfile.ZipFile(io.BytesIO(zip_resp.content))
-            xml_files = [n for n in z.namelist() if n.endswith(".xml")]
-            contents = [z.read(n).decode("utf-8", errors="ignore") for n in xml_files]
+            contents = _xml_contents(z)
         except zipfile.BadZipFile:
             # Some BODS datasets publish a bare TransXChange XML document
             # instead of a zip container.
             head = zip_resp.content[:200].lstrip()
             if head.startswith(b"<?xml") or b"<TransXChange" in head:
-                contents = [zip_resp.content.decode("utf-8", errors="ignore")]
+                contents = iter([zip_resp.content.decode("utf-8", errors="ignore")])
             else:
-                return meta
+                return None
 
         already = ds_id in writer.loaded_ids()
         if already and not force_reload:
@@ -341,28 +355,38 @@ async def _load_dataset(ds_id: int, force_reload: bool = False) -> dict:
         # ensure_schema commits, so it runs BEFORE the purge to keep purge +
         # rewrite inside the single per-dataset transaction closed below.
         writer.ensure_schema()
-        if force_reload:
-            writer.discard_dataset(ds_id)
+        try:
+            if force_reload:
+                writer.discard_dataset(ds_id)
 
-        for content in contents:
-            stops, routes, journeys = parse_transxchange(content, operator)
-            for stop in stops:
-                writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
-            for route in routes:
-                # Legacy (untagged) journeys for this op+route are superseded
-                # by this tagged write.
-                writer.discard_untagged_for(route.operator, route.route_num)
-                writer.upsert_route(route.operator, route.route_num,
-                                    route.directions, route.stops, ds_id)
-            for journey in journeys:
-                writer.add_journey(
-                    journey.operator, journey.route_num, journey.direction,
-                    journey.journey_code, journey.days,
-                    [asdict(s) for s in journey.stops], ds_id)
+            for content in contents:
+                stops, routes, journeys = parse_transxchange(content, operator)
+                for stop in stops:
+                    writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
+                for route in routes:
+                    # Legacy (untagged) journeys for this op+route are superseded
+                    # by this tagged write.
+                    writer.discard_untagged_for(route.operator, route.route_num)
+                    writer.upsert_route(route.operator, route.route_num,
+                                        route.directions, route.stops, ds_id)
+                for journey in journeys:
+                    writer.add_journey(
+                        journey.operator, journey.route_num, journey.direction,
+                        journey.journey_code, journey.days,
+                        [asdict(s) for s in journey.stops], ds_id)
 
-        writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
-        writer.commit()  # one transaction per dataset: implicit checkpoint
+            writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
+            writer.commit()  # one transaction per dataset: implicit checkpoint
+        except Exception:
+            # A failure mid-rewrite must not leave the purge uncommitted:
+            # the next ensure_schema() would commit it, persisting a partial
+            # purge. Roll the whole purge + rewrite back and re-raise.
+            writer.conn.rollback()
+            raise
         return meta
+    finally:
+        if owns:
+            await client.aclose()
 
 
 async def load_all_timetable_data(force_refresh: bool = False) -> str:
@@ -378,6 +402,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
         all_ids: list[int] = []
         offset = 0
         limit = 100
+        sweep_complete = False
         while True:
             resp = await client.get(f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
             if resp.status_code != 200:
@@ -385,15 +410,21 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             data = resp.json()
             results = data.get("results", [])
             if not results:
+                sweep_complete = True
                 break
             for r in results:
                 all_ids.append(r["id"])
             if len(results) < limit:
+                sweep_complete = True
                 break
             offset += limit
 
-    # Reconcile: purge datasets that disappeared from the catalogue.
-    if not force_refresh and all_ids:
+    # Reconcile: purge datasets that disappeared from the catalogue. Only when
+    # the sweep completed — a partial sweep (broke on a non-200 page) has only
+    # seen part of the catalogue, so it must not purge datasets that may still
+    # be live (self-healing re-download would fix it, but it leaves the index
+    # temporarily incomplete during a force_refresh rebuild).
+    if all_ids and sweep_complete:
         known = set(all_ids)
         for ds_id in [i for i in writer.loaded_ids() if i not in known]:
             writer.discard_dataset(ds_id)
@@ -403,24 +434,29 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     skipped = 0
     errors = 0
     failed_ids: list[int] = []
-    for ds_id in all_ids:
-        if not force_refresh and ds_id in writer.loaded_ids():
-            skipped += 1
-            continue
-        try:
-            # force_refresh bypasses the resume guard in load_dataset: purge +
-            # rewrite through _load_dataset(force_reload=True) directly.
-            if force_refresh:
-                await _load_dataset(ds_id, force_reload=True)
-            else:
-                await load_dataset(ds_id)
-            loaded += 1
-        except Exception as e:
-            errors += 1
-            failed_ids.append(ds_id)
-            print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
-                  file=sys.stderr, flush=True)
-        # No explicit checkpoints needed: every dataset commit IS a checkpoint.
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for ds_id in all_ids:
+            if not force_refresh and ds_id in writer.loaded_ids():
+                skipped += 1
+                continue
+            try:
+                # force_refresh bypasses the resume guard in load_dataset: purge +
+                # rewrite through _load_dataset(force_reload=True) directly.
+                if force_refresh:
+                    result = await _load_dataset(ds_id, force_reload=True, client=client)
+                else:
+                    result = await load_dataset(ds_id, client=client)
+                if result is None:
+                    errors += 1
+                    failed_ids.append(ds_id)
+                else:
+                    loaded += 1
+            except Exception as e:
+                errors += 1
+                failed_ids.append(ds_id)
+                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+            # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
@@ -507,18 +543,23 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
         if purged:
             writer.commit()
 
-    for ds_id, entry in catalog.items():
-        modified = _parse_bods_ts(entry.get("modified"))
-        # Unparseable/missing timestamps are treated as changed (conservative).
-        if modified is None or modified > reference:
-            try:
-                await _load_dataset(ds_id, force_reload=True)
-                updated += 1
-            except Exception as e:
-                errors += 1
-                failed_ids.append(ds_id)
-                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
-                      file=sys.stderr, flush=True)
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for ds_id, entry in catalog.items():
+            modified = _parse_bods_ts(entry.get("modified"))
+            # Unparseable/missing timestamps are treated as changed (conservative).
+            if modified is None or modified > reference:
+                try:
+                    result = await _load_dataset(ds_id, force_reload=True, client=client)
+                    if result is None:
+                        errors += 1
+                        failed_ids.append(ds_id)
+                    else:
+                        updated += 1
+                except Exception as e:
+                    errors += 1
+                    failed_ids.append(ds_id)
+                    print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                          file=sys.stderr, flush=True)
 
     # Watermark policy: advance when the run is essentially clean. A single
     # permanently-broken dataset must not freeze the watermark forever (that
@@ -815,11 +856,12 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
     if max_changes >= 1:
         plans.extend(store.plan_one_change(naptans_a, naptans_b, day, target_s))
 
-    # Deduplicate by journey codes
+    # Deduplicate by journey codes (operator + route + depart per leg)
     seen = set()
     deduped = []
     for plan in plans:
-        key = tuple(leg.get("route", "") + "@" + (leg.get("depart") or "") for leg in plan["legs"])
+        key = tuple(leg.get("operator", "") + "@" + leg.get("route", "") + "@" + (leg.get("depart") or "")
+                    for leg in plan["legs"])
         if key not in seen:
             seen.add(key)
             deduped.append(plan)
@@ -837,7 +879,8 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
       operator_ref: Operator NOC code (e.g. ARBB, SCCM, CBBH).
       line_ref: Route number (e.g. 12, MK1, 100).
     """
-    full_url = f"{BASE_URL}/api/v1/datafeed/?operatorRef={operator_ref}&lineRef={line_ref}&api_key={API_KEY}"
+    query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
+    full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(full_url)

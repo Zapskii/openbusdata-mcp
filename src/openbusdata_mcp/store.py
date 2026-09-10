@@ -16,10 +16,10 @@ def _like_escape(text: str) -> str:
 
 
 # Cap on how many NaPTANs a fuzzy stop query may resolve to: resolved sets
-# feed `IN (...)` clauses built from `?` placeholders, and past SQLite's
-# 999-variable limit the query fails outright. Name-substring matches are
-# fuzzy anyway — the caller's results degrade gracefully past the cap.
-MAX_RESOLVE = 500
+# feed `IN (...)` clauses built from `?` placeholders, and find_routes_between
+# binds BOTH sets in one query, so the combined count must stay under SQLite's
+# 999-variable limit (pre-3.32). 400 + 400 = 800 < 999.
+MAX_RESOLVE = 400
 
 
 def _parse_time(text: str) -> Optional[str]:
@@ -38,7 +38,7 @@ def _parse_time(text: str) -> Optional[str]:
         s = int(parts[2]) if len(parts) > 2 else 0
     except (ValueError, IndexError):
         return None
-    if len(parts) > 3 or h < 0 or m > 59 or s > 59:
+    if len(parts) > 3 or h < 0 or m < 0 or m > 59 or s < 0 or s > 59:
         return None
     return f"{h:02d}:{m:02d}:{s:02d}"
 
@@ -84,13 +84,14 @@ class TimetableStore:
         return [{"naptan": n, "name": name} for n, name in rows]
 
     def resolve_stop(self, stop_query: str) -> set[str]:
-        """Digits = literal NaPTAN, else substring match (capped)."""
-        if stop_query.isdigit() or (len(stop_query) >= 8 and stop_query[:2].isdigit()):
-            return {stop_query}
+        """NaPTAN-shaped input = literal, else substring match (capped)."""
+        q = stop_query.strip()
+        if q.isdigit() or (len(q) >= 4 and q[:2].isdigit() and q.isalnum()):
+            return {q}
         return {r[0] for r in self.conn.execute(
             "SELECT naptan FROM stops WHERE LOWER(name) LIKE ? ESCAPE '\\' "
             f"LIMIT {MAX_RESOLVE}",
-            (f"%{_like_escape(stop_query.lower())}%",))}
+            (f"%{_like_escape(q.lower())}%",))}
 
     def stop_name(self, naptan: str) -> str:
         row = self.conn.execute(
@@ -108,6 +109,8 @@ class TimetableStore:
     # -- routes -------------------------------------------------------------
     def find_routes_between(self, naptans_a: set, naptans_b: set) -> list[dict]:
         """Routes serving both stop sets, with A->B / B->A ordering."""
+        if not naptans_a or not naptans_b:
+            return []
         rows = self.conn.execute("""
             SELECT r.key, r.op, r.num, r.directions, r.stops FROM routes r
             WHERE r.key IN (SELECT key FROM stop_to_routes WHERE naptan IN (%s))
@@ -167,14 +170,29 @@ class TimetableStore:
             "FROM journeys WHERE id=?", (jid,)).fetchone()
         return self._journey_row_to_out(row) if row else None
 
+    def _fetch_journeys(self, jids: list[int]) -> dict[int, dict]:
+        if not jids:
+            return {}
+        out: dict[int, dict] = {}
+        # Chunk past SQLite's variable limit (999 on older builds): a busy
+        # stop can touch thousands of journeys, and one giant IN clause would
+        # fail with "too many SQL variables".
+        for i in range(0, len(jids), 500):
+            chunk = jids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT id, ds_id, op, route, direction, code, days, json "
+                f"FROM journeys WHERE id IN ({marks})", chunk).fetchall()
+            out.update({r[0]: self._journey_row_to_out(r) for r in rows})
+        return out
+
     def _journeys_touching(self, naptans: set) -> list[int]:
-        """Journey ids whose stop list contains ANY of naptans."""
-        # journeys has no stop index table; use json1 EXISTS over stops json
+        """Journey ids whose stop list contains ANY of naptans (indexed)."""
+        if not naptans:
+            return []
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(
-            f"SELECT id FROM journeys WHERE EXISTS ("
-            f"  SELECT 1 FROM json_each(journeys.json, '$.stops') "
-            f"  WHERE json_extract(value, '$.naptan') IN ({marks}))",
+            f"SELECT DISTINCT journey_id FROM journey_stops WHERE naptan IN ({marks})",
             list(naptans)).fetchall()
         return [r[0] for r in rows]
 
@@ -188,47 +206,16 @@ class TimetableStore:
             ") ORDER BY id", (naptan, after)).fetchall()
         return [r[0] for r in rows]
 
-    def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
-                                   arrive_by: str, day: str) -> list[dict]:
-        target = _parse_time(arrive_by)
-        if target is None:
-            return []
-        target_s = target
-        out = []
-        # Candidate journeys: touch B stop set at all (smaller set usually)
-        for jid in self._journeys_touching(naptans_b):
-            j = self._fetch_journey(jid)
-            if j is None:
-                continue
-            if day not in j["days"]:
-                continue
-            idx_a = idx_b = None
-            for i, s in enumerate(j["stops"]):
-                if s["naptan"] in naptans_a:
-                    idx_a = i
-                if s["naptan"] in naptans_b:
-                    idx_b = i
-            if idx_a is None or idx_b is None or idx_a >= idx_b:
-                continue
-            arr_b = j["stops"][idx_b].get("arrival")
-            if arr_b and arr_b[:8] <= target_s:
-                dep_a = j["stops"][idx_a].get("departure")
-                out.append({
-                    "operator": j["operator"], "route": j["route"],
-                    "direction": j["direction"], "journey_code": j["journey_code"],
-                    "board_at": self.stop_name(j["stops"][idx_a]["naptan"]),
-                    "depart": dep_a, "alight_at": self.stop_name(j["stops"][idx_b]["naptan"]),
-                    "arrive": arr_b})
-        out.sort(key=lambda x: x["arrive"] or "")
-        return out[:20]
+    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
+        """Yield (journey, idx_a, idx_b) for journeys boarding in A, alighting in B,
+        running on day, arriving at B by target_s.
 
-    def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
-                    target_s: str) -> list[dict]:
-        plans = []
-        for jid in self._journeys_touching(naptans_b):
-            j = self._fetch_journey(jid)
-            if j is None:
-                continue
+        Stop matching uses FIRST occurrence of a naptan in the stop list
+        (next(...)). This is deliberate: plan_direct historically matched the
+        first occurrence, and the shared helper unifies both tools on it. It
+        only differs from last-occurrence for loop routes whose stop list
+        repeats a naptan from A or B — an accepted edge case."""
+        for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
             if day not in j["days"]:
                 continue
             idx_a = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_a), None)
@@ -237,26 +224,49 @@ class TimetableStore:
                 continue
             arr_b = j["stops"][idx_b].get("arrival")
             if arr_b and arr_b[:8] <= target_s:
-                names = self.stop_names_bulk([j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-                plans.append({
-                    "type": "direct",
-                    "legs": [{
-                        "operator": j["operator"], "route": j["route"],
-                        "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                        "depart": j["stops"][idx_a].get("departure"),
-                        "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                        "arrive": arr_b}],
-                    "total_changes": 0})
+                yield j, idx_a, idx_b
+
+    def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
+                                   arrive_by: str, day: str) -> list[dict]:
+        target = _parse_time(arrive_by)
+        if target is None:
+            return []
+        target_s = target
+        out = []
+        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+            names = self.stop_names_bulk(
+                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
+            out.append({
+                "operator": j["operator"], "route": j["route"],
+                "direction": j["direction"], "journey_code": j["journey_code"],
+                "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
+                "depart": j["stops"][idx_a].get("departure"),
+                "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
+                "arrive": j["stops"][idx_b].get("arrival")})
+        out.sort(key=lambda x: x["arrive"] or "")
+        return out[:20]
+
+    def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
+                    target_s: str) -> list[dict]:
+        plans = []
+        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+            names = self.stop_names_bulk(
+                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
+            plans.append({
+                "type": "direct",
+                "legs": [{
+                    "operator": j["operator"], "route": j["route"],
+                    "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
+                    "depart": j["stops"][idx_a].get("departure"),
+                    "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
+                    "arrive": j["stops"][idx_b].get("arrival")}],
+                "total_changes": 0})
         return plans
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:
         plans = []
-        # Leg 1: from A to some mid stop
-        for jid1 in self._journeys_touching(naptans_a):
-            j1 = self._fetch_journey(jid1)
-            if j1 is None:
-                continue
+        for jid1, j1 in self._fetch_journeys(self._journeys_touching(naptans_a)).items():
             if day not in j1["days"]:
                 continue
             idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in naptans_a), None)
@@ -270,11 +280,8 @@ class TimetableStore:
                 mid_arr = mid.get("arrival")
                 if mid_arr is None:
                     continue
-                # Leg 2 candidates: depart mid after mid_arr, reach B by target
-                for jid2 in self._journeys_departing(mid["naptan"], mid_arr[:8]):
-                    j2 = self._fetch_journey(jid2)
-                    if j2 is None:
-                        continue
+                for jid2, j2 in self._fetch_journeys(
+                        self._journeys_departing(mid["naptan"], mid_arr[:8])).items():
                     if j2["id"] == j1["id"]:
                         continue
                     if day not in j2["days"]:
@@ -357,10 +364,26 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS loaded_datasets (
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT);
+        CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
+        CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
+        CREATE INDEX IF NOT EXISTS js_j ON journey_stops(journey_id);
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
         """)
+        # One-time backfill: journey_stops only gets populated by add_journey,
+        # so a DB upgraded in place (journeys already present) would have an
+        # empty index table and every stop->journey query would silently return
+        # nothing. Backfill from the stored stops JSON once, keyed on a meta
+        # flag so it never re-runs.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stops_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO journey_stops (naptan, journey_id) "
+                "SELECT json_extract(value, '$.naptan'), j.id "
+                "FROM journeys j, json_each(j.json, '$.stops')")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('journey_stops_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
@@ -454,10 +477,13 @@ class TimetableWriter:
         j = {"operator": op, "route_num": num, "direction": direction,
              "journey_code": code, "dataset_id": ds_id,
              "days": sorted(days), "stops": [dict(st) for st in stops]}
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
             "VALUES (?,?,?,?,?,?,?)",
             (ds_id, op, num, direction, code, json.dumps(sorted(days)), json.dumps(j)))
+        self.conn.executemany(
+            "INSERT INTO journey_stops VALUES (?,?)",
+            [(s["naptan"], cur.lastrowid) for s in stops])
 
     def commit(self):
         self.conn.commit()
@@ -479,6 +505,10 @@ class TimetableWriter:
         insert supersedes the old rows, which cannot be purged by ds_id.
         """
         self.conn.execute(
+            "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
+            (op, route_num))
+        self.conn.execute(
             "DELETE FROM journeys WHERE ds_id=0 AND op=? AND route=?",
             (op, route_num))
 
@@ -495,8 +525,13 @@ class TimetableWriter:
         and is fully removed by the next full rebuild. The caller owns the
         transaction: purge + rewrite must commit together.
         """
-        self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
         self.conn.execute(
-            "DELETE FROM stop_to_routes WHERE key NOT IN "
-            "(SELECT DISTINCT op || '|' || route FROM journeys)")
+            "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
+        self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
+        # Surviving route keys via an index-only scan on journeys(op, route)
+        # (j_oproute index) instead of a full-table scan + expression eval.
+        self.conn.execute(
+            "DELETE FROM stop_to_routes WHERE key NOT IN ("
+            "SELECT op || '|' || route FROM (SELECT DISTINCT op, route FROM journeys))")
         self.conn.execute("DELETE FROM loaded_datasets WHERE ds_id=?", (ds_id,))

@@ -44,6 +44,9 @@ class _FakeClient:
     async def __aexit__(self, *exc):
         return False
 
+    async def aclose(self):
+        pass
+
     async def get(self, url):
         captured.append(url)
         return _FakeResp()
@@ -106,5 +109,228 @@ assert 42 in writer.loaded_ids(), "valid legacy dataset lost"
 row = writer.conn.execute("SELECT k FROM meta WHERE k='dataset_meta'").fetchone()
 assert row is None, "legacy meta key not consumed"
 print("3. legacy meta promotion guards junk keys: OK")
+
+# --- Test 4: soft failures are counted as errors, not loaded
+import io, zipfile
+
+def _make_zip(xml: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("a.xml", xml)
+    return buf.getvalue()
+
+class _Resp:
+    def __init__(self, status_code=200, content=b"{}"):
+        self.status_code = status_code
+        self.content = content
+        self.text = content.decode("utf-8", "ignore")
+    def json(self):
+        return json.loads(self.content)
+
+class _ZipFailClient(_FakeClient):
+    """meta OK, zip download 404s -> _load_dataset must return None."""
+    async def get(self, url):
+        if "/dataset/1/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _ZipFailClient
+assert asyncio.run(server._load_dataset(1)) is None, "404 zip not reported as failure"
+
+class _ZipOkClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
+
+server.httpx.AsyncClient = _ZipOkClient
+assert asyncio.run(server._load_dataset(2)) is not None, "good zip not reported as success"
+print("4. soft failures counted as errors: OK")
+
+# --- Test 5: plan_journey dedup keeps distinct operators on the same route
+# Seed two journeys: same route number + depart, different operators.
+w = TimetableWriter()
+w.ensure_schema()
+w.add_stop("010A", "A St"); w.add_stop("010B", "B St")
+w.add_journey("OpOne", "1", "outbound", "J1", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 1)
+w.add_journey("OpTwo", "1", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:12:00", "departure": None}], 2)
+w.commit()
+result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0))
+plans = json.loads(result)
+assert len(plans) == 2, f"expected 2 distinct plans, got {len(plans)}"
+assert {p["legs"][0]["operator"] for p in plans} == {"OpOne", "OpTwo"}, \
+    "dedup collapsed distinct operators"
+print("5. plan dedup keeps distinct operators: OK")
+
+# --- Test 6: live-buses URL params are percent-encoded
+captured.clear()
+server.httpx.AsyncClient = _FakeClient
+result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
+assert "operatorRef=A%26B" in captured[0], captured[0]
+assert "lineRef=1%202" in captured[0], captured[0]
+print("6. live-buses params URL-encoded: OK")
+
+# --- Test 7: _load_dataset reuses a caller-supplied client (no new one)
+class _CountingClient(_FakeClient):
+    instances = 0
+    def __init__(self, **kw):
+        _CountingClient.instances += 1
+        super().__init__(**kw)
+
+server.httpx.AsyncClient = _CountingClient
+async def _run():
+    async with server.httpx.AsyncClient() as client:
+        return await server._load_dataset(2, client=client)
+asyncio.run(_run())
+assert _CountingClient.instances == 1, f"expected 1 client, got {_CountingClient.instances}"
+print("7. _load_dataset reuses shared client: OK")
+
+# --- Test 8: _xml_contents yields one XML at a time
+import zipfile as _zf
+buf = io.BytesIO()
+with _zf.ZipFile(buf, "w") as z:
+    z.writestr("a.xml", "<A/>")
+    z.writestr("b.txt", "not xml")
+    z.writestr("c.xml", "<C/>")
+buf.seek(0)
+z = _zf.ZipFile(buf)
+assert list(server._xml_contents(z)) == ["<A/>", "<C/>"], "non-xml leaked or order wrong"
+print("8. _xml_contents lazy generator: OK")
+
+# --- Test 12: force_refresh purges datasets withdrawn from the catalogue
+class _CatClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/?" in url:
+            return _Resp(200, b'{"results":[{"id":1}]}')
+        return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+
+w = TimetableWriter(); w.ensure_schema()
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+server.httpx.AsyncClient = _CatClient
+asyncio.run(server.load_all_timetable_data(force_refresh=True))
+assert 2 not in w.loaded_ids(), "withdrawn dataset not purged on force_refresh"
+print("12. force_refresh reconciles withdrawn datasets: OK")
+
+# --- Test 13: mid-rewrite failure rolls back the purge
+w = TimetableWriter(); w.ensure_schema()
+w.add_journey("Op", "2", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 2)
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+
+# The rewrite must reach writer.add_journey for the injected failure to fire
+# mid-write, so the zip carries a TransXChange with one real journey.
+_JOURNEY_XML = b"""<TransXChange>
+  <PublishedLineName>2</PublishedLineName>
+  <JourneyPatternSection id="jps1">
+    <JourneyPatternTimingLink>
+      <From><StopPointRef>010A</StopPointRef></From>
+      <To><StopPointRef>010B</StopPointRef></To>
+      <RunTime>PT10M</RunTime>
+    </JourneyPatternTimingLink>
+  </JourneyPatternSection>
+  <JourneyPattern id="jp1">
+    <Direction>outbound</Direction>
+    <JourneyPatternSectionRefs>jps1</JourneyPatternSectionRefs>
+  </JourneyPattern>
+  <VehicleJourney>
+    <VehicleJourneyCode>J2</VehicleJourneyCode>
+    <JourneyPatternRef>jp1</JourneyPatternRef>
+    <DepartureTime>09:00:00</DepartureTime>
+    <OperatingProfile><RegularDayType><DaysOfWeek><Monday/></DaysOfWeek></RegularDayType></OperatingProfile>
+  </VehicleJourney>
+</TransXChange>"""
+
+class _ZipJourneyClient(_FakeClient):
+    async def get(self, url):
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(200, _make_zip(_JOURNEY_XML))
+
+server.httpx.AsyncClient = _ZipJourneyClient
+orig_add = server.writer.add_journey
+def _boom(*a, **k):
+    raise RuntimeError("disk full")
+server.writer.add_journey = _boom
+try:
+    try:
+        asyncio.run(server._load_dataset(2, force_reload=True))
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError:
+        pass
+finally:
+    server.writer.add_journey = orig_add
+# The next ensure_schema() is what would commit the orphaned purge
+# transaction; after a rollback it must find the dataset intact.
+server.writer.ensure_schema()
+assert 2 in w.loaded_ids(), "purge not rolled back after mid-rewrite failure"
+assert w.conn.execute("SELECT COUNT(*) FROM journeys WHERE ds_id=2").fetchone()[0] == 1, \
+    "journeys lost to a partial purge"
+print("13. mid-rewrite failure rolls back purge: OK")
+
+# --- Test 20: watermark stays put when soft failures exceed the delta budget
+# Task 1.1's core guarantee: failed downloads must not let the delta watermark
+# advance past datasets that never refreshed. 3 soft failures (zip 404s) with
+# 0 updated -> budget = max(2, 0) = 2 -> 3 > 2 -> watermark must NOT move.
+w = TimetableWriter(); w.ensure_schema()
+for _ds, _rt in ((2, "2"), (3, "3"), (4, "4")):
+    w.add_journey("Op", _rt, "outbound", f"J{_ds}", {"mon"},
+                  [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                   {"naptan": "010B", "arrival": "09:10:00", "departure": None}], _ds)
+    w.mark_dataset_loaded(_ds, "2026-01-01T00:00:00Z", "Op")
+w.set_last_refresh("2026-01-01T00:00:00Z"); w.commit()
+
+class _DeltaFailClient(_FakeClient):
+    """Catalogue + per-dataset meta OK, every zip download 404s."""
+    async def get(self, url):
+        if "/dataset/?" in url:
+            return _Resp(200, b'{"results":[{"id":2,"modified":"2026-09-01T00:00:00Z"},'
+                               b'{"id":3,"modified":"2026-09-01T00:00:00Z"},'
+                               b'{"id":4,"modified":"2026-09-01T00:00:00Z"}]}')
+        if any(f"/dataset/{i}/" in url for i in (2, 3, 4)):
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _DeltaFailClient
+before = w.last_refresh()
+asyncio.run(server._load_timetable_delta())
+assert w.last_refresh() == before, \
+    f"watermark advanced despite 3 errors > budget 2: {before} -> {w.last_refresh()}"
+print("20. watermark held when soft failures exceed the delta budget: OK")
+
+# --- Test 21: a partial catalogue sweep must not purge loaded datasets
+# A sweep that breaks on a non-200 page has only seen part of the catalogue;
+# datasets missing from that partial view may still be live, so reconcile
+# must not purge them (self-healing re-download would fix it, but it leaves
+# the index incomplete during a force_refresh rebuild).
+w = TimetableWriter(); w.ensure_schema()
+w.add_journey("Op", "2", "outbound", "J2", {"mon"},
+              [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+               {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 2)
+w.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op"); w.commit()
+
+_PARTIAL_PAGE = json.dumps(
+    {"results": [{"id": 1000 + i, "modified": "2026-09-01T00:00:00Z"}
+                 for i in range(100)]}).encode()
+
+class _PartialSweepClient(_FakeClient):
+    """First catalogue page full (100 results), second page 500s."""
+    async def get(self, url):
+        if "/dataset/?" in url and "offset=0" in url:
+            return _Resp(200, _PARTIAL_PAGE)
+        if "/dataset/?" in url:
+            return _Resp(500, b"")
+        if "/dataset/2/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+server.httpx.AsyncClient = _PartialSweepClient
+asyncio.run(server.load_all_timetable_data(force_refresh=True))
+assert 2 in w.loaded_ids(), "partial sweep purged a dataset still in the catalogue"
+print("21. partial catalogue sweep does not purge loaded datasets: OK")
 
 print("ALL ROBUSTNESS TESTS PASS")
