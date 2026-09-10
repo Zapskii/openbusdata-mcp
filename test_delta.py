@@ -241,4 +241,19 @@ n = w2.conn.execute(
 assert n == 2, f"backfill missing: {n}"
 print("21. ensure_schema backfills journey_stops: OK")
 
+# --- Test 22: _fetch_journeys chunks past SQLite's variable limit
+# 501 ids cross the 500-id chunk boundary; all must come back without
+# "too many SQL variables".
+for _i in range(501):
+    writer.add_journey("Op", "22", "outbound", f"J22_{_i}", {"mon"},
+                       [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+                        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
+writer.commit()
+ids = [r[0] for r in writer.conn.execute(
+    "SELECT id FROM journeys WHERE route='22'")]
+assert len(ids) == 501
+batch = store2._fetch_journeys(ids)
+assert set(batch) == set(ids), "chunked fetch missing ids"
+print("22. _fetch_journeys chunks past the variable limit: OK")
+
 print("ALL UNIT TESTS PASS")

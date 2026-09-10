@@ -173,11 +173,18 @@ class TimetableStore:
     def _fetch_journeys(self, jids: list[int]) -> dict[int, dict]:
         if not jids:
             return {}
-        marks = ",".join("?" * len(jids))
-        rows = self.conn.execute(
-            f"SELECT id, ds_id, op, route, direction, code, days, json "
-            f"FROM journeys WHERE id IN ({marks})", jids).fetchall()
-        return {r[0]: self._journey_row_to_out(r) for r in rows}
+        out: dict[int, dict] = {}
+        # Chunk past SQLite's variable limit (999 on older builds): a busy
+        # stop can touch thousands of journeys, and one giant IN clause would
+        # fail with "too many SQL variables".
+        for i in range(0, len(jids), 500):
+            chunk = jids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT id, ds_id, op, route, direction, code, days, json "
+                f"FROM journeys WHERE id IN ({marks})", chunk).fetchall()
+            out.update({r[0]: self._journey_row_to_out(r) for r in rows})
+        return out
 
     def _journeys_touching(self, naptans: set) -> list[int]:
         """Journey ids whose stop list contains ANY of naptans (indexed)."""
@@ -201,7 +208,13 @@ class TimetableStore:
 
     def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
         """Yield (journey, idx_a, idx_b) for journeys boarding in A, alighting in B,
-        running on day, arriving at B by target_s."""
+        running on day, arriving at B by target_s.
+
+        Stop matching uses FIRST occurrence of a naptan in the stop list
+        (next(...)). This is deliberate: plan_direct historically matched the
+        first occurrence, and the shared helper unifies both tools on it. It
+        only differs from last-occurrence for loop routes whose stop list
+        repeats a naptan from A or B — an accepted edge case."""
         for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
             if day not in j["days"]:
                 continue
