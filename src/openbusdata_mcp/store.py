@@ -406,6 +406,8 @@ class TimetableWriter:
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
+        CREATE TABLE IF NOT EXISTS journey_stop_times (naptan TEXT, journey_id INT, dep TEXT);
+        CREATE INDEX IF NOT EXISTS jst_n ON journey_stop_times(naptan, dep);
         CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
             name, naptan UNINDEXED, tokenize='unicode61');
         CREATE TRIGGER IF NOT EXISTS stops_fts_ai AFTER INSERT ON stops BEGIN
@@ -442,6 +444,19 @@ class TimetableWriter:
                 "SELECT rowid, name, naptan FROM stops")
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('stops_fts_backfilled', '1')")
+        # One-time backfill: journey_stop_times is populated by add_journey, so
+        # a DB upgraded in place (journeys already present) would have an empty
+        # departure index. Backfill from the stored stops JSON once, keyed on a
+        # meta flag so it never re-runs. dep follows COALESCE(departure, arrival)
+        # to match add_journey's write side.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
+                "SELECT json_extract(value, '$.naptan'), j.id, "
+                "       COALESCE(json_extract(value, '$.departure'), json_extract(value, '$.arrival')) "
+                "FROM journeys j, json_each(j.json, '$.stops')")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('journey_stop_times_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
@@ -549,6 +564,10 @@ class TimetableWriter:
         self.conn.executemany(
             "INSERT INTO journey_stops VALUES (?,?)",
             [(s["naptan"], cur.lastrowid) for s in stops])
+        self.conn.executemany(
+            "INSERT INTO journey_stop_times VALUES (?,?,?)",
+            [(s["naptan"], cur.lastrowid, s.get("departure") or s.get("arrival"))
+             for s in stops])
 
     def commit(self):
         self.conn.commit()
@@ -574,6 +593,10 @@ class TimetableWriter:
             "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
             (op, route_num))
         self.conn.execute(
+            "DELETE FROM journey_stop_times WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
+            (op, route_num))
+        self.conn.execute(
             "DELETE FROM journeys WHERE ds_id=0 AND op=? AND route=?",
             (op, route_num))
 
@@ -592,6 +615,9 @@ class TimetableWriter:
         """
         self.conn.execute(
             "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
+        self.conn.execute(
+            "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
         # Surviving route keys via an index-only scan on journeys(op, route)
