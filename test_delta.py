@@ -232,7 +232,7 @@ def test_15_candidate_journeys_shared_helper(writer, store):
 
 
 # --- Test 20: discard_dataset surviving-key scan uses the j_oproute index
-def test_20_discard_dataset_index_only_scan(writer, store):
+def test_20_discard_dataset_index_only_scan(writer):
     # Seed enough journeys that the planner must choose the covering
     # j_oproute index for the DISTINCT scan (robust across SQLite versions).
     for i in range(300):
@@ -303,9 +303,9 @@ def test_17_upsert_route_prunes_stale_refs(writer, store):
 
 
 # --- Test 23: stops_fts backfill + trigger sync keep the FTS index current
-def test_23_fts_backfill_and_trigger_sync():
+def test_23_fts_backfill_and_trigger_sync(tmp_path):
     # Simulate a pre-FTS DB: stops present, no stops_fts, no backfill flag.
-    _bk = Path(tempfile.mkdtemp()) / "fts.db"
+    _bk = tmp_path / "fts.db"
     w2 = TimetableWriter(_bk)
     w2.conn.execute(
         "CREATE TABLE stops (naptan TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL)")
