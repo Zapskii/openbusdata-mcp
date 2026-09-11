@@ -366,8 +366,8 @@ def test_24_fts_search_and_like_fallback(writer, store):
         "bare backslash escaped literally (LIKE fallback)")
     assert store.search_stops("   ") == [], (
         "whitespace-only query must return nothing, not all stops")
-    # Short query (< 2 chars) -> LIKE directly (substring, not prefix).
-    assert {s["naptan"] for s in store.search_stops("o")} == {"S1", "S2", "S3", "S4", "S5", "S6"}
+    # 1-char query -> FTS prefix ("o"*) matches only o-initial tokens, LIKE fallback otherwise.
+    assert {s["naptan"] for s in store.search_stops("o")} == {"S1", "S2"}
     # resolve_stop: FTS5 path (capped) and NaPTAN literal unchanged.
     assert store.resolve_stop("oaks") == {"S1", "S2"}
     assert store.resolve_stop("010A") == {"010A"}

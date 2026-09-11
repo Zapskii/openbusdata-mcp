@@ -3,6 +3,7 @@
 Replaces the in-memory timetable index for query tools. Same tool output
 shapes, but memory is O(query) instead of O(entire UK timetable).
 """
+import functools
 import json
 import sqlite3
 from pathlib import Path
@@ -70,6 +71,7 @@ class TimetableStore:
         if self._conn is None:
             self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             self._conn.execute("PRAGMA cache_size=-16000")  # 16MB page cache
+            self._conn.execute("PRAGMA mmap_size=268435456")  # 256MB mmap reads
         return self._conn
 
     def exists(self) -> bool:
@@ -102,8 +104,6 @@ class TimetableStore:
         q = query.strip()
         if not q:
             return []   # whitespace-only: nothing to search (regression fix)
-        if len(q) < 2:
-            return self._search_stops_like(q, limit)   # short queries: LIKE directly
         fts = _fts_query(q)
         if fts:
             rows = self.conn.execute(
@@ -173,10 +173,19 @@ class TimetableStore:
 
     def get_route_stops(self, operator: str, route: str,
                         direction: Optional[str] = None) -> list[dict]:
-        q = (f"%{route.lower()}%", f"%{operator.lower()}%")
-        rows = self.conn.execute(
-            "SELECT op, num, directions, stops FROM routes "
-            "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
+        fts = _fts_query(f"{route} {operator}".strip())
+        if fts:
+            rows = self.conn.execute(
+                "SELECT r.op, r.num, r.directions, r.stops FROM routes_fts f "
+                "JOIN routes r ON r.rowid = f.rowid "
+                "WHERE routes_fts MATCH ? ORDER BY rank LIMIT 50", (fts,)).fetchall()
+        else:
+            rows = []
+        if not rows:  # FTS returned nothing (or query had no tokenizable terms) -> LIKE substring fallback
+            q = (f"%{route.lower()}%", f"%{operator.lower()}%")
+            rows = self.conn.execute(
+                "SELECT op, num, directions, stops FROM routes "
+                "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
         matches = []
         for op, num, directions, stops in rows:
             dirs = json.loads(directions)
@@ -233,13 +242,10 @@ class TimetableStore:
         return [r[0] for r in rows]
 
     def _journeys_departing(self, naptan: str, after: str) -> list[int]:
+        """Journey ids that depart `naptan` at/after `after` (indexed range seek)."""
         rows = self.conn.execute(
-            "SELECT id FROM journeys WHERE EXISTS ("
-            "  SELECT 1 FROM json_each(journeys.json, '$.stops')"
-            "  WHERE json_extract(value,'$.naptan')=?"
-            "    AND COALESCE(json_extract(value,'$.departure'),"
-            "                 json_extract(value,'$.arrival')) >= ?"
-            ") ORDER BY id", (naptan, after)).fetchall()
+            "SELECT DISTINCT journey_id FROM journey_stop_times "
+            "WHERE naptan=? AND dep>=? ORDER BY journey_id", (naptan, after)).fetchall()
         return [r[0] for r in rows]
 
     def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
@@ -250,8 +256,14 @@ class TimetableStore:
         (next(...)). This is deliberate: plan_direct historically matched the
         first occurrence, and the shared helper unifies both tools on it. It
         only differs from last-occurrence for loop routes whose stop list
-        repeats a naptan from A or B — an accepted edge case."""
-        for jid, j in self._fetch_journeys(self._journeys_touching(naptans_b)).items():
+        repeats a naptan from A or B — an accepted edge case.
+
+        Candidates are narrowed to journeys touching BOTH stop sets before any
+        JSON is fetched: journeys touching B but not A (or vice versa) can never
+        yield a plan, and fetching them dominates cost when B resolves to a
+        busy/fuzzy set (measured 198ms -> 71ms on a 6,720-journey driving set)."""
+        both = set(self._journeys_touching(naptans_a)) & set(self._journeys_touching(naptans_b))
+        for jid, j in self._fetch_journeys(sorted(both)).items():
             if day not in j["days"]:
                 continue
             idx_a = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_a), None)
@@ -262,14 +274,25 @@ class TimetableStore:
             if arr_b and arr_b[:8] <= target_s:
                 yield j, idx_a, idx_b
 
+    def _data_key(self) -> tuple:
+        """Dataset state plan results depend on; changes after any load."""
+        return tuple(map(tuple, self.conn.execute(
+            "SELECT ds_id, modified FROM loaded_datasets ORDER BY ds_id").fetchall()))
+
     def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
                                    arrive_by: str, day: str) -> list[dict]:
-        target = _parse_time(arrive_by)
-        if target is None:
+        target_s = _parse_time(arrive_by)
+        if target_s is None:
             return []
-        target_s = target
+        return list(self._find_buses_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _find_buses_cached(self, key: tuple, a: frozenset, b: frozenset,
+                           day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         out = []
-        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
             names = self.stop_names_bulk(
                 [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
             out.append({
@@ -284,8 +307,15 @@ class TimetableStore:
 
     def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
                     target_s: str) -> list[dict]:
+        return list(self._plan_direct_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _plan_direct_cached(self, key: tuple, a: frozenset, b: frozenset,
+                            day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         plans = []
-        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
             names = self.stop_names_bulk(
                 [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
             plans.append({
@@ -301,11 +331,18 @@ class TimetableStore:
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:
+        return list(self._plan_one_change_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _plan_one_change_cached(self, key: tuple, a: frozenset, b: frozenset,
+                                day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         plans = []
-        for jid1, j1 in self._fetch_journeys(self._journeys_touching(naptans_a)).items():
+        for jid1, j1 in self._fetch_journeys(self._journeys_touching(a)).items():
             if day not in j1["days"]:
                 continue
-            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in naptans_a), None)
+            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in a), None)
             if idx_a1 is None:
                 continue
             arr_a1 = j1["stops"][idx_a1].get("arrival") or j1["stops"][idx_a1].get("departure")
@@ -323,7 +360,7 @@ class TimetableStore:
                     if day not in j2["days"]:
                         continue
                     idx_mid2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] == mid["naptan"]), None)
-                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in naptans_b), None)
+                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in b), None)
                     if idx_mid2 is None or idx_b2 is None or idx_mid2 >= idx_b2:
                         continue
                     dep2 = j2["stops"][idx_mid2].get("departure") or j2["stops"][idx_mid2].get("arrival")
@@ -406,6 +443,8 @@ class TimetableWriter:
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
+        CREATE TABLE IF NOT EXISTS journey_stop_times (naptan TEXT, journey_id INT, dep TEXT);
+        CREATE INDEX IF NOT EXISTS jst_n ON journey_stop_times(naptan, dep);
         CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
             name, naptan UNINDEXED, tokenize='unicode61');
         CREATE TRIGGER IF NOT EXISTS stops_fts_ai AFTER INSERT ON stops BEGIN
@@ -416,6 +455,17 @@ class TimetableWriter:
         END;
         CREATE TRIGGER IF NOT EXISTS stops_fts_au AFTER UPDATE ON stops BEGIN
             UPDATE stops_fts SET name = new.name, naptan = new.naptan WHERE rowid = old.rowid;
+        END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS routes_fts USING fts5(
+            num, op, key UNINDEXED, tokenize='unicode61');
+        CREATE TRIGGER IF NOT EXISTS routes_fts_ai AFTER INSERT ON routes BEGIN
+            INSERT INTO routes_fts(rowid, num, op, key) VALUES (new.rowid, new.num, new.op, new.key);
+        END;
+        CREATE TRIGGER IF NOT EXISTS routes_fts_au AFTER UPDATE ON routes BEGIN
+            UPDATE routes_fts SET num = new.num, op = new.op WHERE rowid = old.rowid;
+        END;
+        CREATE TRIGGER IF NOT EXISTS routes_fts_ad AFTER DELETE ON routes BEGIN
+            DELETE FROM routes_fts WHERE rowid = old.rowid;
         END;
         """)
         # One-time backfill: journey_stops only gets populated by add_journey,
@@ -442,6 +492,29 @@ class TimetableWriter:
                 "SELECT rowid, name, naptan FROM stops")
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('stops_fts_backfilled', '1')")
+        # One-time backfill: routes_fts only gets populated by the triggers, so
+        # a DB upgraded in place (routes already present) would have an empty
+        # FTS index and every route search would silently return nothing.
+        # Backfill from routes once, keyed on a meta flag so it never re-runs.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='routes_fts_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO routes_fts(rowid, num, op, key) "
+                "SELECT rowid, num, op, key FROM routes")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('routes_fts_backfilled', '1')")
+        # One-time backfill: journey_stop_times is populated by add_journey, so
+        # a DB upgraded in place (journeys already present) would have an empty
+        # departure index. Backfill from the stored stops JSON once, keyed on a
+        # meta flag so it never re-runs. dep follows COALESCE(departure, arrival)
+        # to match add_journey's write side.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
+                "SELECT json_extract(value, '$.naptan'), j.id, "
+                "       COALESCE(json_extract(value, '$.departure'), json_extract(value, '$.arrival')) "
+                "FROM journeys j, json_each(j.json, '$.stops')")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('journey_stop_times_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
@@ -549,6 +622,10 @@ class TimetableWriter:
         self.conn.executemany(
             "INSERT INTO journey_stops VALUES (?,?)",
             [(s["naptan"], cur.lastrowid) for s in stops])
+        self.conn.executemany(
+            "INSERT INTO journey_stop_times VALUES (?,?,?)",
+            [(s["naptan"], cur.lastrowid, s.get("departure") or s.get("arrival"))
+             for s in stops])
 
     def commit(self):
         self.conn.commit()
@@ -563,6 +640,11 @@ class TimetableWriter:
         self.conn.execute(
             "INSERT OR REPLACE INTO meta VALUES ('last_refresh', ?)", (iso,))
 
+    def optimize_fts(self):
+        """Merge/coalesce FTS b-trees after bulk loads (query-speed tail win)."""
+        self.conn.execute("INSERT INTO stops_fts(stops_fts) VALUES('optimize')")
+        self.conn.execute("INSERT INTO routes_fts(routes_fts) VALUES('optimize')")
+
     def discard_untagged_for(self, op: str, route_num: str):
         """Remove pre-SQLite-era journeys (ds_id=0) for one operator+route.
 
@@ -571,6 +653,10 @@ class TimetableWriter:
         """
         self.conn.execute(
             "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
+            (op, route_num))
+        self.conn.execute(
+            "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
             (op, route_num))
         self.conn.execute(
@@ -592,6 +678,9 @@ class TimetableWriter:
         """
         self.conn.execute(
             "DELETE FROM journey_stops WHERE journey_id IN "
+            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
+        self.conn.execute(
+            "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
         # Surviving route keys via an index-only scan on journeys(op, route)
