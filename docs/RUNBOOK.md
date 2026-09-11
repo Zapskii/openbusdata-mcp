@@ -153,6 +153,8 @@ cd /home/hermes/openbusdata-fork
 ~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml python e2e_sqlite.py  # vs real index
 ```
 
+- `ensure_schema` now creates the `stops_fts` FTS5 index and backfills it once on upgrade (no manual step).
+
 Key-validity probe (200 vs 401, value never printed):
 `curl -s -o /dev/null -w '%{http_code}' "https://data.bus-data.dft.gov.uk/api/v1/dataset/?limit=1&api_key=$OPENBUS_API_KEY"`.
 

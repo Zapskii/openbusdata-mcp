@@ -21,6 +21,15 @@ class _FakeResp:
     def json(self):
         return {}
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_bytes(self):
+        yield self.content
+
 
 captured = []
 
@@ -39,6 +48,10 @@ class _FakeClient:
         pass
 
     async def get(self, url):
+        captured.append(url)
+        return _FakeResp()
+
+    def stream(self, method, url):
         captured.append(url)
         return _FakeResp()
 
@@ -74,6 +87,15 @@ class _Resp:
     def json(self):
         return json.loads(self.content)
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_bytes(self):
+        yield self.content
+
 
 class _ZipFailClient(_FakeClient):
     """meta OK, zip download 404s -> _load_dataset must return None."""
@@ -82,11 +104,17 @@ class _ZipFailClient(_FakeClient):
             return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
         return _Resp(404, b"")
 
+    def stream(self, method, url):
+        return _Resp(404, b"")
+
 
 class _ZipOkClient(_FakeClient):
     async def get(self, url):
         if "/dataset/2/" in url:
             return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
         return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
@@ -104,6 +132,9 @@ class _CatClient(_FakeClient):
         if "/dataset/?" in url:
             return _Resp(200, b'{"results":[{"id":1}]}')
         return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+
+    def stream(self, method, url):
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
 # --- Test 13: mid-rewrite failure rolls back the purge
@@ -133,6 +164,9 @@ class _ZipJourneyClient(_FakeClient):
     async def get(self, url):
         if "/dataset/2/" in url:
             return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
         return _Resp(200, _make_zip(_JOURNEY_XML))
 
 
@@ -146,6 +180,9 @@ class _DeltaFailClient(_FakeClient):
                                b'{"id":4,"modified":"2026-09-01T00:00:00Z"}]}')
         if any(f"/dataset/{i}/" in url for i in (2, 3, 4)):
             return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
         return _Resp(404, b"")
 
 
@@ -165,6 +202,9 @@ class _PartialSweepClient(_FakeClient):
         if "/dataset/2/" in url:
             return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-09-01T00:00:00Z"}')
         return _Resp(404, b"")
+
+    def stream(self, method, url):
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
 # --- Test 9: _sweep_catalogue paginates and returns ({id: entry}, complete)
@@ -399,3 +439,34 @@ def test_11_parse_transxchange_namespaced_and_bare():
     bare = "<TransXChange><StopPoints><AnnotatedStopPointRef><StopPointRef>010B</StopPointRef><CommonName>Beta</CommonName></AnnotatedStopPointRef></StopPoints></TransXChange>"
     stops, _, _ = server.parse_transxchange(bare, "Op")
     assert stops and stops[0].naptan == "010B", f"bare parse failed: {stops}"
+
+
+# --- Test 22: the loader streams the zip to a temp file (get for meta)
+class _StreamRecordingClient(_FakeClient):
+    calls = []
+
+    async def get(self, url):
+        _StreamRecordingClient.calls.append(("get", url))
+        if "/dataset/9/" in url:
+            return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
+        _StreamRecordingClient.calls.append(("stream", url))
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
+
+
+def test_22_zip_download_streams(writer):
+    _StreamRecordingClient.calls = []
+
+    async def run():
+        async with _StreamRecordingClient() as client:
+            return await server._load_dataset(9, client=client)
+
+    result = asyncio.run(run())
+    assert result is not None, "dataset did not load"
+    kinds = [c[0] for c in _StreamRecordingClient.calls]
+    assert "stream" in kinds, f"zip not streamed: {_StreamRecordingClient.calls}"
+    assert "get" in kinds, f"meta not fetched via get: {_StreamRecordingClient.calls}"
+    stream_urls = [c[1] for c in _StreamRecordingClient.calls if c[0] == "stream"]
+    assert stream_urls and "http://x/y.zip" in stream_urls[0], stream_urls
