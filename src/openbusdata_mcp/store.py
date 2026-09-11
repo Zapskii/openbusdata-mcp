@@ -19,8 +19,9 @@ def _fts_query(query: str) -> Optional[str]:
     """Build an FTS5 MATCH expression from user input, or None if untokenizable.
 
     Each whitespace token becomes a quoted prefix term, AND-joined. Tokens with
-    no alphanumeric characters (bare '%', '_', '\', quotes) tokenize to nothing
-    in FTS5, so they return None and the caller falls back to LIKE.
+    no alphanumeric characters (bare '%', '_', '\', quotes) are dropped before
+    FTS5 sees them — they would match nothing meaningful — so if every token is
+    dropped this returns None and the caller falls back to LIKE.
     """
     tokens = [t for t in query.strip().lower().split() if t]
     tokens = [t for t in tokens if any(c.isalnum() for c in t)]
@@ -99,6 +100,8 @@ class TimetableStore:
 
     def search_stops(self, query: str, limit: int = 50) -> list[dict]:
         q = query.strip()
+        if not q:
+            return []   # whitespace-only: nothing to search (regression fix)
         if len(q) < 2:
             return self._search_stops_like(q, limit)   # short queries: LIKE directly
         fts = _fts_query(q)
