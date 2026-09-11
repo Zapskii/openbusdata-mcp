@@ -53,7 +53,10 @@ class _FakeClient:
 
     def stream(self, method, url):
         captured.append(url)
-        return _FakeResp()
+        raise NotImplementedError(
+            "zip-download tests must override stream() with a response that "
+            "aiter_bytes()s a real zip; the base _FakeResp.content=b\"{}\" (2 bytes) "
+            "is not a zip")
 
 
 # --- Test 2: HTTP error bodies returned to the MCP client are truncated
@@ -105,6 +108,7 @@ class _ZipFailClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(404, b"")
 
 
@@ -115,6 +119,7 @@ class _ZipOkClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
@@ -134,6 +139,7 @@ class _CatClient(_FakeClient):
         return _Resp(200, b'{"operatorName":"Op","url":"http://x/y.zip","modified":"2026-01-01T00:00:00Z"}')
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
@@ -167,6 +173,7 @@ class _ZipJourneyClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(200, _make_zip(_JOURNEY_XML))
 
 
@@ -183,6 +190,7 @@ class _DeltaFailClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(404, b"")
 
 
@@ -204,6 +212,7 @@ class _PartialSweepClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         return _Resp(200, _make_zip(b"<TransXChange/>"))
 
 
@@ -452,6 +461,7 @@ class _StreamRecordingClient(_FakeClient):
         return _Resp(404, b"")
 
     def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
         _StreamRecordingClient.calls.append(("stream", url))
         return _Resp(200, _make_zip(b"<TransXChange/>"))
 
