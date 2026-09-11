@@ -79,8 +79,11 @@ Add to your MCP client (Claude Desktop, Cursor, etc.):
 python -m venv .venv
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 
-# Install dependencies
+# Install in editable mode with test dependencies
 pip install -e ".[dev]"
+
+# Run the test suite
+pytest
 
 # Run server
 python -m openbusdata_mcp.server
