@@ -153,7 +153,7 @@ cd /home/hermes/openbusdata-fork
 ~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml python e2e_sqlite.py  # vs real index
 ```
 
-- `ensure_schema` now creates the `stops_fts` FTS5 index, backfills it once on upgrade, and `search_stops`/`resolve_stop` query it first with a LIKE fallback. **Semantics:** FTS5 is token+prefix (AND of `"token"*` terms); a query can return a strict subset of what the old substring LIKE would have matched when FTS5 finds *something* (the fallback only runs when FTS5 returns nothing). Whitespace-only queries return nothing.
+- `ensure_schema` now creates the `stops_fts` FTS5 index, backfills it once on upgrade, and `search_stops`/`resolve_stop` query it first with a LIKE fallback. **Semantics:** FTS5 is token+prefix (AND of `"token"*` terms); a query can return a strict subset of what the old substring LIKE would have matched when FTS5 finds *something* (the fallback only runs when FTS5 returns nothing). `search_stops` whitespace-only queries return nothing.
 
 Key-validity probe (200 vs 401, value never printed):
 `curl -s -o /dev/null -w '%{http_code}' "https://data.bus-data.dft.gov.uk/api/v1/dataset/?limit=1&api_key=$OPENBUS_API_KEY"`.
