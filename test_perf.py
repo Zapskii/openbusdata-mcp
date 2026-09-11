@@ -145,3 +145,45 @@ def test_30_candidate_journeys_fetches_only_intersection(writer, store):
     finally:
         store._fetch_journeys = orig
     assert set(seen["ids"]) == touch_a, "fetched more than the A-intersection"
+
+
+def test_31_routes_fts_backfill_and_trigger_sync():
+    _bk = Path(tempfile.mkdtemp()) / "upgrade.db"
+    w2 = TimetableWriter(_bk)
+    w2.ensure_schema()
+    w2.upsert_route("RadialOp1", "31", {"outbound"}, ["010A", "010B"], 1)
+    w2.conn.execute("DELETE FROM routes_fts")
+    w2.conn.execute("DELETE FROM meta WHERE k='routes_fts_backfilled'")
+    w2.conn.commit()
+    w2.ensure_schema()  # must backfill existing routes
+    n = w2.conn.execute(
+        "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '31'").fetchone()[0]
+    assert n == 1, f"backfill missing: {n}"
+    # Backfill must carry the UNINDEXED key column, mirroring the AI trigger.
+    real_key = w2.conn.execute(
+        "SELECT key FROM routes WHERE num='31'").fetchone()[0]
+    b_key = w2.conn.execute(
+        "SELECT key FROM routes_fts WHERE routes_fts MATCH '31'").fetchone()[0]
+    assert b_key == real_key, f"backfill dropped key col: {b_key} != {real_key}"
+    w2.upsert_route("Metrolink", "12", {"outbound"}, ["010A"], 1)  # trigger on INSERT
+    n2 = w2.conn.execute(
+        "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '12'").fetchone()[0]
+    assert n2 == 1, f"insert trigger missing: {n2}"
+    # Drift the index, then re-fire the UPDATE path: routes_fts_au must repair it.
+    w2.conn.execute(
+        "UPDATE routes_fts SET num='99' WHERE rowid="
+        "(SELECT rowid FROM routes WHERE key='Metrolink|12')")
+    w2.conn.commit()
+    w2.upsert_route("Metrolink", "12", {"outbound", "inbound"}, ["010A"], 1)  # UPDATE path
+    au = w2.conn.execute(
+        "SELECT num, key FROM routes_fts WHERE routes_fts MATCH '12'").fetchall()
+    assert au == [("12", "Metrolink|12")], f"update trigger missing: {au}"
+    # DELETE trigger: discard_dataset leaves route rows in place by design, so
+    # delete the route row directly and assert the FTS row follows.
+    w2.conn.execute("DELETE FROM routes WHERE key='Metrolink|12'")
+    w2.conn.commit()
+    assert w2.conn.execute(
+        "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '12'").fetchone()[0] == 0, \
+        "delete trigger left a routes_fts row"
+    assert w2.conn.execute(
+        "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '31'").fetchone()[0] == 1

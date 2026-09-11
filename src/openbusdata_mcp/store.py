@@ -422,6 +422,17 @@ class TimetableWriter:
         CREATE TRIGGER IF NOT EXISTS stops_fts_au AFTER UPDATE ON stops BEGIN
             UPDATE stops_fts SET name = new.name, naptan = new.naptan WHERE rowid = old.rowid;
         END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS routes_fts USING fts5(
+            num, op, key UNINDEXED, tokenize='unicode61');
+        CREATE TRIGGER IF NOT EXISTS routes_fts_ai AFTER INSERT ON routes BEGIN
+            INSERT INTO routes_fts(rowid, num, op, key) VALUES (new.rowid, new.num, new.op, new.key);
+        END;
+        CREATE TRIGGER IF NOT EXISTS routes_fts_au AFTER UPDATE ON routes BEGIN
+            UPDATE routes_fts SET num = new.num, op = new.op WHERE rowid = old.rowid;
+        END;
+        CREATE TRIGGER IF NOT EXISTS routes_fts_ad AFTER DELETE ON routes BEGIN
+            DELETE FROM routes_fts WHERE rowid = old.rowid;
+        END;
         """)
         # One-time backfill: journey_stops only gets populated by add_journey,
         # so a DB upgraded in place (journeys already present) would have an
@@ -447,6 +458,16 @@ class TimetableWriter:
                 "SELECT rowid, name, naptan FROM stops")
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('stops_fts_backfilled', '1')")
+        # One-time backfill: routes_fts only gets populated by the triggers, so
+        # a DB upgraded in place (routes already present) would have an empty
+        # FTS index and every route search would silently return nothing.
+        # Backfill from routes once, keyed on a meta flag so it never re-runs.
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='routes_fts_backfilled'").fetchone():
+            self.conn.execute(
+                "INSERT INTO routes_fts(rowid, num, op, key) "
+                "SELECT rowid, num, op, key FROM routes")
+            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('routes_fts_backfilled', '1')")
         # One-time backfill: journey_stop_times is populated by add_journey, so
         # a DB upgraded in place (journeys already present) would have an empty
         # departure index. Backfill from the stored stops JSON once, keyed on a
