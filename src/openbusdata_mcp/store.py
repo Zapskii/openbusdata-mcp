@@ -233,13 +233,10 @@ class TimetableStore:
         return [r[0] for r in rows]
 
     def _journeys_departing(self, naptan: str, after: str) -> list[int]:
+        """Journey ids that depart `naptan` at/after `after` (indexed range seek)."""
         rows = self.conn.execute(
-            "SELECT id FROM journeys WHERE EXISTS ("
-            "  SELECT 1 FROM json_each(journeys.json, '$.stops')"
-            "  WHERE json_extract(value,'$.naptan')=?"
-            "    AND COALESCE(json_extract(value,'$.departure'),"
-            "                 json_extract(value,'$.arrival')) >= ?"
-            ") ORDER BY id", (naptan, after)).fetchall()
+            "SELECT DISTINCT journey_id FROM journey_stop_times "
+            "WHERE naptan=? AND dep>=? ORDER BY journey_id", (naptan, after)).fetchall()
         return [r[0] for r in rows]
 
     def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
