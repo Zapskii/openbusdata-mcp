@@ -480,6 +480,7 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
     writer.set_last_refresh(datetime.now(timezone.utc).isoformat())
     writer.commit()
     j, s, r, d = writer.counts()
+    writer.optimize_fts()
     failed_note = _format_failed(failed_ids)
     return (f"Loaded {loaded} datasets ({errors} errors, {skipped} already cached). "
             f"Total: {s} stops, {r} routes, {j} journeys from {d} datasets."

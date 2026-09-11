@@ -224,3 +224,17 @@ def test_33_short_search_uses_fts(writer, store):
 def test_34_read_conn_mmap_enabled(store):
     v = store.conn.execute("PRAGMA mmap_size").fetchone()[0]
     assert v >= 268435456, f"mmap not enabled: {v}"
+
+
+def test_35_fts_optimize_after_full_load(writer):
+    writer.add_stop("010A", "Abbey Road")
+    writer.upsert_route("Op", "12", {"outbound"}, ["010A"], 1)
+    writer.commit()
+    writer.optimize_fts()   # must not break searching
+    writer.commit()
+    n = writer.conn.execute(
+        "SELECT COUNT(*) FROM stops_fts WHERE stops_fts MATCH 'abbey'").fetchone()[0]
+    assert n == 1, f"optimize broke FTS: {n}"
+    n = writer.conn.execute(
+        "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '12'").fetchone()[0]
+    assert n == 1, f"routes FTS broken: {n}"

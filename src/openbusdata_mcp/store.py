@@ -614,6 +614,11 @@ class TimetableWriter:
         self.conn.execute(
             "INSERT OR REPLACE INTO meta VALUES ('last_refresh', ?)", (iso,))
 
+    def optimize_fts(self):
+        """Merge/coalesce FTS b-trees after bulk loads (query-speed tail win)."""
+        self.conn.execute("INSERT INTO stops_fts(stops_fts) VALUES('optimize')")
+        self.conn.execute("INSERT INTO routes_fts(routes_fts) VALUES('optimize')")
+
     def discard_untagged_for(self, op: str, route_num: str):
         """Remove pre-SQLite-era journeys (ds_id=0) for one operator+route.
 
