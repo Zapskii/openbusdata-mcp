@@ -238,3 +238,24 @@ def test_35_fts_optimize_after_full_load(writer):
     n = writer.conn.execute(
         "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '12'").fetchone()[0]
     assert n == 1, f"routes FTS broken: {n}"
+
+
+def test_36_plan_cache_hit_and_invalidation(writer, store):
+    writer.add_journey("Op", "36", "outbound", "J36", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 1)
+    writer.add_stop("010A", "Alpha"); writer.add_stop("010B", "Beta")
+    writer.commit()
+    r1 = store.plan_direct({"010A"}, {"010B"}, "mon", "10:00:00")
+    assert len(r1) == 1, r1
+    assert store.plan_direct({"010A"}, {"010B"}, "mon", "10:00:00") == r1   # cache hit
+    assert store._plan_direct_cached.cache_info().hits == 1, "repeat call must reuse the cache"
+    assert store.plan_direct({"010A"}, {"010B"}, "tue", "10:00:00") == []   # different key
+    writer.add_journey("Op2", "36b", "outbound", "J36b", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "08:00:00"},
+        {"naptan": "010B", "arrival": "08:10:00", "departure": None}], 2)
+    writer.mark_dataset_loaded(2, None, "Op2")
+    writer.commit()
+    r4 = store.plan_direct({"010A"}, {"010B"}, "mon", "10:00:00")
+    assert len(r4) == 2, r4   # data_key changed -> cache invalidated
+    assert store._plan_direct_cached.cache_info().hits == 1, "dataset change must invalidate (recompute is a miss)"

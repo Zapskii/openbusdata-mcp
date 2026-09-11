@@ -3,6 +3,7 @@
 Replaces the in-memory timetable index for query tools. Same tool output
 shapes, but memory is O(query) instead of O(entire UK timetable).
 """
+import functools
 import json
 import sqlite3
 from pathlib import Path
@@ -273,14 +274,25 @@ class TimetableStore:
             if arr_b and arr_b[:8] <= target_s:
                 yield j, idx_a, idx_b
 
+    def _data_key(self) -> tuple:
+        """Dataset state plan results depend on; changes after any load."""
+        return tuple(map(tuple, self.conn.execute(
+            "SELECT ds_id, modified FROM loaded_datasets ORDER BY ds_id").fetchall()))
+
     def find_buses_by_arrival_time(self, naptans_a: set, naptans_b: set,
                                    arrive_by: str, day: str) -> list[dict]:
-        target = _parse_time(arrive_by)
-        if target is None:
+        target_s = _parse_time(arrive_by)
+        if target_s is None:
             return []
-        target_s = target
+        return list(self._find_buses_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _find_buses_cached(self, key: tuple, a: frozenset, b: frozenset,
+                           day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         out = []
-        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
             names = self.stop_names_bulk(
                 [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
             out.append({
@@ -295,8 +307,15 @@ class TimetableStore:
 
     def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
                     target_s: str) -> list[dict]:
+        return list(self._plan_direct_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _plan_direct_cached(self, key: tuple, a: frozenset, b: frozenset,
+                            day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         plans = []
-        for j, idx_a, idx_b in self._candidate_journeys(naptans_a, naptans_b, day, target_s):
+        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
             names = self.stop_names_bulk(
                 [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
             plans.append({
@@ -312,11 +331,18 @@ class TimetableStore:
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:
+        return list(self._plan_one_change_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
+
+    @functools.lru_cache(maxsize=128)
+    def _plan_one_change_cached(self, key: tuple, a: frozenset, b: frozenset,
+                                day: str, target_s: str) -> list[dict]:
+        a, b = set(a), set(b)
         plans = []
-        for jid1, j1 in self._fetch_journeys(self._journeys_touching(naptans_a)).items():
+        for jid1, j1 in self._fetch_journeys(self._journeys_touching(a)).items():
             if day not in j1["days"]:
                 continue
-            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in naptans_a), None)
+            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in a), None)
             if idx_a1 is None:
                 continue
             arr_a1 = j1["stops"][idx_a1].get("arrival") or j1["stops"][idx_a1].get("departure")
@@ -334,7 +360,7 @@ class TimetableStore:
                     if day not in j2["days"]:
                         continue
                     idx_mid2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] == mid["naptan"]), None)
-                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in naptans_b), None)
+                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in b), None)
                     if idx_mid2 is None or idx_b2 is None or idx_mid2 >= idx_b2:
                         continue
                     dep2 = j2["stops"][idx_mid2].get("departure") or j2["stops"][idx_mid2].get("arrival")
