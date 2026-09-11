@@ -70,6 +70,7 @@ class TimetableStore:
         if self._conn is None:
             self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
             self._conn.execute("PRAGMA cache_size=-16000")  # 16MB page cache
+            self._conn.execute("PRAGMA mmap_size=268435456")  # 256MB mmap reads
         return self._conn
 
     def exists(self) -> bool:

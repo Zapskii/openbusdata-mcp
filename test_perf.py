@@ -219,3 +219,8 @@ def test_33_short_search_uses_fts(writer, store):
     assert "Abbey Road" in names, names       # abbey starts with "a"
     got = store.search_stops("")              # empty -> no rows, must stay capped
     assert 0 <= len(got) <= 50
+
+
+def test_34_read_conn_mmap_enabled(store):
+    v = store.conn.execute("PRAGMA mmap_size").fetchone()[0]
+    assert v >= 268435456, f"mmap not enabled: {v}"
