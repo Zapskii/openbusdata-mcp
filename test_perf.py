@@ -208,3 +208,14 @@ def test_32_get_route_stops_fts_first_like_fallback(writer, store):
     assert got == []                                # direction filter still applies
     got = store.get_route_stops("RadialOp1", "12")
     assert got[0]["directions"] == ["inbound", "outbound"]
+
+
+def test_33_short_search_uses_fts(writer, store):
+    writer.add_stop("010A", "Abbey Road")
+    writer.add_stop("010B", "Station X")
+    writer.commit()
+    got = store.search_stops("a")            # 1 char -> FTS prefix "a"*
+    names = [g["name"] for g in got]
+    assert "Abbey Road" in names, names       # abbey starts with "a"
+    got = store.search_stops("")              # empty -> no rows, must stay capped
+    assert 0 <= len(got) <= 50

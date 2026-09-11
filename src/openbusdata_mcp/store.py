@@ -102,8 +102,6 @@ class TimetableStore:
         q = query.strip()
         if not q:
             return []   # whitespace-only: nothing to search (regression fix)
-        if len(q) < 2:
-            return self._search_stops_like(q, limit)   # short queries: LIKE directly
         fts = _fts_query(q)
         if fts:
             rows = self.conn.execute(
