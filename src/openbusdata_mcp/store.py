@@ -173,10 +173,19 @@ class TimetableStore:
 
     def get_route_stops(self, operator: str, route: str,
                         direction: Optional[str] = None) -> list[dict]:
-        q = (f"%{route.lower()}%", f"%{operator.lower()}%")
-        rows = self.conn.execute(
-            "SELECT op, num, directions, stops FROM routes "
-            "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
+        fts = _fts_query(f"{route} {operator}".strip())
+        if fts:
+            rows = self.conn.execute(
+                "SELECT r.op, r.num, r.directions, r.stops FROM routes_fts f "
+                "JOIN routes r ON r.rowid = f.rowid "
+                "WHERE routes_fts MATCH ? ORDER BY rank LIMIT 50", (fts,)).fetchall()
+        else:
+            rows = []
+        if not rows:  # FTS returned nothing (or query had no tokenizable terms) -> LIKE substring fallback
+            q = (f"%{route.lower()}%", f"%{operator.lower()}%")
+            rows = self.conn.execute(
+                "SELECT op, num, directions, stops FROM routes "
+                "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
         matches = []
         for op, num, directions, stops in rows:
             dirs = json.loads(directions)

@@ -187,3 +187,24 @@ def test_31_routes_fts_backfill_and_trigger_sync():
         "delete trigger left a routes_fts row"
     assert w2.conn.execute(
         "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '31'").fetchone()[0] == 1
+
+
+def test_32_get_route_stops_fts_first_like_fallback(writer, store):
+    writer.upsert_route("RadialOp1", "12", {"outbound", "inbound"}, ["010A", "010B"], 1)
+    writer.upsert_route("Metrolink", "12", {"outbound"}, ["010A"], 1)
+    writer.upsert_route("RadialOp1", "30", {"outbound"}, ["010A"], 1)
+    writer.upsert_route("RadialOp1", "Cross City", {"outbound"}, ["010A"], 1)
+    writer.commit()
+    got = store.get_route_stops("RadialOp1", "12")  # exact op+num via FTS
+    assert [(g["operator"], g["route"]) for g in got] == [("RadialOp1", "12")]
+    got = store.get_route_stops("Radial", "12")     # partial-op prefix via FTS
+    assert got and got[0]["route"] == "12"
+    assert got and "Metrolink" not in [g["operator"] for g in got]
+    got = store.get_route_stops("%", "%")           # untokenizable -> LIKE fallback
+    assert len(got) == 4  # all four seeded routes (12/12/30/Cross City)
+    got = store.get_route_stops("RadialOp1", "City Cross")  # tokens in reversed order
+    assert [(g["operator"], g["route"]) for g in got] == [("RadialOp1", "Cross City")], got
+    got = store.get_route_stops("RadialOp1", "12", direction="cross")
+    assert got == []                                # direction filter still applies
+    got = store.get_route_stops("RadialOp1", "12")
+    assert got[0]["directions"] == ["inbound", "outbound"]
