@@ -445,18 +445,28 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             await client.aclose()
 
 
-async def _sweep_catalogue(client: httpx.AsyncClient) -> tuple[dict[int, dict], bool]:
+async def _sweep_catalogue(client: httpx.AsyncClient,
+                           modified_since: Optional[str] = None
+                           ) -> tuple[dict[int, dict], bool]:
     """Sweep the BODS catalogue, returning ({id: entry}, complete).
 
     complete is True only when the sweep finished normally (empty or short
     page); False when it broke on a non-200 page (partial view).
+
+    modified_since: when given, the API filters server-side on modifiedDate,
+    so the sweep pages only changed datasets instead of the whole catalogue.
+    A filtered sweep CANNOT detect catalogue withdrawals — callers that need
+    reconcile must sweep unfiltered.
     """
     catalog: dict[int, dict] = {}
     offset = 0
     limit = 100
     while True:
-        resp = await client.get(
-            f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
+        url = f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}"
+        if modified_since:
+            url += "&modifiedDate=" + quote(modified_since, safe="")
+        url += f"&api_key={API_KEY}"
+        resp = await client.get(url)
         if resp.status_code != 200:
             return catalog, False
         results = resp.json().get("results", [])
@@ -579,17 +589,28 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
 
     sweep_start = datetime.now(timezone.utc)
 
+    # Full sweep when the full-sweep watermark is stale or absent (withdrawal
+    # purges need the whole catalogue, so reconcile runs on full sweeps only);
+    # otherwise a server-side filtered sweep touches only changed datasets.
+    full = writer.full_sweep_due()
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        catalog, _ = await _sweep_catalogue(client)
+        catalog, sweep_complete = await _sweep_catalogue(
+            client, modified_since=None if full else reference.isoformat())
+    if full and sweep_complete:
+        writer.set_last_full_sweep(datetime.now(timezone.utc).isoformat())
+        writer.commit()
 
-    if not catalog:
+    # An empty catalogue is only a failure when the sweep broke before seeing
+    # anything; a completed sweep that returns no results is authoritative
+    # (filtered: nothing changed; full: everything withdrawn -> purge below).
+    if not catalog and not sweep_complete:
         return "Catalogue sweep failed (non-200 or empty) - watermark left untouched."
 
     updated = 0
     purged = 0
     errors = 0
     failed_ids: list[int] = []
-    if reconcile:
+    if reconcile and sweep_complete and full:
         for ds_id in [i for i in writer.loaded_ids() if i not in catalog]:
             writer.discard_dataset(ds_id)
             purged += 1
@@ -770,6 +791,9 @@ async def load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     refresh (default watermark; pass an ISO timestamp to override) and
     purge datasets withdrawn from the catalogue. Minutes instead of hours
     versus a full load. No-op fallback to a full load if no cache exists.
+    Catalogue sweeps are server-side filtered by modifiedDate when the index
+    is fresh; a full (unfiltered) sweep - needed to detect withdrawn
+    datasets - runs at most every 7 days.
 
     Parameters:
       since: Optional ISO timestamp (YYYY-MM-DDTHH:MM:SS). Empty = use the

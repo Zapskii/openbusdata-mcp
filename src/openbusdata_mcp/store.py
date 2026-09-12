@@ -6,6 +6,7 @@ shapes, but memory is O(query) instead of O(entire UK timetable).
 import functools
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,16 @@ def _fts_query(query: str) -> Optional[str]:
 # binds BOTH sets in one query, so the combined count must stay under SQLite's
 # 999-variable limit (pre-3.32). 400 + 400 = 800 < 999.
 MAX_RESOLVE = 400
+
+
+def _parse_iso(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_time(text: str) -> Optional[str]:
@@ -635,6 +646,27 @@ class TimetableWriter:
         self.conn.execute(
             "INSERT OR REPLACE INTO loaded_datasets VALUES (?,?,?)",
             (ds_id, modified, operator))
+
+    def last_full_sweep(self) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT v FROM meta WHERE k='last_full_sweep'").fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_last_full_sweep(self, iso: str):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('last_full_sweep', ?)", (iso,))
+
+    def full_sweep_due(self, max_age_days: int = 7) -> bool:
+        """True when a full (unfiltered) catalogue sweep is overdue.
+
+        Withdrawal purges need the full catalogue, so they run on full sweeps
+        only; otherwise a filtered delta sweep is enough until this watermark
+        ages out (default 7 days)."""
+        iso = self.last_full_sweep()
+        ts = _parse_iso(iso) if iso else None
+        if ts is None:
+            return True
+        return (datetime.now(timezone.utc) - ts).total_seconds() > max_age_days * 86400
 
     def set_last_refresh(self, iso: str):
         self.conn.execute(
