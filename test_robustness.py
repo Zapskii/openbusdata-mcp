@@ -602,3 +602,43 @@ def test_26_api_key_is_redacted_from_fares_tool(monkeypatch):
         server.set_http_client(None)
     assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
     assert "401" in out, "the failure must still be reported readably"
+
+
+# --- Test 27: the passthrough handler's SUCCESS returns are redacted too (P31)
+# Its sibling error returns (the HTTPStatusError branch and the generic one)
+# already pass through _redact; P31's point is the invariant that EVERY return
+# from that handler does, so no future reader has to re-derive reachability on
+# this surface. The leak it prevents needs a remote endpoint to echo the
+# request URL -- key included -- into its own 200 body, which is what this test
+# puts in the handler; it is not asserted that any real endpoint does so.
+def _echo_url_client(response_for):
+    def handler(request):
+        return response_for(str(request.url))
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_27_api_key_is_redacted_from_passthrough_success(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    tool_fn = _dataset_tool()
+    assert tool_fn is not None, "generated dataset tool not found"
+
+    # JSON branch: the echoed URL arrives in a JSON body -> resp.json() path.
+    server.set_http_client(_echo_url_client(
+        lambda url: httpx.Response(200, json={"echo": url})))
+    try:
+        out = asyncio.run(tool_fn(datasetID="12"))
+    finally:
+        server.set_http_client(None)
+    assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
+    assert "echo" in out, "the successful response must still be returned"
+
+    # Non-JSON branch: resp.json() raises, so the handler returns resp.text.
+    server.set_http_client(_echo_url_client(
+        lambda url: httpx.Response(200, content=url.encode())))
+    try:
+        out = asyncio.run(tool_fn(datasetID="12"))
+    finally:
+        server.set_http_client(None)
+    assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
+    assert "api/v1/dataset" in out, "the successful response must still be returned"
+

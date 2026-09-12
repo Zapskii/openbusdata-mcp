@@ -912,10 +912,18 @@ def register_tools_from_specs(specs: dict[str, Any]):
                             client = get_http_client()
                             resp = await client.get(full_url)
                             resp.raise_for_status()
+                            # P31: EVERY return from this handler goes through
+                            # _redact -- success as well as failure. A remote
+                            # endpoint that echoes the request URL (key
+                            # included) into a 200 body must not publish the
+                            # credential, and the invariant is checkable at a
+                            # glance rather than by re-deriving reachability.
                             try:
-                                return json.dumps(resp.json(), indent=2, ensure_ascii=False)
+                                return _redact(
+                                    json.dumps(resp.json(), indent=2,
+                                               ensure_ascii=False))
                             except Exception:
-                                return resp.text
+                                return _redact(resp.text)
                         except httpx.HTTPStatusError as e:
                             return _redact(
                                 f"HTTP Error {e.response.status_code}: "
