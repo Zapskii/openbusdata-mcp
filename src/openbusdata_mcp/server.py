@@ -1042,8 +1042,8 @@ async def _annotate_disruptions(plans: list) -> list:
         return plans
     line_refs, op_refs = set(), set()
     for m in messages:
-        line_refs.update(m["lines"])
-        op_refs.update(m["operators"])
+        line_refs.update(m.get("lines") or ())
+        op_refs.update(m.get("operators") or ())
     for p in plans:
         alerts = []
         for leg in p["legs"]:
@@ -1110,7 +1110,7 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
 
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
     if check_disruptions:
-        deduped = await _annotate_disruptions(deduped[:15])
+        await _annotate_disruptions(deduped[:15])
     return json.dumps(deduped, indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
 
 

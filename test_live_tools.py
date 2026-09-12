@@ -242,3 +242,53 @@ def test_plan_journey_check_disruptions_false_skips_fetch(seeded_route, monkeypa
                                     arrive_by="10:00", day="mon",
                                     check_disruptions=False))
     assert called == []
+
+
+def test_plan_journey_annotation_does_not_truncate(seeded_route, writer, monkeypatch):
+    # 16 extra Monday journeys on route 12 push the plan count past the
+    # annotation cap of 15 (seeded_route already contributes J1 and J2).
+    for i in range(16):
+        dep = 10 * 60 + i * 30  # 10:00 onwards, every 30 minutes
+        writer.add_journey("OPX", "12", "outbound", f"X{i}", {"mon"}, [
+            {"naptan": "010A", "arrival": None,
+             "departure": f"{dep // 60:02d}:{dep % 60:02d}:00"},
+            {"naptan": "010B", "arrival": f"{(dep + 10) // 60:02d}:{(dep + 10) % 60:02d}:00",
+             "departure": f"{(dep + 11) // 60:02d}:{(dep + 11) % 60:02d}:00"},
+            {"naptan": "010C", "arrival": f"{(dep + 20) // 60:02d}:{(dep + 20) % 60:02d}:00",
+             "departure": None}], 1)
+    writer.commit()
+
+    calls = []
+
+    async def fake_fetch(kind):
+        calls.append(kind)
+        return [{"recorded_at": "2026-09-12T10:00:00Z", "valid_until": None,
+                 "channel": "disruptions", "severity": "severe",
+                 "operators": [], "lines": ["12"], "stops": [],
+                 "summary": "Road closure on Bravo Road"}]
+
+    monkeypatch.setattr(server, "_fetch_sx", fake_fetch)
+
+    # check_disruptions=False is the uncapped path, so it measures the
+    # planner's true plan count — and it must not touch the feed at all.
+    off = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="23:00", day="mon",
+        check_disruptions=False)))
+    assert calls == [], "the opt-out path must not fetch the feed"
+    assert len(off) > 15, "seeding must produce enough plans to observe truncation"
+
+    on = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="23:00", day="mon")))
+    assert len(on) == len(off), \
+        f"annotation truncated the plan list: {len(on)} of {len(off)} plans returned"
+    assert all(p["disruption_alerts"] == ["route 12 has an active disruption"]
+               for p in on[:15])
+    assert any("disruption_alerts" not in p for p in on[15:]), \
+        "the [:15] annotation cap must leave the tail unannotated"
+
+    # The second plan_journey call above is an lru_cache hit, and test_perf.py
+    # ::test_36 asserts a process-global cache_info().hits counter without ever
+    # clearing it — so empty the plan caches here to leave process state as we
+    # found it (this also keeps in-place annotated dicts out of the cache).
+    server.store._plan_direct_cached.cache_clear()
+    server.store._plan_one_change_cached.cache_clear()
