@@ -423,12 +423,6 @@ def test_plan_journey_opt_out_uncontaminated_by_cache(seeded_route):
         f"CACHE CONTAMINATION: {len(contaminated)} of {len(off)} plans returned "
         "alerts to a caller that asked NOT to check disruptions")
 
-    # The three calls above hit the planner cache twice; test_perf.py::test_36
-    # asserts the process-global cache_info().hits counter without clearing it,
-    # so empty the plan caches here (same hygiene as the truncation test above).
-    server.store._plan_direct_cached.cache_clear()
-    server.store._plan_one_change_cached.cache_clear()
-
 
 def test_plan_journey_survives_message_missing_refs(seeded_route, monkeypatch):
     async def feed_without_refs(kind):

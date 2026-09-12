@@ -36,6 +36,28 @@ def _fresh_db(tmp_path):
     server.store.close()
 
 
+@pytest.fixture(autouse=True)
+def _clear_plan_caches():
+    """Empty the planner's process-global lru caches before every test.
+
+    TimetableStore._plan_direct_cached / _plan_one_change_cached are class
+    attributes, so they outlive the per-test store rebuild, and
+    test_perf.py::test_36 asserts an ABSOLUTE cache_info().hits count without
+    clearing the cache itself — so any earlier test that makes a plan-cache hit
+    breaks it, in a different file. Clearing here, autouse, reaches every test
+    module in this directory rather than only the one that defines the
+    fixture.
+
+    Do not replace this with trailing cache_clear() calls in the tests that
+    happen to hit the cache: such a call only runs on the success path, so a
+    genuine failure above it cascades into a spurious test_36 failure and makes
+    one real defect look like two.
+    """
+    TimetableStore._plan_direct_cached.cache_clear()
+    TimetableStore._plan_one_change_cached.cache_clear()
+    yield
+
+
 @pytest.fixture()
 def writer(_fresh_db):
     return server.writer
