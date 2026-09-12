@@ -17,6 +17,7 @@ import json
 import zipfile
 import xml.etree.ElementTree as ET
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode, urljoin
@@ -59,8 +60,6 @@ def set_http_client(client: Optional[httpx.AsyncClient]) -> None:
     global _http_client
     _http_client = client
 
-
-import time
 
 class TTLCache:
     """Tiny process-local TTL cache: monotonic clock, bounded entry count."""
@@ -960,8 +959,10 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
                 "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
                 "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
             })
-        _LIVE_CACHE.put((operator_ref, line_ref), buses)
-        return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
+        if buses:
+            _LIVE_CACHE.put((operator_ref, line_ref), buses)
+            return json.dumps(buses, indent=2, ensure_ascii=False)
+        return f"No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
 
