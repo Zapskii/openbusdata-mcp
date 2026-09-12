@@ -797,8 +797,10 @@ async def load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     versus a full load. No-op fallback to a full load if no cache exists.
     Catalogue sweeps are server-side filtered by modifiedDate when the index
     is fresh; a full (unfiltered) sweep - needed to detect withdrawn
-    datasets - runs at most every 7 days. reconcile=True forces a full
-    sweep (withdrawal purges need the full catalogue).
+    datasets - runs at most every 7 days. reconcile=True does not force a
+    full sweep, but withdrawal purges happen only on full sweeps, so with
+    a fresh watermark withdrawals linger up to 7 days (self-heals on the
+    next full sweep).
 
     Parameters:
       since: Optional ISO timestamp (YYYY-MM-DDTHH:MM:SS). Empty = use the
