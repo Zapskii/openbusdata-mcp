@@ -59,6 +59,34 @@ def set_http_client(client: Optional[httpx.AsyncClient]) -> None:
     global _http_client
     _http_client = client
 
+
+import time
+
+class TTLCache:
+    """Tiny process-local TTL cache: monotonic clock, bounded entry count."""
+
+    def __init__(self, ttl_seconds: float):
+        self.ttl = ttl_seconds
+        self._store: dict = {}
+
+    def get(self, key):
+        hit = self._store.get(key)
+        if hit is None:
+            return None
+        ts, val = hit
+        if time.monotonic() - ts > self.ttl:
+            del self._store[key]
+            return None
+        return val
+
+    def put(self, key, val):
+        if len(self._store) >= 256:
+            self._store.clear()  # simple bounded reset; keys are few
+        self._store[key] = (time.monotonic(), val)
+
+
+_LIVE_CACHE = TTLCache(20.0)  # bus positions are re-polled within seconds
+
 mcp = FastMCP("openbusdata")
 
 
@@ -903,6 +931,9 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
     """
     query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
     full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
+    cached = _LIVE_CACHE.get((operator_ref, line_ref))
+    if cached is not None:
+        return json.dumps(cached, indent=2, ensure_ascii=False)
     try:
         client = get_http_client()
         resp = await client.get(full_url)
@@ -929,6 +960,7 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
                 "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
                 "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
             })
+        _LIVE_CACHE.put((operator_ref, line_ref), buses)
         return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"

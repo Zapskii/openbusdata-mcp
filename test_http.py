@@ -42,3 +42,44 @@ def test_get_http_client_lazy_singleton():
         assert c1 is c2, "shared client must be a singleton"
     finally:
         server.set_http_client(None)
+
+
+import time
+
+
+def test_ttl_cache_hit_then_expiry(monkeypatch):
+    from openbusdata_mcp.server import TTLCache
+    cache = TTLCache(ttl_seconds=20.0)
+    cache.put("k", {"a": 1})
+    assert cache.get("k") == {"a": 1}
+    fake_now = time.monotonic() + 21.0
+    monkeypatch.setattr(time, "monotonic", lambda: fake_now)
+    assert cache.get("k") is None, "expired entry must not be served"
+
+
+def test_live_buses_ttl_cache_skips_second_request():
+    # Real datafeed XML is namespace-qualified (see server.py: ns = siri.org.uk);
+    # the fixture must declare xmlns or the parser finds no VehicleActivity.
+    sirii = b'<?xml version="1.0"?><Siri xmlns="http://www.siri.org.uk/siri">' \
+            b'<VehicleActivity>' \
+            b'<MonitoredVehicleJourney><VehicleRef>V1</VehicleRef>' \
+            b'</MonitoredVehicleJourney></VehicleActivity></Siri>'
+
+    def xml_handler(request):
+        counts["n"] += 1
+        return httpx.Response(200, content=sirii)
+
+    _, counts = _client()  # replaced below; reuse the counting dict
+    client = httpx.AsyncClient(transport=httpx.MockTransport(xml_handler))
+    server.set_http_client(client)
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        r1 = asyncio.run(server.get_live_buses_on_route("OPX", "12"))
+        r2 = asyncio.run(server.get_live_buses_on_route("OPX", "12"))
+        assert counts["n"] == 1, "second call within TTL must be served from cache"
+        assert r1 == r2
+        r3 = asyncio.run(server.get_live_buses_on_route("OPY", "12"))
+        assert counts["n"] == 2, "a different route key must miss the cache"
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
