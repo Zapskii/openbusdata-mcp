@@ -103,6 +103,23 @@ def test_get_departures_board_errors(seeded_route):
     assert "Could not resolve stop" in out
 
 
+def test_get_departures_board_blank_stop_name_is_unknown(writer, store):
+    # A `stops` row can exist with an empty name (add_stop inserts the name as
+    # given), so COALESCE(s.name, 'Unknown') alone renders such a destination
+    # as "" — the fallback must cover a present-but-empty name too (P18).
+    writer.add_stop("010A", "Alpha Street")
+    writer.add_stop("010B", "")
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A", "010B"], 1)
+    writer.add_journey("OPX", "12", "outbound", "J1", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 1)
+    writer.commit()
+    out = json.loads(asyncio.run(server.get_departures_board(
+        "Alpha Street", day="mon", from_time="08:00")))
+    assert out, "the seeded departure must be on the board"
+    assert out[0]["destination"] == "Unknown", out
+
+
 VM_ONE = b'''<?xml version="1.0"?>
 <Siri xmlns="http://www.siri.org.uk/siri">
  <VehicleActivity>

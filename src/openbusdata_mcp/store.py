@@ -398,14 +398,17 @@ class TimetableStore:
                         limit: int = 20) -> list:
         """Next scheduled departures from any of the given stops on `day`,
         at/after from_time ('HH:MM:SS'), ordered by time. Destination is the
-        name of each journey's final stop. Rides jst_n (naptan, dep) for the
-        candidate scan and jst_j (journey_id) for the correlated MAX(seq)."""
+        name of each journey's final stop, falling back to 'Unknown' when that
+        stop has no `stops` row OR a row with a blank name (R14's COALESCE
+        plus P18's NULLIF). Rides jst_n (naptan, dep) for the candidate scan
+        and jst_j (journey_id) for the correlated MAX(seq)."""
         if not naptans:
             return []
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(f"""
             SELECT j.op, j.route, j.direction, j.code,
-                   MIN(jst.dep) AS dep, COALESCE(s.name, 'Unknown') AS dest
+                   MIN(jst.dep) AS dep,
+                   COALESCE(NULLIF(s.name, ''), 'Unknown') AS dest
             FROM journey_stop_times jst
             JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
             JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
