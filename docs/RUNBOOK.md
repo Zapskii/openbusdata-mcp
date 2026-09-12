@@ -147,9 +147,16 @@ EOF
 # not HTML (HTML = the /api/v1 double-prefix regression, fixed in 1f3bea5):
 #   call tool timetables_api_v1_dataset {limit: 2} → expect {"count": 941, ...}
 
+# New coverage tools — quick checks (replace args with real refs from the index):
+#   get_departures_board {stop: "<known stop name>"}           → ordered JSON board
+#   get_disruptions {}                                          → JSON list or "No matching..."
+#   get_cancellations {}                                        → JSON list or "No matching..."
+#   estimate_live_eta {stop, operator_ref, line_ref}            → vehicles + eta or a readable note
+#   get_fare_prices {dataset_id}                                → JSON prices or "No fare prices..."
+
 # Unit + E2E (from the repo):
 cd /home/hermes/openbusdata-fork
-~/.local/bin/uv run --extra dev pytest -q   # 68/68
+~/.local/bin/uv run --extra dev pytest -q   # 119/119
 ~/.local/bin/uv run --with 'mcp<2' --with httpx --with pyyaml python e2e_sqlite.py  # vs real index
 ```
 
@@ -169,7 +176,7 @@ Key-validity probe (200 vs 401, value never printed):
 
 - **Why SQLite:** the JSON cache needed the whole index in RAM (~9.4 GB peak;
   3× exit-137 OOMKills in a 7.7 GB cgroup). SQLite reads keep the container at
-  ~45 MB and make startup instant. Tool surface unchanged (17 tools).
+  ~45 MB and make startup instant. Tool surface now 22 tools: the 17 passthrough/search/planning tools plus get_disruptions, get_cancellations, get_departures_board, estimate_live_eta and get_fare_prices; get_live_buses_on_route additionally accepts server-side filters (origin_ref, destination_ref, vehicle_ref, bounding_box).
 - **Download quirks** (both fixed in the fork): not all BODS downloads are zips
   (many are bare TransXChange XML); parsed journey times are `datetime.time`
   and must be isoformat'd before JSON insertion.
