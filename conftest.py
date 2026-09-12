@@ -36,6 +36,28 @@ def _fresh_db(tmp_path):
     server.store.close()
 
 
+@pytest.fixture(autouse=True)
+def _clear_plan_caches():
+    """Empty the planner's process-global lru caches before every test.
+
+    TimetableStore._plan_direct_cached / _plan_one_change_cached are class
+    attributes, so they outlive the per-test store rebuild, and
+    test_perf.py::test_36 asserts an ABSOLUTE cache_info().hits count without
+    clearing the cache itself — so any earlier test that makes a plan-cache hit
+    breaks it, in a different file. Clearing here, autouse, reaches every test
+    module in this directory rather than only the one that defines the
+    fixture.
+
+    Do not replace this with trailing cache_clear() calls in the tests that
+    happen to hit the cache: such a call only runs on the success path, so a
+    genuine failure above it cascades into a spurious test_36 failure and makes
+    one real defect look like two.
+    """
+    TimetableStore._plan_direct_cached.cache_clear()
+    TimetableStore._plan_one_change_cached.cache_clear()
+    yield
+
+
 @pytest.fixture()
 def writer(_fresh_db):
     return server.writer
@@ -46,3 +68,26 @@ def store(_fresh_db):
     s = TimetableStore()
     yield s
     s.close()
+
+
+@pytest.fixture()
+def seeded_route(writer, store):
+    """Route OPX|12 outbound over three stops, two Monday journeys.
+
+    J1: 010A dep 09:00, 010B arr 09:10 / dep 09:11, 010C arr 09:20.
+    J2: 010A dep 09:30, 010B arr 09:40,            010C arr 09:50.
+    """
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    writer.add_stop("010B", "Bravo Road", 51.51, -0.11)
+    writer.add_stop("010C", "Charlie Road", 51.52, -0.12)
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A", "010B", "010C"], 1)
+    writer.add_journey("OPX", "12", "outbound", "J1", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010B", "arrival": "09:10:00", "departure": "09:11:00"},
+        {"naptan": "010C", "arrival": "09:20:00", "departure": None}], 1)
+    writer.add_journey("OPX", "12", "outbound", "J2", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:30:00"},
+        {"naptan": "010B", "arrival": "09:40:00", "departure": None},
+        {"naptan": "010C", "arrival": "09:50:00", "departure": None}], 1)
+    writer.commit()
+    return store

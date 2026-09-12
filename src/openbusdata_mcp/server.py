@@ -15,7 +15,9 @@ import tempfile
 import yaml
 import json
 import zipfile
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
+import math
 import re
 import time
 from pathlib import Path
@@ -24,6 +26,8 @@ from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
+from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
+from .fares import parse_fare_prices
 from collections import defaultdict
 
 import httpx
@@ -86,7 +90,174 @@ class TTLCache:
 
 _LIVE_CACHE = TTLCache(20.0)  # bus positions are re-polled within seconds
 
+_SIRI_VM_FILTER_KEYS = ("operatorRef", "lineRef", "originRef",
+                        "destinationRef", "vehicleRef", "boundingBox")
+
+_API_KEY_PARAM_RE = re.compile(r"(api_key=)[^&\s'\"]+")
+
+
+def _redact(text: str) -> str:
+    """Strip the API key from text bound for tool output or a log line.
+
+    httpx builds HTTPStatusError messages from the request URL, and every BODS
+    URL carries ?api_key=..., so an unredacted failure message publishes the
+    credential into tool output and the session transcript.
+
+    Ruling R24: this strips the api_key parameter by PATTERN rather than by
+    enumerating the key's encodings. The package builds that parameter three
+    ways -- the fares tool interpolates API_KEY raw, SIRI-SX uses
+    quote(API_KEY) (safe='/'), and SIRI-VM uses urlencode(..., quote_via=quote)
+    (which passes safe='') -- so a key containing '/' appears as %2F on one
+    path and '/' on another, and no fixed list of literals covers all three.
+    A pattern also keeps working when the next URL builder is added, which is
+    what makes this a closed class rather than a list that goes stale.
+
+    The literal replacement is kept as well, for a key that reaches output
+    outside a query string (a raw traceback, say).
+    """
+    if not API_KEY:
+        return text
+    out = text.replace(API_KEY, "***")
+    return _API_KEY_PARAM_RE.sub(r"\1***", out)
+
+
+def _siri_vm_url(filters: dict) -> str:
+    params = {k: v for k, v in filters.items() if v}
+    params["api_key"] = API_KEY
+    return f"{BASE_URL}/api/v1/datafeed/?{urlencode(params, quote_via=quote)}"
+
+
+async def _fetch_siri_vm(filters: dict) -> bytes:
+    """Fetch raw SIRI-VM bytes for the given datafeed filters, cached on the
+    full filter tuple with the 20s TTL. Empty feeds (no VehicleActivity) are
+    never cached so the next poll re-requests. Raises on HTTP errors."""
+    key = tuple(filters.get(k) for k in _SIRI_VM_FILTER_KEYS)
+    cached = _LIVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resp = await get_http_client().get(_siri_vm_url(filters))
+    resp.raise_for_status()
+    # An empty AVL feed is not cached: vehicles appear and vanish constantly, so
+    # an empty response is usually transient and a 20s cache of it would hide a
+    # bus that is already running. The asymmetry with _fetch_sx is deliberate —
+    # SIRI-SX carries messages that stay valid for hours, so an empty SX
+    # response is authoritative and worth caching. Do not "fix" this to match.
+    if parse_siri_vm(resp.content):
+        _LIVE_CACHE.put(key, resp.content)
+    return resp.content
+
+
+_SX_CACHE = TTLCache(60.0)  # SIRI-SX feeds refresh on their own cadence
+
+_SX_PATHS = {"disruptions": "/api/v1/siri-sx/",
+             "cancellations": "/api/v1/siri-sx/cancellations/"}
+
+
+async def _fetch_sx(kind: str) -> Optional[list]:
+    """Cached SIRI-SX fetch. Returns None when the feed is unreachable or
+    unparseable — callers degrade (never crash) on None."""
+    cached = _SX_CACHE.get(kind)
+    if cached is not None:
+        return cached
+    url = f"{BASE_URL}{_SX_PATHS[kind]}?api_key={quote(API_KEY)}"
+    try:
+        resp = await get_http_client().get(url)
+        resp.raise_for_status()
+        parsed = (parse_siri_sx if kind == "disruptions"
+                  else parse_cancellations)(resp.content)
+    except Exception as e:
+        print(_redact(f"[siri-sx] {kind} fetch/parse failed: "
+                      f"{type(e).__name__}: {e}"),
+              file=sys.stderr, flush=True)
+        return None
+    _SX_CACHE.put(kind, parsed)
+    return parsed
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return None
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _hms_minutes(s: str) -> int:
+    """'HH:MM:SS' -> minutes since service-day start. Hours are NOT clamped
+    at 24 (past-midnight times publish as 24:xx+), matching the store."""
+    h, m, _sec = s.split(":")
+    return int(h) * 60 + int(m)
+
+
 mcp = FastMCP("openbusdata")
+
+
+# ---------------------------------------------------------------------------
+# SIRI-SX tools (disruptions & cancellations)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def get_disruptions(operator: Optional[str] = None, line: Optional[str] = None,
+                          stop: Optional[str] = None) -> str:
+    """
+    Get active SIRI-SX disruption messages as structured JSON, optionally
+    filtered (client-side — the endpoint itself accepts no query parameters).
+
+    Parameters:
+      operator: Optional operator NOC code. Matched by EXACT membership of the
+                message's operator refs — not a substring, so "OPX" matches a
+                message carrying <OperatorRef>OPX</OperatorRef> and nothing
+                else does.
+      line: Optional line/route number, matched by exact membership of the
+            message's line refs.
+      stop: Optional NaPTAN stop ref, matched by exact membership of the
+            message's stop point refs.
+    """
+    messages = await _fetch_sx("disruptions")
+    if messages is None:
+        return "Disruptions feed unavailable (fetch or parse failed)."
+
+    def keep(m):
+        if operator and operator not in m["operators"]:
+            return False
+        if line and line not in m["lines"]:
+            return False
+        if stop and stop not in m["stops"]:
+            return False
+        return True
+
+    filtered = [m for m in messages if keep(m)]
+    if not filtered:
+        return "No matching disruption messages."
+    # R32: message text is remote-derived, so the success return goes through
+    # _redact like the failure returns above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
+
+
+@mcp.tool()
+async def get_cancellations(operator: Optional[str] = None,
+                            line: Optional[str] = None) -> str:
+    """
+    Get published operator cancellations (SIRI-SX /cancellations) as
+    structured JSON. Filtering is client-side and exact-match.
+
+    Parameters:
+      operator: Optional operator NOC code (exact match).
+      line: Optional line/route number (exact match).
+    """
+    entries = await _fetch_sx("cancellations")
+    if entries is None:
+        return "Cancellations feed unavailable (fetch or parse failed)."
+    filtered = [e for e in entries
+                if (not operator or e["operator"] == operator)
+                and (not line or e["line"] == line)]
+    if not filtered:
+        return "No matching cancellation entries."
+    # R32: entry text is remote-derived, so the success return goes through
+    # _redact like the failure returns above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +368,8 @@ def _parse_days(op_profile) -> set[str]:
 def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], list[Route], list[Journey]]:
     """Parse a single TransXChange XML string. Returns (stops, routes, journeys)."""
     try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
+        root = SafeET.fromstring(content)
+    except (SafeET.ParseError, DefusedXmlException):
         return [], [], []
 
     ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
@@ -527,7 +698,8 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             except Exception as e:
                 errors += 1
                 failed_ids.append(ds_id)
-                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                print(_redact(f"[loader] dataset {ds_id} failed: "
+                              f"{type(e).__name__}: {e}"),
                       file=sys.stderr, flush=True)
             # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
@@ -629,7 +801,8 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                 except Exception as e:
                     errors += 1
                     failed_ids.append(ds_id)
-                    print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                    print(_redact(f"[loader] dataset {ds_id} failed: "
+                                  f"{type(e).__name__}: {e}"),
                           file=sys.stderr, flush=True)
 
     # Full-sweep watermark: written only AFTER the purge/load phase has been
@@ -752,15 +925,25 @@ def register_tools_from_specs(specs: dict[str, Any]):
                             client = get_http_client()
                             resp = await client.get(full_url)
                             resp.raise_for_status()
+                            # P31: EVERY return from this handler goes through
+                            # _redact -- success as well as failure. A remote
+                            # endpoint that echoes the request URL (key
+                            # included) into a 200 body must not publish the
+                            # credential, and the invariant is checkable at a
+                            # glance rather than by re-deriving reachability.
                             try:
-                                return json.dumps(resp.json(), indent=2, ensure_ascii=False)
+                                return _redact(
+                                    json.dumps(resp.json(), indent=2,
+                                               ensure_ascii=False))
                             except Exception:
-                                return resp.text
+                                return _redact(resp.text)
                         except httpx.HTTPStatusError as e:
-                            return (f"HTTP Error {e.response.status_code}: "
-                                    f"{e.response.text[:500]}")
+                            return _redact(
+                                f"HTTP Error {e.response.status_code}: "
+                                f"{e.response.text[:500]}")
                         except Exception as e:
-                            return f"Error: {type(e).__name__}: {str(e)}"
+                            return _redact(
+                                f"Error: {type(e).__name__}: {str(e)}")
                     return tool_func
 
                 tool_func = make_tool()
@@ -900,8 +1083,39 @@ async def find_buses_by_arrival_time(stop_a: str, stop_b: str, arrive_by: str, d
     return json.dumps(results, indent=2, ensure_ascii=False) if results else f"No buses found arriving at '{stop_b}' by {arrive_by} on {day}."
 
 
+async def _annotate_disruptions(plans: list) -> list:
+    """Attach disruption_alerts to plans whose legs' route or operator refs
+    appear in the live SIRI-SX feed. Annotation only — plans are never
+    dropped — and a feed failure degrades to silent, unannotated output."""
+    try:
+        messages = await _fetch_sx("disruptions")
+    except Exception as e:
+        print(_redact(f"[siri-sx] disruption annotation skipped: "
+                      f"{type(e).__name__}: {e}"),
+              file=sys.stderr, flush=True)
+        return plans
+    if not messages:
+        return plans
+    line_refs, op_refs = set(), set()
+    for m in messages:
+        line_refs.update(m.get("lines") or ())
+        op_refs.update(m.get("operators") or ())
+    for p in plans:
+        alerts = []
+        for leg in p["legs"]:
+            if leg.get("route") in line_refs:
+                alerts.append(f"route {leg.get('route')} has an active disruption")
+            elif leg.get("operator") in op_refs:
+                alerts.append(f"operator {leg.get('operator')} has an active disruption notice")
+        if alerts:
+            p["disruption_alerts"] = sorted(set(alerts))
+    return plans
+
+
 @mcp.tool()
-async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[str] = None, max_changes: int = 1) -> str:
+async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
+                       day: Optional[str] = None, max_changes: int = 1,
+                       check_disruptions: bool = True) -> str:
     """
     Plan a journey from stop_a to stop_b arriving by a given time.
     Supports direct routes and single changes.
@@ -912,6 +1126,12 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
       arrive_by: Target arrival time (HH:MM, 24h format).
       day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
       max_changes: Maximum number of bus changes (0 = direct only, 1 = one change). Default 1.
+      check_disruptions: If true (default), plans whose route or operator
+                appears in the live SIRI-SX disruptions feed are annotated
+                with a "disruption_alerts" list. Annotation never drops or
+                reorders a plan and never changes the returned count; a feed
+                failure degrades silently. At most the 15 earliest-arriving
+                plans are returned, with or without annotation.
     """
     if not store.exists():
         return "No timetable data loaded. Please call load_timetable_index() first."
@@ -944,58 +1164,257 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
                     for leg in plan["legs"])
         if key not in seen:
             seen.add(key)
-            deduped.append(plan)
+            # Copy: plan_direct/plan_one_change hand back the planner's own
+            # lru-cached dicts, and _annotate_disruptions mutates what it is
+            # given — annotating the originals would leak alerts into later
+            # check_disruptions=False calls on the same cache key.
+            # Shallow is sufficient and deliberate: the only write is a
+            # top-level key ("disruption_alerts") and "legs" is only ever read,
+            # so nothing nested is shared mutably. A write INTO a nested value
+            # would need a deepcopy here, or it re-contaminates the cache.
+            deduped.append(dict(plan))
 
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
+    if check_disruptions:
+        await _annotate_disruptions(deduped[:15])
+    # R28: the 15-plan output cap predates the annotation feature (both the
+    # release base and the commit before it ended with deduped[:15]), so it is
+    # the back-compatible output the Global Constraint protects. Annotation
+    # must not reduce the returned set below this; it adds alerts, nothing else.
     return json.dumps(deduped[:15], indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
 
 
 @mcp.tool()
-async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
+async def get_live_buses_on_route(operator_ref: str, line_ref: str,
+                                  origin_ref: Optional[str] = None,
+                                  destination_ref: Optional[str] = None,
+                                  vehicle_ref: Optional[str] = None,
+                                  bounding_box: Optional[str] = None) -> str:
     """
     Get real-time bus locations for a specific operator and route.
+    Filters are applied server-side by the BODS datafeed, shrinking payloads.
 
     Parameters:
       operator_ref: Operator NOC code (e.g. ARBB, SCCM, CBBH).
       line_ref: Route number (e.g. 12, MK1, 100).
+      origin_ref: Optional origin stop ref filter.
+      destination_ref: Optional destination stop ref filter.
+      vehicle_ref: Optional single-vehicle filter.
+      bounding_box: Optional filter "minLon,minLat,maxLon,maxLat" (WGS84).
     """
-    query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
-    full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
-    cached = _LIVE_CACHE.get((operator_ref, line_ref))
-    if cached is not None:
-        return json.dumps(cached, indent=2, ensure_ascii=False)
+    filters = {"operatorRef": operator_ref, "lineRef": line_ref,
+               "originRef": origin_ref, "destinationRef": destination_ref,
+               "vehicleRef": vehicle_ref, "boundingBox": bounding_box}
     try:
-        client = get_http_client()
-        resp = await client.get(full_url)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        ns = "http://www.siri.org.uk/siri"
-        def get_text(tag):
-            el = mvj.find(f"{{{ns}}}{tag}")
-            return el.text if el is not None else "N/A"
+        content = await _fetch_siri_vm(filters)
         buses = []
-        for activity in root.iter(f"{{{ns}}}VehicleActivity"):
-            mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
-            if mvj is None:
-                continue
-            loc = mvj.find(f"{{{ns}}}VehicleLocation")
-            lat = lon = "N/A"
-            if loc is not None:
-                lat_el = loc.find(f"{{{ns}}}Latitude")
-                lon_el = loc.find(f"{{{ns}}}Longitude")
-                lat = lat_el.text if lat_el is not None else "N/A"
-                lon = lon_el.text if lon_el is not None else "N/A"
-            buses.append({
-                "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
-                "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
-                "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
-            })
+        for v in parse_siri_vm(content):
+            lat, lon = v["location"]["lat"], v["location"]["lon"]
+            buses.append({**v, "location": {"lat": "N/A" if lat is None else lat,
+                                            "lon": "N/A" if lon is None else lon}})
         if buses:
-            _LIVE_CACHE.put((operator_ref, line_ref), buses)
-            return json.dumps(buses, indent=2, ensure_ascii=False)
-        return f"No live buses found."
+            # R29: this return carries remote-derived content, so it leaves
+            # through _redact on the success path too, not only on the error
+            # path below -- a feed can echo the request URL (key and all) back
+            # into a field the parser hands to the caller. Every tool that
+            # returns parsed remote content needs its own wrap of this kind;
+            # that is a per-tool review obligation, not something the code
+            # enforces for you. R32 found two tools this one had missed.
+            return _redact(json.dumps(buses, indent=2, ensure_ascii=False))
+        return "No live buses found."
     except Exception as e:
-        return f"Error: {type(e).__name__}: {str(e)}"
+        return _redact(f"Error: {type(e).__name__}: {str(e)}")
+
+
+@mcp.tool()
+async def get_departures_board(stop: str, day: Optional[str] = None,
+                               from_time: Optional[str] = None,
+                               limit: int = 20) -> str:
+    """
+    Get the next scheduled departures at a stop (a departures board).
+
+    Parameters:
+      stop: Stop (NaPTAN code or name).
+      day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
+      from_time: Optional start time HH:MM (24h). Defaults to now.
+      limit: Max departures to return (1-50, default 20).
+    """
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    naptans = store.resolve_stop(stop)
+    if not naptans:
+        return f'Could not resolve stop: "{stop}". Try search_stops().'
+    if day is None:
+        day = datetime.now().strftime("%a").lower()
+    day = day.lower()[:3]
+    if from_time is None:
+        from_s = datetime.now().strftime("%H:%M:%S")
+    else:
+        from_s = _parse_time(from_time)
+        if from_s is None:
+            return f'Invalid time format: "{from_time}". Use HH:MM (24h).'
+    limit = max(1, min(int(limit), 50))
+    board = store.next_departures(naptans, day, from_s, limit)
+    if not board:
+        return f"No departures found at '{stop}' on {day} after {from_s}."
+    return json.dumps(board, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
+                            day: Optional[str] = None) -> str:
+    """
+    Estimate when live buses on a route will reach a stop. Each vehicle is
+    matched to its nearest stop on the timetable route; the ETA is the
+    schedule offset from that position (or, when the next service hasn't
+    reached the vehicle's position yet, its scheduled arrival). Honest
+    estimation, not prediction: it assumes vehicles run to schedule from
+    their matched position. Route stop lists are direction-merged and
+    past-midnight times compare as published.
+
+    Parameters:
+      stop: Target stop (NaPTAN code or name).
+      operator_ref: Operator NOC code.
+      line_ref: Route number.
+      day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
+    """
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    naptans = store.resolve_stop(stop)
+    if not naptans:
+        return f'Could not resolve stop: "{stop}". Try search_stops().'
+    coords = store.route_stop_coords(operator_ref, line_ref)
+    if coords is None:
+        return (f"Route {operator_ref}|{line_ref} is not in the timetable index. "
+                f"Try get_route_stops().")
+    target = next((c for c in coords if c["naptan"] in naptans), None)
+    if target is None:
+        return f'"{stop}" is not served by route {operator_ref}|{line_ref}.'
+
+    filters = {"operatorRef": operator_ref, "lineRef": line_ref}
+    try:
+        content = await _fetch_siri_vm(filters)
+        vehicles = parse_siri_vm(content)
+    except Exception as e:
+        return _redact(f"Error fetching live data: {type(e).__name__}: {str(e)}")
+
+    if day is None:
+        day = datetime.now().strftime("%a").lower()
+    day = day.lower()[:3]
+    profiles = store.journeys_on_route(operator_ref, line_ref, day)
+    now_s = datetime.now().strftime("%H:%M:%S")
+
+    results = []
+    skipped = 0
+    for v in vehicles:
+        vlat, vlon = v["location"]["lat"], v["location"]["lon"]
+        if vlat is None or vlon is None:
+            continue
+        nearest, dist = None, None
+        for c in coords:
+            d = _haversine_km(vlat, vlon, c["lat"], c["lon"])
+            if d is not None and (dist is None or d < dist):
+                nearest, dist = c, d
+        if nearest is None or dist is None or dist > 2.0:
+            skipped += 1
+            continue
+        cands = ([p for p in profiles
+                  if v["direction"] in ("inbound", "outbound")
+                  and p["direction"] == v["direction"]] or profiles)
+        at_nearest = []
+        for p in cands:
+            for st in p["stops"]:
+                if st["naptan"] == nearest["naptan"]:
+                    t = st["arr"] or st["dep"]
+                    if t:
+                        at_nearest.append((t, p))
+                    break  # first occurrence of the nearest stop in the profile
+        running = [tp for tp in at_nearest if tp[0] <= now_s]
+        if running:
+            t_k, profile = max(running, key=lambda tp: tp[0])
+            basis = "schedule-offset"
+        elif at_nearest:
+            t_k, profile = min(at_nearest, key=lambda tp: tp[0])
+            basis = "scheduled"
+        else:
+            continue
+        t_target = None
+        for i, st in enumerate(profile["stops"]):
+            if st["naptan"] == target["naptan"] and i >= nearest["seq"]:
+                t_target = st["arr"] or st["dep"]
+                break
+        if not t_target or t_target < t_k:
+            results.append({"vehicle_id": v["vehicle_id"],
+                            "vehicle_at": nearest["name"],
+                            "distance_km": round(dist, 2), "eta": None,
+                            "note": "past the target stop or no onward scheduled time"})
+            continue
+        if basis == "scheduled":
+            minutes = _hms_minutes(t_target) - _hms_minutes(now_s)
+        else:
+            minutes = _hms_minutes(t_target) - _hms_minutes(t_k)
+        minutes = max(0, min(int(minutes), 180))
+        results.append({"vehicle_id": v["vehicle_id"],
+                        "vehicle_at": nearest["name"],
+                        "distance_km": round(dist, 2),
+                        "eta": {"minutes": minutes, "basis": basis,
+                                "journey_code": profile["code"],
+                                "scheduled_time": t_target}})
+    results.sort(key=lambda r: (r["eta"] or {}).get("minutes", 10 ** 6))
+    if not results:
+        note = f" ({skipped} vehicles unmatched to the route)" if skipped else ""
+        return (f"No live buses matched to route {operator_ref}|{line_ref} "
+                f"near the target stop{note}.")
+    # R29: remote-derived content on the way out, so it goes through _redact.
+    return _redact(json.dumps({"target_stop": target["name"], "vehicles": results},
+                              indent=2, ensure_ascii=False))
+
+
+@mcp.tool()
+async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
+                          destination_zone: Optional[str] = None) -> str:
+    """
+    Download a BODS fares dataset (NeTEx) and extract its published fare
+    prices as structured JSON, optionally filtered by tariff zone. Find
+    dataset ids with the fares catalogue passthrough tool
+    (Data_set_api_v1_fares_dataset).
+
+    Parameters:
+      dataset_id: Fares dataset id from the fares catalogue.
+      origin_zone: Optional start tariff zone ref to filter by.
+      destination_zone: Optional end tariff zone ref to filter by.
+    """
+    try:
+        meta = await get_http_client().get(
+            f"{BASE_URL}/api/v1/fares/dataset/{quote(dataset_id)}/?api_key={API_KEY}")
+        meta.raise_for_status()
+        download_url = meta.json().get("url")
+        if not download_url:
+            return (f"Dataset {dataset_id} exposes no download URL in its "
+                    f"catalogue metadata.")
+        dl = await get_http_client().get(f"{download_url}?api_key={API_KEY}")
+        dl.raise_for_status()
+        prices = parse_fare_prices(dl.content)
+    except Exception as e:
+        return _redact(f"Error: {type(e).__name__}: {str(e)}")
+
+    def keep(p):
+        if origin_zone and origin_zone not in p["start_zones"] + p["zones"]:
+            return False
+        if destination_zone and destination_zone not in p["end_zones"] + p["zones"]:
+            return False
+        return True
+
+    filtered = [p for p in prices if keep(p)]
+    if not filtered:
+        if not prices:
+            return (f"No fare prices could be extracted from dataset "
+                    f"{dataset_id}: the downloaded document contained no "
+                    f"recognised NeTEx price elements.")
+        return f"No fare prices match the given zones ({len(prices)} prices extracted)."
+    # R29: the downloaded NeTEx is remote-derived, so the success return is
+    # redacted like the error return above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------

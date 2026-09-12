@@ -83,3 +83,48 @@ def test_live_buses_ttl_cache_skips_second_request():
     finally:
         server.set_http_client(None)
         server._LIVE_CACHE = server.TTLCache(20.0)
+
+
+def _assert_url_has(get_url, param: str) -> None:
+    """Check a query parameter is present without the URL reaching the output.
+
+    The captured URL carries ?api_key=..., so with a real key in the environment
+    any rendering of it prints the credential into the test output. What gets
+    rendered is wider than an assert's operands: pytest also renders the
+    ARGUMENTS of every frame in the traceback. A helper that takes the URL as a
+    parameter therefore leaks it from the frame above the raise, even though the
+    exception text interpolates nothing but the parameter NAME -- measured in
+    situ with a fabricated key: `assert ..., url` renders 2 occurrences,
+    argument-taking helper 1, thunk 0.
+
+    So take a thunk: a lambda's repr carries no captured text, and this helper's
+    own message stays parameter-name-only. Call sites pass
+    `lambda: captured["url"]`. (Rulings R34 and R37.)
+    """
+    if param not in get_url():
+        raise AssertionError(f"request URL is missing {param}")
+
+
+def test_live_buses_passes_server_side_filters():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, content=b'<Siri xmlns="http://www.siri.org.uk/siri"/>')
+
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        out = asyncio.run(server.get_live_buses_on_route(
+            "OPX", "12", origin_ref="490A", destination_ref="490B",
+            vehicle_ref="V1", bounding_box="-0.2,51.4,0.0,51.6"))
+        _assert_url_has(lambda: captured["url"], "originRef=490A")
+        _assert_url_has(lambda: captured["url"], "destinationRef=490B")
+        _assert_url_has(lambda: captured["url"], "vehicleRef=V1")
+        _assert_url_has(lambda: captured["url"], "boundingBox=-0.2%2C51.4%2C0.0%2C51.6")
+        _assert_url_has(lambda: captured["url"], "operatorRef=OPX")
+        _assert_url_has(lambda: captured["url"], "lineRef=12")
+        assert "No live buses found." in out
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)

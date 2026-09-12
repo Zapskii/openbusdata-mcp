@@ -2,10 +2,35 @@ import asyncio
 import io
 import json
 import zipfile
+from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
 
+import httpx
 import pytest
 
 import openbusdata_mcp.server as server
+
+
+def _check(condition, message: str) -> None:
+    """Assert without rendering the operand.
+
+    pytest renders an `assert` statement's operands on failure, and several
+    operands in this file are request URLs carrying ?api_key=... or the bodies
+    of live tools. With a real key in the environment a failing assertion would
+    print the credential into the test output, where it ends up in transcripts
+    and CI logs. Call sites pass a thunk and a message that names what was
+    expected, never the value observed. (Ruling R34.)
+    """
+    if not condition():
+        raise AssertionError(message)
+
+
+def _assert_no_key(get_body, where: str) -> None:
+    """No encoding of DUMMY_KEY reaches the body `get_body` returns."""
+    forms = _leaked(get_body())
+    if forms:
+        raise AssertionError(
+            f"API key encoding reached {where} ({len(forms)} form(s))")
 
 
 # --- Test 1: spec-generated tools URL-encode path params
@@ -253,12 +278,16 @@ def test_1_path_params_url_encoded():
     assert tool_fn is not None, "generated dataset tool not found"
     result = asyncio.run(tool_fn(datasetID="12?q=1#frag"))
     assert result == "{}", f"unexpected tool result: {result}"
-    assert len(captured) == 1, captured
+    _check(lambda: len(captured) == 1,
+           f"expected exactly one request, got {len(captured)}")
     url = captured[0]
-    # '?', '#' and any stray '/' must be percent-encoded so the path survives
-    assert "/api/v1/dataset/12%3Fq%3D1%23frag" in url, url
-    assert "?" not in url.split("api_key")[0].split("/api/v1/dataset/", 1)[1], \
-        f"param broke out of the path: {url}"
+    # '?', '#' and any stray '/' must be percent-encoded so the path survives.
+    # Checked through _check rather than `assert`: these operands carry the key.
+    _check(lambda: "/api/v1/dataset/12%3Fq%3D1%23frag" in url,
+           "the dataset id must be percent-encoded into the path")
+    path_part = url.split("api_key")[0].split("/api/v1/dataset/", 1)[1]
+    _check(lambda: "?" not in path_part,
+           "the parameter must not break out of the path")
 
 
 # --- Test 2: HTTP error bodies returned to the MCP client are truncated
@@ -308,7 +337,7 @@ def test_5_plan_dedup_keeps_distinct_operators(writer):
                        [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
                         {"naptan": "010B", "arrival": "09:12:00", "departure": None}], 2)
     writer.commit()
-    result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0))
+    result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0, check_disruptions=False))
     plans = json.loads(result)
     assert len(plans) == 2, f"expected 2 distinct plans, got {len(plans)}"
     assert {p["legs"][0]["operator"] for p in plans} == {"OpOne", "OpTwo"}, \
@@ -343,8 +372,10 @@ def test_6_live_buses_params_url_encoded():
         result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
     finally:
         server.set_http_client(None)
-    assert "operatorRef=A%26B" in captured[0], captured[0]
-    assert "lineRef=1%202" in captured[0], captured[0]
+    _check(lambda: "operatorRef=A%26B" in captured[0],
+           "operatorRef must be percent-encoded")
+    _check(lambda: "lineRef=1%202" in captured[0],
+           "lineRef must be percent-encoded")
 
 
 # --- Test 7: _load_dataset reuses a caller-supplied client (no new one)
@@ -502,7 +533,314 @@ def test_22_zip_download_streams(writer):
     result = asyncio.run(run())
     assert result is not None, "dataset did not load"
     kinds = [c[0] for c in _StreamRecordingClient.calls]
-    assert "stream" in kinds, f"zip not streamed: {_StreamRecordingClient.calls}"
-    assert "get" in kinds, f"meta not fetched via get: {_StreamRecordingClient.calls}"
+    _check(lambda: "stream" in kinds, "the zip must be streamed, not fetched")
+    _check(lambda: "get" in kinds, "the catalogue metadata must be fetched via get")
     stream_urls = [c[1] for c in _StreamRecordingClient.calls if c[0] == "stream"]
-    assert stream_urls and "http://x/y.zip" in stream_urls[0], stream_urls
+    _check(lambda: bool(stream_urls) and "http://x/y.zip" in stream_urls[0],
+           "the zip must come from the catalogue's download URL")
+
+
+# --- Test 23: remote TransXChange XML is parsed entity-safe (defusedxml)
+# stdlib ElementTree *expands* an internal entity; defusedxml refuses the
+# document outright. The observable difference is whether the stop parses.
+ENTITY_DOC = (
+    '<?xml version="1.0"?>'
+    '<!DOCTYPE TransXChange [<!ENTITY nm "Alpha Street">]>'
+    '<TransXChange xmlns="http://www.transxchange.org.uk/">'
+    '<StopPoints><AnnotatedStopPointRef>'
+    '<StopPointRef>010A</StopPointRef><CommonName>&nm;</CommonName>'
+    '</AnnotatedStopPointRef></StopPoints></TransXChange>')
+
+
+def test_23_transxchange_entities_are_refused():
+    stops, routes, journeys = server.parse_transxchange(ENTITY_DOC, "OpX")
+    assert (stops, routes, journeys) == ([], [], []), (
+        "an entity-bearing document must be refused, not expanded")
+
+
+# --- Test 24/25: the API key never reaches output or the log stream (ruling R16)
+# httpx builds HTTPStatusError messages from the request URL, so an unredacted
+# failure publishes the credential into tool output and the session transcript.
+#
+# Ruling R24: the key MUST contain characters the two quote() variants treat
+# differently, or these tests cannot see the gap they exist to catch. The
+# package builds its api_key query parameter three different ways:
+#   fares tool  f"...?api_key={API_KEY}"                 raw, unquoted
+#   SIRI-SX     f"...?api_key={quote(API_KEY)}"          quote(), safe='/'
+#   SIRI-VM     urlencode(params, quote_via=quote)        quote(), safe=''
+# urlencode passes safe='' to quote, so a key containing '/' is encoded as
+# %2F on the SIRI-VM path but left as '/' on the SIRI-SX path. An
+# alphanumeric key encodes identically everywhere and hides that entirely.
+# DUMMY_KEY is a fabricated credential used nowhere; it is deliberately
+# awkward, not realistic.
+DUMMY_KEY = "DUMMY/KEY+abc=123"
+
+
+def _leaked(text: str) -> list:
+    """Every encoding of DUMMY_KEY that appears in `text` (empty list = clean).
+
+    Asserting only `DUMMY_KEY not in text` is VACUOUS for this key: the
+    SIRI-VM URL carries quote(DUMMY_KEY, safe=''), which does not contain
+    DUMMY_KEY as a substring, so that assertion passes even with no
+    redaction at all. Check every form the builders can produce.
+    """
+    forms = {DUMMY_KEY, quote(DUMMY_KEY), quote(DUMMY_KEY, safe="")}
+    return sorted(f for f in forms if f in text)
+
+
+def test_24_api_key_is_redacted_from_tool_output(monkeypatch, seeded_route):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(401, json={}))))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        out = asyncio.run(server.estimate_live_eta(
+            "Charlie Road", "OPX", "12", day="mon"))
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
+    _assert_no_key(lambda: out, "estimate_live_eta output")
+    _check(lambda: "401" in out, "the failure must still be reported readably")
+
+
+def test_25_api_key_is_redacted_from_siri_sx_log(monkeypatch, capsys):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(403, json={}))))
+    server._SX_CACHE = server.TTLCache(60.0)
+    try:
+        assert asyncio.run(server._fetch_sx("disruptions")) is None
+    finally:
+        server.set_http_client(None)
+        server._SX_CACHE = server.TTLCache(60.0)
+    err = capsys.readouterr().err
+    _assert_no_key(lambda: err, "the siri-sx log stream")
+    _check(lambda: "403" in err, "the failure must still be logged readably")
+
+
+# --- Test 26: the fares tool's error return is redacted too (ruling R22)
+# R22 found this site only after Task 6 added the fetch path, which is exactly the
+# staleness the sweep in this task's brief exists to prevent. It has no module cache
+# to reset -- get_fare_prices caches nothing -- so nothing is reset here.
+def test_26_api_key_is_redacted_from_fares_tool(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(401, json={}))))
+    try:
+        out = asyncio.run(server.get_fare_prices("DS1"))
+    finally:
+        server.set_http_client(None)
+    _assert_no_key(lambda: out, "get_fare_prices output")
+    _check(lambda: "401" in out, "the failure must still be reported readably")
+
+
+# --- Test 27: the passthrough handler's SUCCESS returns are redacted too (P31)
+# Its sibling error returns (the HTTPStatusError branch and the generic one)
+# already pass through _redact; P31's point is the invariant that EVERY return
+# from that handler does, so no future reader has to re-derive reachability on
+# this surface. The leak it prevents needs a remote endpoint to echo the
+# request URL -- key included -- into its own 200 body, which is what this test
+# puts in the handler; it is not asserted that any real endpoint does so.
+def _echo_url_client(response_for):
+    def handler(request):
+        return response_for(str(request.url))
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_27_api_key_is_redacted_from_passthrough_success(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    tool_fn = _dataset_tool()
+    assert tool_fn is not None, "generated dataset tool not found"
+
+    # JSON branch: the echoed URL arrives in a JSON body -> resp.json() path.
+    server.set_http_client(_echo_url_client(
+        lambda url: httpx.Response(200, json={"echo": url})))
+    try:
+        out = asyncio.run(tool_fn(datasetID="12"))
+    finally:
+        server.set_http_client(None)
+    _assert_no_key(lambda: out, "the passthrough success output")
+    _check(lambda: "echo" in out, "the successful response must still be returned")
+
+    # Non-JSON branch: resp.json() raises, so the handler returns resp.text.
+    server.set_http_client(_echo_url_client(
+        lambda url: httpx.Response(200, content=url.encode())))
+    try:
+        out = asyncio.run(tool_fn(datasetID="12"))
+    finally:
+        server.set_http_client(None)
+    _assert_no_key(lambda: out, "the passthrough success output")
+    _check(lambda: "api/v1/dataset" in out,
+           "the successful response must still be returned")
+
+
+# --- Test 28: every success path carrying remote-derived content is redacted
+# (rulings R29/R32). P31 closed one instance of this class; this pins the
+# property instead of the lines -- five tools, five mocked remote documents,
+# each echoing the request URL (key included) into a field its parser hands
+# back to the caller.
+#
+# R32 added the two SIRI-SX tools, which the R29 sweep missed. That sweep
+# grepped for existing _redact call sites, and that grep is structurally blind
+# to a function that calls _redact nowhere. The list below now comes from the
+# enumeration of remote-returning functions recorded in the wave report, not
+# from a grep.
+#
+# The leak check takes a THUNK, not the body, on purpose: pytest renders a
+# failing frame's arguments, so passing the body itself (or asserting on
+# _leaked(body)) publishes the very credential this test exists to keep out of
+# output -- measured, not assumed. For the same reason every check below is an
+# inline `raise`, never an `assert`: pytest renders an assert's operands, and on
+# the unfixed code this body carries the key. The messages report how many
+# encodings leaked, never which.
+def _assert_success_path_is_clean(get_body, marker: str, tool: str) -> None:
+    body = get_body()  # a local, not an argument: locals are not rendered
+    if marker not in body:
+        raise AssertionError(f"{tool} did not return the parsed remote content")
+    _assert_no_key(lambda: body, f"{tool} output")
+    if "api_key=***" not in body:
+        raise AssertionError(f"{tool} output kept no redacted URL to show")
+
+
+def _vm_echo_client():
+    """Mock SIRI-VM feed whose VehicleRef is the request URL it was asked for.
+
+    The URL's '&' separators must be XML-escaped or the document is malformed;
+    the parser hands the unescaped text straight into the vehicle dict."""
+    def handler(request):
+        ref = xml_escape(str(request.url))
+        return httpx.Response(200, content=(
+            '<?xml version="1.0"?>'
+            '<Siri xmlns="http://www.siri.org.uk/siri"><VehicleActivity>'
+            '<MonitoredVehicleJourney>'
+            f'<VehicleRef>{ref}</VehicleRef>'
+            '<DirectionRef>outbound</DirectionRef>'
+            # near seeded_route's 010B (51.51, -0.11), so estimate_live_eta
+            # matches this vehicle instead of taking the no-match branch
+            '<VehicleLocation><Latitude>51.511</Latitude>'
+            '<Longitude>-0.111</Longitude></VehicleLocation>'
+            '</MonitoredVehicleJourney></VehicleActivity></Siri>').encode())
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _fares_echo_handler(request):
+    """Catalogue metadata, then a NeTEx document whose zone ref echoes the
+    download request URL (the fares download URL is the one built with the
+    raw, unquoted key)."""
+    url = str(request.url)
+    if "/api/v1/fares/dataset/" in url:
+        return httpx.Response(200, json={"url": "https://example.test/dl"})
+    ref = xml_escape(url)
+    return httpx.Response(200, content=(
+        '<?xml version="1.0"?>'
+        '<PublicationDelivery xmlns="http://www.netex.org.uk/netex">'
+        '<dataObjects><CompositeFrame><FaresFrame>'
+        '<FareFrame version="1.0" id="FF">'
+        '<fareStructureElements>'
+        '<FareStructureElement version="1.0" id="FSE">'
+        '<distanceMatrixElements>'
+        '<DistanceMatrixElement version="1.0" id="Z1+Z2">'
+        f'<StartTariffZoneRef version="1.0" ref="{ref}"/>'
+        '<GeographicalIntervalPrice version="1.0" id="p">'
+        '<Amount>1.20</Amount>'
+        '</GeographicalIntervalPrice>'
+        '</DistanceMatrixElement>'
+        '</distanceMatrixElements>'
+        '</FareStructureElement>'
+        '</fareStructureElements>'
+        '</FareFrame>'
+        '</FaresFrame></CompositeFrame></dataObjects>'
+        '</PublicationDelivery>').encode())
+
+
+# The SIRI-SX phases carry a sentinel next to the echoed URL rather than a
+# field-name marker. A field name is not enough there: json.dumps renders
+# {"summary": null} and {"reason": null}, so a phase whose message parsed but
+# carried no text would still match "summary"/"reason" and pass the leak check
+# for the wrong reason.
+ECHO_SENTINEL = "ECHO-SENTINEL"
+
+_SX_KIND = {"get_disruptions": "disruptions",
+            "get_cancellations": "cancellations"}
+
+# One vacuity marker per phase: the parsed-content tell that the remote
+# document reached the caller at all.
+_MARKER = {"get_live_buses_on_route": "vehicle_id",
+           "estimate_live_eta": '"vehicles"',
+           "get_fare_prices": '"start_zones"',
+           "get_disruptions": ECHO_SENTINEL,
+           "get_cancellations": ECHO_SENTINEL}
+
+
+def _sx_echo_client(kind):
+    """Mock SIRI-SX feed echoing the request URL into the field its parser
+    carries through. Not the same field for both: parse_siri_sx reads a
+    message's <Summary> (falling back to <Description>), while
+    parse_cancellations reads a cancelled-vehicle entry's <CancellationReason>
+    (falling back to <Reason>). Each document is shaped so its own parser
+    produces an entry -- the cancellations traversal only fires on a
+    CANCELLATION_TAGS element."""
+    def handler(request):
+        url = xml_escape(str(request.url))
+        if kind == "disruptions":
+            doc = ('<?xml version="1.0"?>'
+                   '<Siri xmlns="http://www.siri.org.uk/siri"><InfoMessage>'
+                   f'<Summary>{ECHO_SENTINEL} {url}</Summary>'
+                   '<OperatorRef>OPX</OperatorRef>'
+                   '</InfoMessage></Siri>')
+        else:
+            doc = ('<?xml version="1.0"?>'
+                   '<Siri xmlns="http://www.siri.org.uk/siri">'
+                   '<EstimatedVehicleJourneyCancellations>'
+                   '<OperatorRef>OPX</OperatorRef><LineRef>12</LineRef>'
+                   f'<CancellationReason>{ECHO_SENTINEL} {url}'
+                   '</CancellationReason>'
+                   '</EstimatedVehicleJourneyCancellations></Siri>')
+        return httpx.Response(200, content=doc.encode())
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("tool", ["get_live_buses_on_route", "estimate_live_eta",
+                                  "get_fare_prices", "get_disruptions",
+                                  "get_cancellations"])
+def test_28_remote_echo_is_redacted_from_every_success_path(
+        tool, monkeypatch, seeded_route):
+    """A mocked remote document echoes the request URL (key included) into a
+    field each tool's parser carries to the caller; the credential must not
+    surface. Parametrized so a regression names the tool that leaked."""
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+
+    if tool in _SX_KIND:
+        # _fetch_sx caches the parsed feed per kind for 60s, so an entry left
+        # by another test would have this phase asserting on that test's
+        # document instead of the echo.
+        server.set_http_client(_sx_echo_client(_SX_KIND[tool]))
+        server._SX_CACHE = server.TTLCache(60.0)
+        try:
+            body = asyncio.run(getattr(server, tool)())
+        finally:
+            server.set_http_client(None)
+            server._SX_CACHE = server.TTLCache(60.0)
+    elif tool == "get_fare_prices":
+        server.set_http_client(httpx.AsyncClient(
+            transport=httpx.MockTransport(_fares_echo_handler)))
+        try:
+            body = asyncio.run(server.get_fare_prices("DS1"))
+        finally:
+            server.set_http_client(None)
+    else:
+        server.set_http_client(_vm_echo_client())
+        server._LIVE_CACHE = server.TTLCache(20.0)
+        try:
+            if tool == "get_live_buses_on_route":
+                body = asyncio.run(server.get_live_buses_on_route("OPX", "12"))
+            else:
+                body = asyncio.run(server.estimate_live_eta(
+                    "Charlie Road", "OPX", "12", day="mon"))
+        finally:
+            server.set_http_client(None)
+            server._LIVE_CACHE = server.TTLCache(20.0)
+
+    _assert_success_path_is_clean(lambda: body, _MARKER[tool], tool)
+
+

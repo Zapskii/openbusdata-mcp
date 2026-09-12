@@ -394,6 +394,75 @@ class TimetableStore:
                 "total_changes": 1})
         return plans
 
+    def next_departures(self, naptans: set, day: str, from_time: str,
+                        limit: int = 20) -> list:
+        """Next scheduled departures from any of the given stops on `day`,
+        at/after from_time ('HH:MM:SS'), ordered by time. Destination is the
+        name of each journey's final stop, falling back to 'Unknown' when that
+        stop has no `stops` row OR a row with a blank name (R14's COALESCE
+        plus P18's NULLIF). Rides jst_n (naptan, dep) for the candidate scan
+        and jst_j (journey_id) for the correlated MAX(seq)."""
+        if not naptans:
+            return []
+        marks = ",".join("?" * len(naptans))
+        rows = self.conn.execute(f"""
+            SELECT j.op, j.route, j.direction, j.code,
+                   MIN(jst.dep) AS dep,
+                   COALESCE(NULLIF(s.name, ''), 'Unknown') AS dest
+            FROM journey_stop_times jst
+            JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
+            JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
+                 AND lastj.seq = (SELECT MAX(seq) FROM journey_stop_times
+                                  WHERE journey_id = jst.journey_id)
+            LEFT JOIN stops s ON s.naptan = lastj.naptan
+            WHERE jst.naptan IN ({marks}) AND jst.dep IS NOT NULL AND jst.dep >= ?
+            GROUP BY jst.journey_id
+            ORDER BY dep
+            LIMIT ?
+        """, [DAY_BITS.get(day, 0)] + list(naptans) + [from_time, limit]).fetchall()
+        return [{"operator": r[0], "route": r[1], "direction": r[2],
+                 "journey_code": r[3], "depart": r[4], "destination": r[5]}
+                for r in rows]
+
+    def route_stop_coords(self, operator: str, route: str) -> Optional[list]:
+        """The route's ordered stop list with names and coordinates (the
+        routes.stops JSON joined to stops). None when the route is unknown.
+        The list is direction-merged (upsert_route keeps the longest sequence)."""
+        row = self.conn.execute(
+            "SELECT stops FROM routes WHERE key=?", (f"{operator}|{route}",)).fetchone()
+        if row is None:
+            return None
+        naptans = json.loads(row[0])
+        if not naptans:
+            return []
+        marks = ",".join("?" * len(naptans))
+        info = {r[0]: (r[1], r[2], r[3]) for r in self.conn.execute(
+            f"SELECT naptan, name, lat, lon FROM stops WHERE naptan IN ({marks})",
+            list(naptans)).fetchall()}
+        return [{"seq": i, "naptan": n,
+                 "name": info.get(n, ("Unknown", None, None))[0],
+                 "lat": info.get(n, ("Unknown", None, None))[1],
+                 "lon": info.get(n, ("Unknown", None, None))[2]}
+                for i, n in enumerate(naptans)]
+
+    def journeys_on_route(self, operator: str, route: str, day: str,
+                          limit: int = 300) -> list:
+        """Today's journeys for a route with their full stop-time profiles
+        (dep = COALESCE(departure, arrival), arr = raw arrival)."""
+        rows = self.conn.execute(
+            "SELECT id, direction, code FROM journeys "
+            "WHERE op=? AND route=? AND days_mask & ? != 0 LIMIT ?",
+            (operator, route, DAY_BITS.get(day, 0), limit)).fetchall()
+        profiles = []
+        for jid, direction, code in rows:
+            stops = self.conn.execute(
+                "SELECT naptan, dep, arr FROM journey_stop_times "
+                "WHERE journey_id=? ORDER BY seq", (jid,)).fetchall()
+            profiles.append({"journey_id": jid, "direction": direction, "code": code,
+                             "stops": [{"naptan": n, "dep": d, "arr": a}
+                                       for n, d, a in stops]})
+        return profiles
+
     # -- provenance / maintenance (used by delta loader) --------------------
     def dataset_meta(self, ds_id: int) -> Optional[dict]:
         row = self.conn.execute(

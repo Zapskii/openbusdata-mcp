@@ -8,6 +8,7 @@ timetable parsing, stop search, route discovery, journey planning and real-time 
 ## Features
 
 - **Live API tools** — query timetables, fares, disruptions, cancellations and real-time bus locations
+- **Coverage tools** — departures board, live ETA at a stop, filtered live buses, disruption-aware journey planning, and fares price extraction
 - **Stop search** — fuzzy text search across every bus stop in the UK
 - **Route finder** — discover all routes serving a pair of stops
 - **Journey planner** — "get to X by Y o'clock" with support for direct and chained multi-leg journeys

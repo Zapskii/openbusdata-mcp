@@ -154,3 +154,58 @@ def test_candidate_journeys_sql_parity(writer, store):
     assert [x.code for x in tue] == ["J6b"]
     # Arrival target filters: nothing arrives by 09:19.
     assert list(store._candidate_journeys({"A1"}, {"B1"}, "mon", "09:19:00")) == []
+
+
+def test_next_departures_orders_and_names_destination(seeded_route):
+    board = seeded_route.next_departures({"010A"}, "mon", "08:00:00", 10)
+    assert [d["depart"] for d in board] == ["09:00:00", "09:30:00"]
+    assert board[0] == {"operator": "OPX", "route": "12", "direction": "outbound",
+                        "journey_code": "J1", "depart": "09:00:00",
+                        "destination": "Charlie Road"}
+
+
+def test_next_departures_respects_day_and_limit(seeded_route):
+    assert seeded_route.next_departures({"010A"}, "tue", "08:00:00", 10) == []
+    only_one = seeded_route.next_departures({"010A"}, "mon", "08:00:00", 1)
+    assert [d["depart"] for d in only_one] == ["09:00:00"]
+
+
+def test_next_departures_unknown_day_and_empty_set(seeded_route):
+    assert seeded_route.next_departures({"010A"}, "bogus", "08:00:00", 10) == []
+    assert seeded_route.next_departures(set(), "mon", "08:00:00", 10) == []
+
+
+def test_next_departures_keeps_departure_when_terminus_has_no_stop_row(writer, store):
+    """A journey whose final stop has no `stops` row must still be reported:
+    the origin resolves, so dropping the row would silently under-report."""
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A", "010Z"], 1)
+    writer.add_journey("OPX", "12", "outbound", "J9", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010Z", "arrival": "09:20:00", "departure": None}], 1)
+    writer.commit()
+    board = store.next_departures({"010A"}, "mon", "08:00:00", 10)
+    assert [d["depart"] for d in board] == ["09:00:00"]
+    assert board[0]["destination"] == "Unknown"
+
+
+def test_route_stop_coords_ordered_with_names(seeded_route):
+    coords = seeded_route.route_stop_coords("OPX", "12")
+    assert [c["naptan"] for c in coords] == ["010A", "010B", "010C"]
+    assert coords[0] == {"seq": 0, "naptan": "010A", "name": "Alpha Street",
+                         "lat": 51.5, "lon": -0.1}
+
+
+def test_route_stop_coords_unknown_route_is_none(seeded_route):
+    assert seeded_route.route_stop_coords("OPX", "999") is None
+
+
+def test_journeys_on_route_full_profiles(seeded_route):
+    profiles = seeded_route.journeys_on_route("OPX", "12", "mon")
+    assert len(profiles) == 2
+    j1 = next(p for p in profiles if p["code"] == "J1")
+    assert j1["direction"] == "outbound"
+    assert j1["stops"] == [
+        {"naptan": "010A", "dep": "09:00:00", "arr": None},
+        {"naptan": "010B", "dep": "09:11:00", "arr": "09:10:00"},
+        {"naptan": "010C", "dep": "09:20:00", "arr": "09:20:00"}]
