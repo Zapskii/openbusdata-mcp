@@ -8,7 +8,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 DB_PATH = Path.home() / ".cache" / "openbusdata" / "index.db"
 
@@ -45,6 +45,21 @@ DAY_BITS = {"mon": 1, "tue": 2, "wed": 4, "thu": 8,
 
 def _days_mask(days: set) -> int:
     return sum(DAY_BITS[d] for d in days if d in DAY_BITS)
+
+
+class Candidate(NamedTuple):
+    """One A-boards-before-B journey resolved entirely in SQL."""
+    journey_id: int
+    operator: str
+    route: str
+    direction: str
+    code: str
+    naptan_a: str
+    naptan_b: str
+    depart_a: Optional[str]
+    arrive_b: Optional[str]
+    seq_a: int
+    seq_b: int
 
 
 def _parse_iso(text: Optional[str]) -> Optional[datetime]:
@@ -267,31 +282,41 @@ class TimetableStore:
             "WHERE naptan=? AND dep>=? ORDER BY journey_id", (naptan, after)).fetchall()
         return [r[0] for r in rows]
 
-    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
-        """Yield (journey, idx_a, idx_b) for journeys boarding in A, alighting in B,
-        running on day, arriving at B by target_s.
+    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str,
+                            target_s: str):
+        """Yield Candidates for journeys boarding in A, alighting in B, running
+        on day, arriving at B by target_s — resolved in one indexed SQL query.
 
-        Stop matching uses FIRST occurrence of a naptan in the stop list
-        (next(...)). This is deliberate: plan_direct historically matched the
-        first occurrence, and the shared helper unifies both tools on it. It
-        only differs from last-occurrence for loop routes whose stop list
-        repeats a naptan from A or B — an accepted edge case.
-
-        Candidates are narrowed to journeys touching BOTH stop sets before any
-        JSON is fetched: journeys touching B but not A (or vice versa) can never
-        yield a plan, and fetching them dominates cost when B resolves to a
-        busy/fuzzy set (measured 198ms -> 71ms on a 6,720-journey driving set)."""
-        both = set(self._journeys_touching(naptans_a)) & set(self._journeys_touching(naptans_b))
-        for jid, j in self._fetch_journeys(sorted(both)).items():
-            if day not in j["days"]:
-                continue
-            idx_a = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_a), None)
-            idx_b = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_b), None)
-            if idx_a is None or idx_b is None or idx_a >= idx_b:
-                continue
-            arr_b = j["stops"][idx_b].get("arrival")
-            if arr_b and arr_b[:8] <= target_s:
-                yield j, idx_a, idx_b
+        First-occurrence semantics preserved: MIN(seq) per journey reproduces
+        the previous Python next() scan. First-occurrence of a naptan in a
+        loop route's stop list differs from last-occurrence only for loop
+        routes repeating a naptan from A or B — an accepted edge case.
+        Variable budget: <= 400 + 400 + 2 = 802 < 999 (see MAX_RESOLVE)."""
+        if not naptans_a or not naptans_b:
+            return
+        a_marks = ",".join("?" * len(naptans_a))
+        b_marks = ",".join("?" * len(naptans_b))
+        rows = self.conn.execute(f"""
+            SELECT j.id, j.op, j.route, j.direction, j.code,
+                   sa.naptan, sb.naptan, sa.dep, sb.arr, aa.seq, bb.seq
+            FROM journeys j
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({a_marks}) GROUP BY journey_id) aa
+              ON aa.journey_id = j.id
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({b_marks}) GROUP BY journey_id) bb
+              ON bb.journey_id = j.id
+            JOIN journey_stop_times sa ON sa.journey_id = j.id AND sa.seq = aa.seq
+            JOIN journey_stop_times sb ON sb.journey_id = j.id AND sb.seq = bb.seq
+            WHERE j.days_mask & ? != 0
+              AND aa.seq < bb.seq
+              AND sb.arr IS NOT NULL AND sb.arr <= ?
+        """, list(naptans_a) + list(naptans_b)
+             + [DAY_BITS[day], target_s]).fetchall()
+        for (jid, op, route, direction, code, na, nb, dep_a, arr_b,
+             seq_a, seq_b) in rows:
+            yield Candidate(jid, op, route, direction, code, na, nb,
+                            dep_a, arr_b, seq_a, seq_b)
 
     def _data_key(self) -> tuple:
         """Dataset state plan results depend on; changes after any load."""
@@ -309,18 +334,16 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _find_buses_cached(self, key: tuple, a: frozenset, b: frozenset,
                            day: str, target_s: str) -> list[dict]:
-        a, b = set(a), set(b)
-        out = []
-        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
-            names = self.stop_names_bulk(
-                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-            out.append({
-                "operator": j["operator"], "route": j["route"],
-                "direction": j["direction"], "journey_code": j["journey_code"],
-                "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                "depart": j["stops"][idx_a].get("departure"),
-                "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                "arrive": j["stops"][idx_b].get("arrival")})
+        cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
+        names = self.stop_names_bulk(
+            [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
+        out = [{
+            "operator": c.operator, "route": c.route,
+            "direction": c.direction, "journey_code": c.code,
+            "board_at": names.get(c.naptan_a, "Unknown"),
+            "depart": c.depart_a,
+            "alight_at": names.get(c.naptan_b, "Unknown"),
+            "arrive": c.arrive_b} for c in cands]
         out.sort(key=lambda x: x["arrive"] or "")
         return out[:20]
 
@@ -332,21 +355,18 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _plan_direct_cached(self, key: tuple, a: frozenset, b: frozenset,
                             day: str, target_s: str) -> list[dict]:
-        a, b = set(a), set(b)
-        plans = []
-        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
-            names = self.stop_names_bulk(
-                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-            plans.append({
-                "type": "direct",
-                "legs": [{
-                    "operator": j["operator"], "route": j["route"],
-                    "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                    "depart": j["stops"][idx_a].get("departure"),
-                    "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                    "arrive": j["stops"][idx_b].get("arrival")}],
-                "total_changes": 0})
-        return plans
+        cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
+        names = self.stop_names_bulk(
+            [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
+        return [{
+            "type": "direct",
+            "legs": [{
+                "operator": c.operator, "route": c.route,
+                "board": names.get(c.naptan_a, "Unknown"),
+                "depart": c.depart_a,
+                "alight": names.get(c.naptan_b, "Unknown"),
+                "arrive": c.arrive_b}],
+            "total_changes": 0} for c in cands]
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:

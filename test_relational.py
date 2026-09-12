@@ -83,3 +83,29 @@ def test_journey_stop_times_v2_backfill(writer):
         "WHERE journey_id=1 ORDER BY seq").fetchall()
     assert rows == [(0, "010A", "08:00:00", None),
                     (1, "010B", "08:10:00", "08:10:00")], rows
+
+
+def test_candidate_journeys_sql_parity(writer, store):
+    import json as _json
+    writer.add_journey("Op", "6", "outbound", "J6", {"mon"}, [
+        {"naptan": "A1", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "A2", "arrival": "09:05:00", "departure": None},
+        {"naptan": "B1", "arrival": "09:20:00", "departure": None}], 5)
+    writer.add_journey("Op", "6b", "outbound", "J6b", {"tue"}, [
+        {"naptan": "A1", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "B1", "arrival": "09:20:00", "departure": None}], 5)
+    writer.commit()
+    cands = list(store._candidate_journeys({"A1"}, {"B1"}, "mon", "09:30:00"))
+    assert len(cands) == 1
+    c = cands[0]
+    assert (c.journey_id, c.code, c.naptan_a, c.naptan_b) == (1, "J6", "A1", "B1")
+    assert c.depart_a == "09:00:00" and c.arrive_b == "09:20:00"
+    assert (c.seq_a, c.seq_b) == (0, 2)
+    # First-occurrence semantics: A2 appears before B1; boarding at A2 works.
+    c2 = list(store._candidate_journeys({"A2"}, {"B1"}, "mon", "09:30:00"))
+    assert len(c2) == 1 and c2[0].seq_a == 1 and c2[0].seq_b == 2
+    # Day mask filters in SQL: the tue journey only on tue.
+    tue = list(store._candidate_journeys({"A1"}, {"B1"}, "tue", "09:30:00"))
+    assert [x.code for x in tue] == ["J6b"]
+    # Arrival target filters: nothing arrives by 09:19.
+    assert list(store._candidate_journeys({"A1"}, {"B1"}, "mon", "09:19:00")) == []

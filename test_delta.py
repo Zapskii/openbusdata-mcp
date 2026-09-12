@@ -227,7 +227,8 @@ def test_15_candidate_journeys_shared_helper(writer, store):
                         {"naptan": "15B", "arrival": "09:10:00", "departure": None}], 99)
     writer.commit()
     cands = list(store._candidate_journeys({"15A"}, {"15B"}, "mon", "09:30:00"))
-    assert len(cands) == 1 and cands[0][0]["journey_code"] == "J15"
+    assert len(cands) == 1 and cands[0].code == "J15"
+    assert (cands[0].naptan_a, cands[0].naptan_b) == ("15A", "15B")
     assert list(store._candidate_journeys({"15A"}, {"15B"}, "tue", "09:30:00")) == []
 
 

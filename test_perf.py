@@ -91,22 +91,25 @@ def test_28_journeys_departing_uses_index_and_matches_old_semantics(writer, stor
 
 
 def _old_candidates(store, na, nb, day, target_s):
-    """Pre-change implementation — frozen reference for parity."""
-    for jid, j in store._fetch_journeys(store._journeys_touching(nb)).items():
-        if day not in j["days"]:
+    """Pre-change implementation — frozen reference reading journeys.json."""
+    import json as _json
+    rows = store.conn.execute("SELECT id, days, json FROM journeys").fetchall()
+    for jid, days, raw in rows:
+        if day not in _json.loads(days):
             continue
-        ia = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in na), None)
-        ib = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in nb), None)
+        stops = _json.loads(raw)["stops"]
+        ia = next((i for i, s in enumerate(stops) if s["naptan"] in na), None)
+        ib = next((i for i, s in enumerate(stops) if s["naptan"] in nb), None)
         if ia is None or ib is None or ia >= ib:
             continue
-        ar = j["stops"][ib].get("arrival")
+        ar = stops[ib].get("arrival")
         if ar and ar[:8] <= target_s:
-            yield j, ia, ib
+            yield jid, ia, ib
 
 
 def test_29_candidate_journeys_intersection_parity(writer, store):
-    # _journeys_touching returns UNORDERED ids (its query has no ORDER BY), so
-    # both sides are compared sorted: (id, idx_a, idx_b) triples are orderable.
+    # _candidate_journeys rows are unordered SQL output; both sides compared
+    # sorted on (journey_id, seq_a, seq_b) triples.
     for i in range(2):
         seq = ["CTR0", f"R{i}_hub", f"R{i}_1", f"R{i}_2"]
         for dep0 in ("08:00:00", "09:00:00"):
@@ -115,36 +118,10 @@ def test_29_candidate_journeys_intersection_parity(writer, store):
                                f"J{i}-{dep0}", {"mon"}, stops, 1)
     writer.commit()
     for na, nb in [({"CTR0"}, {"R0_2"}), ({"CTR0", "R1_hub"}, {"R0_1", "R1_2"})]:
-        got = [(j["id"], ia, ib)
-               for j, ia, ib in store._candidate_journeys(na, nb, "mon", "09:30:00")]
-        ref = [(j["id"], ia, ib)
-               for j, ia, ib in _old_candidates(store, na, nb, "mon", "09:30:00")]
+        got = [(c.journey_id, c.seq_a, c.seq_b)
+               for c in store._candidate_journeys(na, nb, "mon", "09:30:00")]
+        ref = list(_old_candidates(store, na, nb, "mon", "09:30:00"))
         assert sorted(got) == sorted(ref), (na, nb, got, ref)
-
-
-def test_30_candidate_journeys_fetches_only_intersection(writer, store):
-    for i in range(2):
-        seq = ["CTR0", f"R{i}_hub", f"R{i}_1", f"R{i}_2"]
-        for dep0 in ("08:00:00", "09:00:00", "10:00:00"):
-            stops = [{"naptan": s, "arrival": dep0, "departure": dep0} for s in seq]
-            writer.add_journey(f"Op{i}", str(i), "outbound",
-                               f"J{i}-{dep0}", {"mon"}, stops, 1)
-    writer.commit()
-    na, nb = {"R0_hub"}, {"CTR0", "R0_hub", "R0_1", "R0_2", "R1_hub", "R1_1", "R1_2"}
-    touch_a = set(store._journeys_touching(na))
-    touch_b = set(store._journeys_touching(nb))
-    assert 0 < len(touch_a) < len(touch_b), "test needs a small-A/large-B scenario"
-    orig = store._fetch_journeys
-    seen = {}
-    def spy(jids):
-        seen["ids"] = list(jids)
-        return orig(jids)
-    store._fetch_journeys = spy
-    try:
-        list(store._candidate_journeys(na, nb, "mon", "23:59:59"))
-    finally:
-        store._fetch_journeys = orig
-    assert set(seen["ids"]) == touch_a, "fetched more than the A-intersection"
 
 
 def test_31_routes_fts_backfill_and_trigger_sync():
