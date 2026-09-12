@@ -292,3 +292,70 @@ def test_plan_journey_annotation_does_not_truncate(seeded_route, writer, monkeyp
     # found it (this also keeps in-place annotated dicts out of the cache).
     server.store._plan_direct_cached.cache_clear()
     server.store._plan_one_change_cached.cache_clear()
+
+
+def test_plan_journey_opt_out_has_no_alerts_without_any_fetch(seeded_route):
+    # Control for the cache-contamination test below: with no SX fetch ever
+    # made, the opt-out path produces no alerts at all — so any alert it does
+    # return after an annotated call must have reached it through the plan
+    # cache rather than through the parser or the fixture.
+    off = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", "10:00", day="mon",
+        check_disruptions=False)))
+    assert off and all("disruption_alerts" not in p for p in off)
+
+
+def test_plan_journey_opt_out_uncontaminated_by_cache(seeded_route):
+    # plan_direct/plan_one_change hand out the lru_cache's own plan dicts, so
+    # annotating them in place would make a later check_disruptions=False call
+    # (same stops/day/time -> same cache key) return alerts it never asked for.
+    _install(lambda request: httpx.Response(200, content=SIRI_SX))
+    try:
+        # Negative control, same store and same cache key: this call runs
+        # before anything has been annotated.
+        control = json.loads(asyncio.run(server.plan_journey(
+            "Alpha Street", "Charlie Road", "10:00", day="mon",
+            check_disruptions=False)))
+        assert control and all("disruption_alerts" not in p for p in control)
+
+        on = json.loads(asyncio.run(server.plan_journey(
+            "Alpha Street", "Charlie Road", "10:00", day="mon")))
+        assert on and all(p["disruption_alerts"] == ["route 12 has an active disruption"]
+                          for p in on)
+
+        off = json.loads(asyncio.run(server.plan_journey(
+            "Alpha Street", "Charlie Road", "10:00", day="mon",
+            check_disruptions=False)))
+    finally:
+        _reset()
+    contaminated = [p for p in off if "disruption_alerts" in p]
+    assert not contaminated, (
+        f"CACHE CONTAMINATION: {len(contaminated)} of {len(off)} plans returned "
+        "alerts to a caller that asked NOT to check disruptions")
+
+    # The three calls above hit the planner cache twice; test_perf.py::test_36
+    # asserts the process-global cache_info().hits counter without clearing it,
+    # so empty the plan caches here (same hygiene as the truncation test above).
+    server.store._plan_direct_cached.cache_clear()
+    server.store._plan_one_change_cached.cache_clear()
+
+
+def test_plan_journey_survives_message_missing_refs(seeded_route, monkeypatch):
+    async def feed_without_refs(kind):
+        return [{"recorded_at": "2026-09-12T10:00:00Z", "summary": "no refs"}]
+
+    monkeypatch.setattr(server, "_fetch_sx", feed_without_refs)
+    plans = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
+    assert plans and all("disruption_alerts" not in p for p in plans)
+
+
+def test_plan_journey_survives_message_null_refs(seeded_route, monkeypatch):
+    async def feed_with_null_refs(kind):
+        return [{"recorded_at": "2026-09-12T10:00:00Z", "lines": None,
+                 "operators": None, "summary": "null refs"}]
+
+    monkeypatch.setattr(server, "_fetch_sx", feed_with_null_refs)
+    plans = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
+    assert plans and all("disruption_alerts" not in p for p in plans)

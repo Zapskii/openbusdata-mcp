@@ -1106,7 +1106,11 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
                     for leg in plan["legs"])
         if key not in seen:
             seen.add(key)
-            deduped.append(plan)
+            # Copy: plan_direct/plan_one_change hand back the planner's own
+            # lru-cached dicts, and _annotate_disruptions mutates what it is
+            # given — annotating the originals would leak alerts into later
+            # check_disruptions=False calls on the same cache key.
+            deduped.append(dict(plan))
 
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
     if check_disruptions:
