@@ -19,6 +19,8 @@ is a one-place fix. All parsing goes through defusedxml (safe against
 entity-expansion / billion-laughs in remote documents).
 """
 
+from typing import Optional
+
 from defusedxml import ElementTree as SafeET
 
 SIRI_NS = "http://www.siri.org.uk/siri"
@@ -52,6 +54,22 @@ def _desc_text(el, tag: str, default=None):
     return default
 
 
+def _coord(el) -> Optional[float]:
+    """A coordinate element's numeric value, or None when it is absent,
+    empty, whitespace-only or not a number.
+
+    One vehicle with a malformed <Latitude> must not fail the whole feed: the
+    tool renders a None coordinate as "N/A" and every other vehicle still
+    arrives. (The pre-release tool passed the raw text through and rendered
+    a missing coordinate the same way.)"""
+    if el is None or not el.text:
+        return None
+    try:
+        return float(el.text)
+    except ValueError:
+        return None
+
+
 def parse_siri_vm(content: bytes) -> list:
     """Parse a SIRI-VM datafeed document into vehicle dicts.
 
@@ -69,12 +87,8 @@ def parse_siri_vm(content: bytes) -> list:
         loc = mvj.find(f"{{{SIRI_NS}}}VehicleLocation")
         lat = lon = None
         if loc is not None:
-            lat_el = loc.find(f"{{{SIRI_NS}}}Latitude")
-            lon_el = loc.find(f"{{{SIRI_NS}}}Longitude")
-            if lat_el is not None and lat_el.text:
-                lat = float(lat_el.text)
-            if lon_el is not None and lon_el.text:
-                lon = float(lon_el.text)
+            lat = _coord(loc.find(f"{{{SIRI_NS}}}Latitude"))
+            lon = _coord(loc.find(f"{{{SIRI_NS}}}Longitude"))
         buses.append({
             "vehicle_id": _text(mvj, "VehicleRef", "N/A"),
             "direction": _text(mvj, "DirectionRef", "N/A"),

@@ -38,6 +38,34 @@ def test_parse_siri_vm_empty_feed():
     assert siri.parse_siri_vm(b'<Siri xmlns="http://www.siri.org.uk/siri"/>') == []
 
 
+# V1 is well-formed; V2's latitude is not a number and its longitude is
+# whitespace only. One malformed coordinate must cost that one vehicle its
+# coordinate (rendered "N/A" downstream), never the whole feed.
+VM_BAD_COORD = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <VehicleActivity>
+  <MonitoredVehicleJourney>
+   <VehicleRef>V1</VehicleRef>
+   <VehicleLocation><Latitude>51.5</Latitude><Longitude>-0.1</Longitude></VehicleLocation>
+  </MonitoredVehicleJourney>
+ </VehicleActivity>
+ <VehicleActivity>
+  <MonitoredVehicleJourney>
+   <VehicleRef>V2</VehicleRef>
+   <VehicleLocation><Latitude>not-a-number</Latitude><Longitude> </Longitude></VehicleLocation>
+  </MonitoredVehicleJourney>
+ </VehicleActivity>
+</Siri>'''
+
+
+def test_parse_siri_vm_unparseable_coordinate_degrades():
+    buses = siri.parse_siri_vm(VM_BAD_COORD)
+    assert len(buses) == 2, "one bad coordinate must not fail the whole feed"
+    assert buses[0]["location"] == {"lat": 51.5, "lon": -0.1}
+    assert buses[1]["vehicle_id"] == "V2"
+    assert buses[1]["location"] == {"lat": None, "lon": None}
+
+
 SX = b'''<?xml version="1.0"?>
 <Siri xmlns="http://www.siri.org.uk/siri">
  <ServiceDelivery>
