@@ -73,9 +73,48 @@ def test_parse_siri_sx_records():
         "valid_until": "2026-09-12T18:00:00Z",
         "channel": "disruptions", "severity": "severe",
         "operators": ["OPX"], "lines": ["12", "15"], "stops": ["010A"],
-        "summary": "Road closure on Bravo Road"}
+        "summary": "Road closure on Bravo Road", "description": None}
     assert msgs[1]["lines"] == ["99"]
     assert msgs[1]["summary"] == "Diversion"
+
+
+# Scalar fields nested one level below the InfoMessage and padded with
+# pretty-print whitespace — the shape a real (unprobed) feed may publish.
+NESTED_PADDED_SX = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <InfoMessageDelivery>
+   <InfoMessage>
+    <Content>
+      <RecordedAtTime>
+        2026-09-12T10:00:00Z
+      </RecordedAtTime>
+      <ValidUntilTime> 2026-09-12T18:00:00Z </ValidUntilTime>
+      <InfoChannelRef> disruptions </InfoChannelRef>
+      <OperatorRef> OPX </OperatorRef>
+      <LineRef> 12 </LineRef>
+      <Severity> severe </Severity>
+      <Summary>Road closure on Bravo Road</Summary>
+      <Description>
+        Road closure on Bravo Road
+      </Description>
+    </Content>
+   </InfoMessage>
+  </InfoMessageDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_parse_siri_sx_descendant_search_strips_scalars():
+    msg = siri.parse_siri_sx(NESTED_PADDED_SX)[0]
+    assert msg["recorded_at"] == "2026-09-12T10:00:00Z"
+    assert msg["valid_until"] == "2026-09-12T18:00:00Z"
+    assert msg["channel"] == "disruptions"
+    assert msg["severity"] == "severe"
+    assert msg["operators"] == ["OPX"]
+    assert msg["lines"] == ["12"]
+    assert msg["summary"] == "Road closure on Bravo Road"
+    assert msg["description"] == "Road closure on Bravo Road"
 
 
 NESTED_SX = b'''<?xml version="1.0"?>
@@ -116,6 +155,31 @@ CXL = b'''<?xml version="1.0"?>
 
 def test_parse_cancellations():
     assert siri.parse_cancellations(CXL) == [{
+        "recorded_at": "2026-09-12T10:00:00Z",
+        "vehicle_journey_ref": "J-42", "operator": "OPX", "line": "12",
+        "origin": "010A", "destination": "010C", "reason": "breakdown"}]
+
+
+# Same fields one level below the matching element and padded — the shape a
+# real (unprobed) feed may publish.
+NESTED_PADDED_CXL = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <EstimatedVehicleJourneyCancellations>
+  <EstimatedVehicleJourney>
+   <RecordedAtTime> 2026-09-12T10:00:00Z </RecordedAtTime>
+   <OperatorRef> OPX </OperatorRef>
+   <LineRef> 12 </LineRef>
+   <OriginRef> 010A </OriginRef>
+   <DestinationRef> 010C </DestinationRef>
+   <FramedVehicleJourneyRef><VehicleJourneyRef> J-42 </VehicleJourneyRef></FramedVehicleJourneyRef>
+   <CancellationReason> breakdown </CancellationReason>
+  </EstimatedVehicleJourney>
+ </EstimatedVehicleJourneyCancellations>
+</Siri>'''
+
+
+def test_parse_cancellations_descendant_search_strips_scalars():
+    assert siri.parse_cancellations(NESTED_PADDED_CXL) == [{
         "recorded_at": "2026-09-12T10:00:00Z",
         "vehicle_journey_ref": "J-42", "operator": "OPX", "line": "12",
         "origin": "010A", "destination": "010C", "reason": "breakdown"}]

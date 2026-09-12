@@ -25,10 +25,11 @@ SIRI_NS = "http://www.siri.org.uk/siri"
 
 
 def _text(el, tag: str, default=None):
-    """Direct-child text lookup, namespace-qualified."""
+    """Direct-child text lookup, namespace-qualified. Surrounding whitespace
+    is stripped, so pretty-printed feeds compare equal to their values."""
     found = el.find(f"{{{SIRI_NS}}}{tag}")
     if found is not None and found.text is not None:
-        return found.text
+        return found.text.strip()
     return default
 
 
@@ -39,13 +40,15 @@ def _refs(el, tag: str) -> list:
 
 
 def _desc_text(el, tag: str, default=None):
-    """Descendant-search text lookup (first match), namespace-qualified.
+    """Descendant-search text lookup (first match), namespace-qualified and
+    whitespace-stripped.
 
-    BODS nests some fields one level down (e.g. <Severity> inside <Content>),
-    where the direct-child _text helper would miss them."""
+    BODS nests fields at varying depth (e.g. <Severity> inside <Content>),
+    so the SIRI-SX parsers read every scalar this way; a descendant search
+    also finds direct children, so direct-child elements still resolve."""
     found = el.find(f".//{{{SIRI_NS}}}{tag}")
     if found is not None and found.text is not None:
-        return found.text
+        return found.text.strip()
     return default
 
 
@@ -88,8 +91,9 @@ def parse_siri_vm(content: bytes) -> list:
 def parse_siri_sx(content: bytes) -> list:
     """Flatten a SIRI-SX document into one dict per InfoMessage:
     recorded_at, valid_until, channel, severity, operators, lines, stops,
-    summary. All refs use descendant search; a container InfoMessage that
-    wraps a nested one is skipped so its content is not reported twice."""
+    summary, description. Every scalar uses descendant search (stripped) so
+    the parser tolerates BODS's nesting; a container InfoMessage that wraps
+    a nested one is skipped so its content is not reported twice."""
     root = SafeET.fromstring(content)
     messages = []
     for info in root.iter(f"{{{SIRI_NS}}}InfoMessage"):
@@ -102,14 +106,15 @@ def parse_siri_sx(content: bytes) -> list:
                 summary = " ".join(found.text.split())
                 break
         messages.append({
-            "recorded_at": _text(info, "RecordedAtTime"),
-            "valid_until": _text(info, "ValidUntilTime"),
-            "channel": _text(info, "InfoChannelRef"),
+            "recorded_at": _desc_text(info, "RecordedAtTime"),
+            "valid_until": _desc_text(info, "ValidUntilTime"),
+            "channel": _desc_text(info, "InfoChannelRef"),
             "severity": _desc_text(info, "Severity"),
             "operators": _refs(info, "OperatorRef"),
             "lines": _refs(info, "LineRef"),
             "stops": _refs(info, "StopPointRef"),
             "summary": summary,
+            "description": _desc_text(info, "Description"),
         })
     return messages
 
@@ -120,9 +125,11 @@ CANCELLATION_TAGS = {"VehicleJourneyCancellation",
 
 def parse_cancellations(content: bytes) -> list:
     """Flatten the /siri-sx/cancellations document into one dict per
-    cancelled-vehicle entry. If the live probe (Step 1) shows the feed
-    carries InfoMessage-shaped records instead, replace this traversal with
-    parse_siri_sx and map the fields — the tool layer is unaffected."""
+    cancelled-vehicle entry. Every scalar uses descendant search (stripped)
+    so the parser tolerates BODS's nesting. If the live probe (Step 1) shows
+    the feed carries InfoMessage-shaped records instead, replace this
+    traversal with parse_siri_sx and map the fields — the tool layer is
+    unaffected."""
     root = SafeET.fromstring(content)
     out = []
     for el in root.iter():
@@ -131,14 +138,16 @@ def parse_cancellations(content: bytes) -> list:
         fjv = el.find(f".//{{{SIRI_NS}}}FramedVehicleJourneyRef")
         vjr = None
         if fjv is not None:
-            vjr = _text(fjv, "VehicleJourneyRef") or _text(fjv, "DatedVehicleJourneyRef")
+            vjr = (_desc_text(fjv, "VehicleJourneyRef")
+                   or _desc_text(fjv, "DatedVehicleJourneyRef"))
         out.append({
-            "recorded_at": _text(el, "RecordedAtTime"),
-            "vehicle_journey_ref": vjr or _text(el, "VehicleJourneyRef"),
-            "operator": _text(el, "OperatorRef"),
-            "line": _text(el, "LineRef"),
-            "origin": _text(el, "OriginRef") or _text(el, "OriginName"),
-            "destination": _text(el, "DestinationRef") or _text(el, "DestinationName"),
-            "reason": _text(el, "CancellationReason") or _text(el, "Reason"),
+            "recorded_at": _desc_text(el, "RecordedAtTime"),
+            "vehicle_journey_ref": vjr or _desc_text(el, "VehicleJourneyRef"),
+            "operator": _desc_text(el, "OperatorRef"),
+            "line": _desc_text(el, "LineRef"),
+            "origin": _desc_text(el, "OriginRef") or _desc_text(el, "OriginName"),
+            "destination": (_desc_text(el, "DestinationRef")
+                            or _desc_text(el, "DestinationName")),
+            "reason": _desc_text(el, "CancellationReason") or _desc_text(el, "Reason"),
         })
     return out
