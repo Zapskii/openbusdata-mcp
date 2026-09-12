@@ -258,9 +258,9 @@ def test_live_buses_empty_feed_is_not_cached():
 
 
 def test_live_buses_missing_coordinate_renders_na():
-    # Location is present but has no Longitude, and V2 has no VehicleLocation.
-    # Both must render the missing coordinate as "N/A" rather than null (the
-    # shape get_live_buses_on_route has always published).
+    # V9 has a VehicleLocation with no Longitude; V10 has no VehicleLocation
+    # element at all. Both must render the missing coordinate as "N/A" rather
+    # than null (the shape get_live_buses_on_route has always published).
     partial_vm = b'''<?xml version="1.0"?>
 <Siri xmlns="http://www.siri.org.uk/siri">
  <VehicleActivity>
@@ -268,6 +268,9 @@ def test_live_buses_missing_coordinate_renders_na():
    <VehicleRef>V9</VehicleRef>
    <VehicleLocation><Latitude>51.5</Latitude></VehicleLocation>
   </MonitoredVehicleJourney>
+ </VehicleActivity>
+ <VehicleActivity>
+  <MonitoredVehicleJourney><VehicleRef>V10</VehicleRef></MonitoredVehicleJourney>
  </VehicleActivity>
 </Siri>'''
     server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
@@ -278,8 +281,9 @@ def test_live_buses_missing_coordinate_renders_na():
     finally:
         server.set_http_client(None)
         server._LIVE_CACHE = server.TTLCache(20.0)
-    assert out[0]["vehicle_id"] == "V9"
-    assert out[0]["location"] == {"lat": 51.5, "lon": "N/A"}, out[0]["location"]
+    assert [(b["vehicle_id"], b["location"]) for b in out] == [
+        ("V9", {"lat": 51.5, "lon": "N/A"}),
+        ("V10", {"lat": "N/A", "lon": "N/A"})], out
 
 
 def test_plan_journey_annotates_disrupted_legs(seeded_route, monkeypatch):
