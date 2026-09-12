@@ -46,3 +46,26 @@ def store(_fresh_db):
     s = TimetableStore()
     yield s
     s.close()
+
+
+@pytest.fixture()
+def seeded_route(writer, store):
+    """Route OPX|12 outbound over three stops, two Monday journeys.
+
+    J1: 010A dep 09:00, 010B arr 09:10 / dep 09:11, 010C arr 09:20.
+    J2: 010A dep 09:30, 010B arr 09:40,            010C arr 09:50.
+    """
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    writer.add_stop("010B", "Bravo Road", 51.51, -0.11)
+    writer.add_stop("010C", "Charlie Road", 51.52, -0.12)
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A", "010B", "010C"], 1)
+    writer.add_journey("OPX", "12", "outbound", "J1", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010B", "arrival": "09:10:00", "departure": "09:11:00"},
+        {"naptan": "010C", "arrival": "09:20:00", "departure": None}], 1)
+    writer.add_journey("OPX", "12", "outbound", "J2", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:30:00"},
+        {"naptan": "010B", "arrival": "09:40:00", "departure": None},
+        {"naptan": "010C", "arrival": "09:50:00", "departure": None}], 1)
+    writer.commit()
+    return store

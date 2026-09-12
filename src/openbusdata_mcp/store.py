@@ -394,6 +394,33 @@ class TimetableStore:
                 "total_changes": 1})
         return plans
 
+    def next_departures(self, naptans: set, day: str, from_time: str,
+                        limit: int = 20) -> list:
+        """Next scheduled departures from any of the given stops on `day`,
+        at/after from_time ('HH:MM:SS'), ordered by time. Destination is the
+        name of each journey's final stop. Rides jst_n (naptan, dep) for the
+        candidate scan and jst_j (journey_id) for the correlated MAX(seq)."""
+        if not naptans:
+            return []
+        marks = ",".join("?" * len(naptans))
+        rows = self.conn.execute(f"""
+            SELECT j.op, j.route, j.direction, j.code,
+                   MIN(jst.dep) AS dep, s.name
+            FROM journey_stop_times jst
+            JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
+            JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
+                 AND lastj.seq = (SELECT MAX(seq) FROM journey_stop_times
+                                  WHERE journey_id = jst.journey_id)
+            JOIN stops s ON s.naptan = lastj.naptan
+            WHERE jst.naptan IN ({marks}) AND jst.dep IS NOT NULL AND jst.dep >= ?
+            GROUP BY jst.journey_id
+            ORDER BY dep
+            LIMIT ?
+        """, [DAY_BITS.get(day, 0)] + list(naptans) + [from_time, limit]).fetchall()
+        return [{"operator": r[0], "route": r[1], "direction": r[2],
+                 "journey_code": r[3], "depart": r[4], "destination": r[5]}
+                for r in rows]
+
     # -- provenance / maintenance (used by delta loader) --------------------
     def dataset_meta(self, ds_id: int) -> Optional[dict]:
         row = self.conn.execute(

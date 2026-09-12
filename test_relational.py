@@ -154,3 +154,22 @@ def test_candidate_journeys_sql_parity(writer, store):
     assert [x.code for x in tue] == ["J6b"]
     # Arrival target filters: nothing arrives by 09:19.
     assert list(store._candidate_journeys({"A1"}, {"B1"}, "mon", "09:19:00")) == []
+
+
+def test_next_departures_orders_and_names_destination(seeded_route):
+    board = seeded_route.next_departures({"010A"}, "mon", "08:00:00", 10)
+    assert [d["depart"] for d in board] == ["09:00:00", "09:30:00"]
+    assert board[0] == {"operator": "OPX", "route": "12", "direction": "outbound",
+                        "journey_code": "J1", "depart": "09:00:00",
+                        "destination": "Charlie Road"}
+
+
+def test_next_departures_respects_day_and_limit(seeded_route):
+    assert seeded_route.next_departures({"010A"}, "tue", "08:00:00", 10) == []
+    only_one = seeded_route.next_departures({"010A"}, "mon", "08:00:00", 1)
+    assert [d["depart"] for d in only_one] == ["09:00:00"]
+
+
+def test_next_departures_unknown_day_and_empty_set(seeded_route):
+    assert seeded_route.next_departures({"010A"}, "bogus", "08:00:00", 10) == []
+    assert seeded_route.next_departures(set(), "mon", "08:00:00", 10) == []

@@ -86,3 +86,17 @@ def test_get_cancellations_filters():
         assert asyncio.run(server.get_cancellations(operator="NOPE")) == "No matching cancellation entries."
     finally:
         _reset()
+
+
+def test_get_departures_board_tool(seeded_route):
+    out = json.loads(asyncio.run(server.get_departures_board(
+        "Alpha Street", day="mon", from_time="08:00")))
+    assert [d["depart"] for d in out] == ["09:00:00", "09:30:00"]
+    assert out[0]["destination"] == "Charlie Road"
+
+
+def test_get_departures_board_errors(seeded_route):
+    out = asyncio.run(server.get_departures_board("Alpha Street", from_time="25:99"))
+    assert "Invalid time format" in out
+    out = asyncio.run(server.get_departures_board("Nowhere Street"))
+    assert "Could not resolve stop" in out

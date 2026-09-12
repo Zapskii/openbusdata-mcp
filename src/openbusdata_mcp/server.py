@@ -1094,6 +1094,40 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str,
         return f"Error: {type(e).__name__}: {str(e)}"
 
 
+@mcp.tool()
+async def get_departures_board(stop: str, day: Optional[str] = None,
+                               from_time: Optional[str] = None,
+                               limit: int = 20) -> str:
+    """
+    Get the next scheduled departures at a stop (a departures board).
+
+    Parameters:
+      stop: Stop (NaPTAN code or name).
+      day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
+      from_time: Optional start time HH:MM (24h). Defaults to now.
+      limit: Max departures to return (1-50, default 20).
+    """
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    naptans = store.resolve_stop(stop)
+    if not naptans:
+        return f'Could not resolve stop: "{stop}". Try search_stops().'
+    if day is None:
+        day = datetime.now().strftime("%a").lower()
+    day = day.lower()[:3]
+    if from_time is None:
+        from_s = datetime.now().strftime("%H:%M:%S")
+    else:
+        from_s = _parse_time(from_time)
+        if from_s is None:
+            return f'Invalid time format: "{from_time}". Use HH:MM (24h).'
+    limit = max(1, min(int(limit), 50))
+    board = store.next_departures(naptans, day, from_s, limit)
+    if not board:
+        return f"No departures found at '{stop}' on {day} after {from_s}."
+    return json.dumps(board, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
