@@ -596,9 +596,6 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         catalog, sweep_complete = await _sweep_catalogue(
             client, modified_since=None if full else reference.isoformat())
-    if full and sweep_complete:
-        writer.set_last_full_sweep(datetime.now(timezone.utc).isoformat())
-        writer.commit()
 
     # An empty catalogue is only a failure when the sweep broke before seeing
     # anything; a completed sweep that returns no results is authoritative
@@ -634,6 +631,13 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                     failed_ids.append(ds_id)
                     print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
                           file=sys.stderr, flush=True)
+
+    # Full-sweep watermark: written only AFTER the purge/load phase has been
+    # applied — a crash mid-apply leaves the watermark stale so the next run
+    # repeats the (paid-for) full sweep instead of trusting a half-applied one.
+    if full and sweep_complete:
+        writer.set_last_full_sweep(datetime.now(timezone.utc).isoformat())
+        writer.commit()
 
     # Watermark policy: advance when the run is essentially clean. A single
     # permanently-broken dataset must not freeze the watermark forever (that
@@ -793,7 +797,8 @@ async def load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     versus a full load. No-op fallback to a full load if no cache exists.
     Catalogue sweeps are server-side filtered by modifiedDate when the index
     is fresh; a full (unfiltered) sweep - needed to detect withdrawn
-    datasets - runs at most every 7 days.
+    datasets - runs at most every 7 days. reconcile=True forces a full
+    sweep (withdrawal purges need the full catalogue).
 
     Parameters:
       since: Optional ISO timestamp (YYYY-MM-DDTHH:MM:SS). Empty = use the

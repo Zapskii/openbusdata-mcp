@@ -339,8 +339,10 @@ class TimetableStore:
             COALESCE(departure, arrival)), and alights at the FIRST
             occurrence of any B stop, arriving by target_s;
           - j2 != j1; both journeys run on `day` (days_mask).
-        Variable budget: <= 400 + 400 + 3 = 803 < 999. LIMIT 2000 bounds the
-        worst-case cross join; the tool-level dedup + top-15 cap follows."""
+        Variable budget: <= 400 + 400 + 3 = 803 < 999. ORDER BY sb.arr +
+        LIMIT 2000 bounds the worst-case cross join deterministically (the
+        earliest-arriving 2000 survive; sb.arr is never NULL on surviving
+        rows); the tool-level dedup + top-15 cap follows."""
         a, b = set(a), set(b)
         if not a or not b:
             return []
@@ -372,6 +374,7 @@ class TimetableStore:
               AND sa.dep IS NOT NULL
               AND sm2.seq < bb.seq
               AND sb.arr IS NOT NULL AND sb.arr <= ?
+            ORDER BY sb.arr
             LIMIT 2000
         """, list(a) + [mask] + list(b) + [mask, target_s]).fetchall()
         naptans = {r[5] for r in rows} | {r[6] for r in rows} | {r[15] for r in rows}
@@ -451,7 +454,6 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS journey_stop_times (
             journey_id INT, seq INT, naptan TEXT, dep TEXT, arr TEXT);
         CREATE INDEX IF NOT EXISTS jst_n ON journey_stop_times(naptan, dep);
-        CREATE INDEX IF NOT EXISTS jst_j ON journey_stop_times(journey_id, seq);
         CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
             name, naptan UNINDEXED, tokenize='unicode61');
         CREATE TRIGGER IF NOT EXISTS stops_fts_ai AFTER INSERT ON stops BEGIN
@@ -514,10 +516,14 @@ class TimetableWriter:
         # present) is rebuilt from the stored stops JSON once. dep follows
         # COALESCE(departure, arrival) to match add_journey's write side;
         # arr is the raw arrival (NULL where the timetable publishes none).
-        if not self.conn.execute(
-                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'").fetchone():
-            cols = {r[1] for r in self.conn.execute(
-                "PRAGMA table_info(journey_stop_times)")}
+        # The gate is COLUMN-driven, not flag-driven: a legacy DB already
+        # carries the backfill flag ('1', set by the v1 backfill), so an
+        # existing flag must never skip a missing-column rebuild.
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(journey_stop_times)")}
+        if ("seq" not in cols or "arr" not in cols or not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'"
+            ).fetchone()):
             for c in ("seq", "arr"):
                 if c not in cols:
                     self.conn.execute(
@@ -535,7 +541,13 @@ class TimetableWriter:
                 "FROM journeys j, json_each(j.json, '$.stops') e")
             self.conn.execute(
                 "INSERT OR REPLACE INTO meta VALUES"
-                " ('journey_stop_times_backfilled', '1')")
+                " ('journey_stop_times_backfilled', '2')")
+        # jst_j indexes (journey_id, seq): created here — AFTER the ALTERs
+        # above have guaranteed the seq column exists, because a legacy v1
+        # table (naptan/journey_id/dep only) would make an in-script
+        # CREATE INDEX fail with "no such column: seq" at startup.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS jst_j ON journey_stop_times(journey_id, seq)")
         # journeys.days_mask: SQL-level day filter (7-bit, mon=1 .. sun=64).
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(journeys)")}
         if "days_mask" not in cols:

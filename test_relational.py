@@ -61,28 +61,74 @@ def test_journey_stop_times_v2_backfill(writer):
         {"naptan": "010A", "arrival": None, "departure": "08:00:00"},
         {"naptan": "010B", "arrival": "08:10:00", "departure": None}], 5)
     writer.commit()
-    # Simulate a pre-v2 DB: old-shape rows, no seq/arr, flag present.
-    writer.conn.execute("DELETE FROM journey_stop_times")
+    # Simulate the true deployed legacy state: old-shape rows (no seq/arr)
+    # AND the v1 backfill flag already set to '1' — the upgrade must still
+    # run, because the gate is column-driven, not flag-driven.
+    writer.conn.execute("DROP TABLE journey_stop_times")
+    writer.conn.execute(
+        "CREATE TABLE journey_stop_times (naptan TEXT, journey_id INT, dep TEXT)")
     writer.conn.execute(
         "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
         "SELECT json_extract(value, '$.naptan'), j.id, "
         "       COALESCE(json_extract(value, '$.departure'),"
         "                json_extract(value, '$.arrival')) "
         "FROM journeys j, json_each(j.json, '$.stops')")
-    writer.conn.commit()
-    writer.ensure_schema()  # flag present -> no v2 rebuild: rows stay old-shape
-    assert writer.conn.execute(
-        "SELECT seq FROM journey_stop_times LIMIT 1").fetchone()[0] is None
-    # the real legacy path is exercised by resetting the flag:
     writer.conn.execute(
-        "DELETE FROM meta WHERE k='journey_stop_times_backfilled'")
+        "INSERT OR REPLACE INTO meta VALUES"
+        " ('journey_stop_times_backfilled', '1')")
     writer.conn.commit()
+    writer.ensure_schema()  # legacy rows must be upgraded despite flag='1'
+    rows = writer.conn.execute(
+        "SELECT seq, naptan, dep, arr FROM journey_stop_times "
+        "WHERE journey_id=1 ORDER BY seq").fetchall()
+    assert rows == [(0, "010A", "08:00:00", None),
+                    (1, "010B", "08:10:00", "08:10:00")], rows
+    assert writer.conn.execute(
+        "SELECT v FROM meta WHERE k='journey_stop_times_backfilled'"
+    ).fetchone()[0] == "2"
+    # A v2 DB with the flag present must NOT rebuild (idempotence): re-run
+    # leaves the rebuilt rows untouched.
     writer.ensure_schema()
     rows = writer.conn.execute(
         "SELECT seq, naptan, dep, arr FROM journey_stop_times "
         "WHERE journey_id=1 ORDER BY seq").fetchall()
     assert rows == [(0, "010A", "08:00:00", None),
                     (1, "010B", "08:10:00", "08:10:00")], rows
+
+
+def test_v1_shaped_db_upgrade_keeps_queries_working(writer, store):
+    """A genuinely v1-shaped DB (3-column table, flag='1') must upgrade at
+    ensure_schema without breaking candidate queries or index creation."""
+    writer.add_journey("Op", "7", "outbound", "J7", {"mon"}, [
+        {"naptan": "020A", "arrival": None, "departure": "07:00:00"},
+        {"naptan": "020B", "arrival": "07:15:00", "departure": None}], 5)
+    writer.commit()
+    writer.conn.execute("DROP TABLE journey_stop_times")
+    writer.conn.execute(
+        "CREATE TABLE journey_stop_times (naptan TEXT, journey_id INT, dep TEXT)")
+    writer.conn.execute(
+        "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
+        "SELECT json_extract(value, '$.naptan'), j.id, "
+        "       COALESCE(json_extract(value, '$.departure'),"
+        "                json_extract(value, '$.arrival')) "
+        "FROM journeys j, json_each(j.json, '$.stops')")
+    writer.conn.execute(
+        "INSERT OR REPLACE INTO meta VALUES"
+        " ('journey_stop_times_backfilled', '1')")
+    writer.conn.commit()
+    writer.ensure_schema()
+    cols = {r[1] for r in writer.conn.execute(
+        "PRAGMA table_info(journey_stop_times)")}
+    assert {"seq", "arr"} <= cols
+    assert writer.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='jst_j'"
+    ).fetchone(), "jst_j index must exist after upgrade"
+    # Candidate query must run (previously: "no such column: seq").
+    cands = list(store._candidate_journeys({"020A"}, {"020B"}, "mon", "08:00:00"))
+    assert len(cands) == 1
+    assert (cands[0].code, cands[0].naptan_a, cands[0].naptan_b) == \
+        ("J7", "020A", "020B")
+    assert cands[0].arrive_b == "07:15:00"
 
 
 def test_candidate_journeys_sql_parity(writer, store):
