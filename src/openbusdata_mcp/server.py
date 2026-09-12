@@ -93,6 +93,33 @@ _LIVE_CACHE = TTLCache(20.0)  # bus positions are re-polled within seconds
 _SIRI_VM_FILTER_KEYS = ("operatorRef", "lineRef", "originRef",
                         "destinationRef", "vehicleRef", "boundingBox")
 
+_API_KEY_PARAM_RE = re.compile(r"(api_key=)[^&\s'\"]+")
+
+
+def _redact(text: str) -> str:
+    """Strip the API key from text bound for tool output or a log line.
+
+    httpx builds HTTPStatusError messages from the request URL, and every BODS
+    URL carries ?api_key=..., so an unredacted failure message publishes the
+    credential into tool output and the session transcript.
+
+    Ruling R24: this strips the api_key parameter by PATTERN rather than by
+    enumerating the key's encodings. The package builds that parameter three
+    ways -- the fares tool interpolates API_KEY raw, SIRI-SX uses
+    quote(API_KEY) (safe='/'), and SIRI-VM uses urlencode(..., quote_via=quote)
+    (which passes safe='') -- so a key containing '/' appears as %2F on one
+    path and '/' on another, and no fixed list of literals covers all three.
+    A pattern also keeps working when the next URL builder is added, which is
+    what makes this a closed class rather than a list that goes stale.
+
+    The literal replacement is kept as well, for a key that reaches output
+    outside a query string (a raw traceback, say).
+    """
+    if not API_KEY:
+        return text
+    out = text.replace(API_KEY, "***")
+    return _API_KEY_PARAM_RE.sub(r"\1***", out)
+
 
 def _siri_vm_url(filters: dict) -> str:
     params = {k: v for k, v in filters.items() if v}
@@ -134,7 +161,8 @@ async def _fetch_sx(kind: str) -> Optional[list]:
         parsed = (parse_siri_sx if kind == "disruptions"
                   else parse_cancellations)(resp.content)
     except Exception as e:
-        print(f"[siri-sx] {kind} fetch/parse failed: {type(e).__name__}: {e}",
+        print(_redact(f"[siri-sx] {kind} fetch/parse failed: "
+                      f"{type(e).__name__}: {e}"),
               file=sys.stderr, flush=True)
         return None
     _SX_CACHE.put(kind, parsed)
@@ -657,7 +685,8 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
             except Exception as e:
                 errors += 1
                 failed_ids.append(ds_id)
-                print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                print(_redact(f"[loader] dataset {ds_id} failed: "
+                              f"{type(e).__name__}: {e}"),
                       file=sys.stderr, flush=True)
             # No explicit checkpoints needed: every dataset commit IS a checkpoint.
 
@@ -759,7 +788,8 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                 except Exception as e:
                     errors += 1
                     failed_ids.append(ds_id)
-                    print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
+                    print(_redact(f"[loader] dataset {ds_id} failed: "
+                                  f"{type(e).__name__}: {e}"),
                           file=sys.stderr, flush=True)
 
     # Full-sweep watermark: written only AFTER the purge/load phase has been
@@ -887,10 +917,12 @@ def register_tools_from_specs(specs: dict[str, Any]):
                             except Exception:
                                 return resp.text
                         except httpx.HTTPStatusError as e:
-                            return (f"HTTP Error {e.response.status_code}: "
-                                    f"{e.response.text[:500]}")
+                            return _redact(
+                                f"HTTP Error {e.response.status_code}: "
+                                f"{e.response.text[:500]}")
                         except Exception as e:
-                            return f"Error: {type(e).__name__}: {str(e)}"
+                            return _redact(
+                                f"Error: {type(e).__name__}: {str(e)}")
                     return tool_func
 
                 tool_func = make_tool()
@@ -1037,7 +1069,8 @@ async def _annotate_disruptions(plans: list) -> list:
     try:
         messages = await _fetch_sx("disruptions")
     except Exception as e:
-        print(f"[siri-sx] disruption annotation skipped: {type(e).__name__}: {e}",
+        print(_redact(f"[siri-sx] disruption annotation skipped: "
+                      f"{type(e).__name__}: {e}"),
               file=sys.stderr, flush=True)
         return plans
     if not messages:
@@ -1152,7 +1185,7 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str,
             return json.dumps(buses, indent=2, ensure_ascii=False)
         return "No live buses found."
     except Exception as e:
-        return f"Error: {type(e).__name__}: {str(e)}"
+        return _redact(f"Error: {type(e).__name__}: {str(e)}")
 
 
 @mcp.tool()
@@ -1225,7 +1258,7 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
         content = await _fetch_siri_vm(filters)
         vehicles = parse_siri_vm(content)
     except Exception as e:
-        return f"Error fetching live data: {type(e).__name__}: {str(e)}"
+        return _redact(f"Error fetching live data: {type(e).__name__}: {str(e)}")
 
     if day is None:
         day = datetime.now().strftime("%a").lower()
@@ -1324,7 +1357,7 @@ async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
         dl.raise_for_status()
         prices = parse_fare_prices(dl.content)
     except Exception as e:
-        return f"Error: {type(e).__name__}: {str(e)}"
+        return _redact(f"Error: {type(e).__name__}: {str(e)}")
 
     def keep(p):
         if origin_zone and origin_zone not in p["start_zones"] + p["zones"]:

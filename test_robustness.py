@@ -2,7 +2,9 @@ import asyncio
 import io
 import json
 import zipfile
+from urllib.parse import quote
 
+import httpx
 import pytest
 
 import openbusdata_mcp.server as server
@@ -524,3 +526,79 @@ def test_23_transxchange_entities_are_refused():
     stops, routes, journeys = server.parse_transxchange(ENTITY_DOC, "OpX")
     assert (stops, routes, journeys) == ([], [], []), (
         "an entity-bearing document must be refused, not expanded")
+
+
+# --- Test 24/25: the API key never reaches output or the log stream (ruling R16)
+# httpx builds HTTPStatusError messages from the request URL, so an unredacted
+# failure publishes the credential into tool output and the session transcript.
+#
+# Ruling R24: the key MUST contain characters the two quote() variants treat
+# differently, or these tests cannot see the gap they exist to catch. The
+# package builds its api_key query parameter three different ways:
+#   fares tool  f"...?api_key={API_KEY}"                 raw, unquoted
+#   SIRI-SX     f"...?api_key={quote(API_KEY)}"          quote(), safe='/'
+#   SIRI-VM     urlencode(params, quote_via=quote)        quote(), safe=''
+# urlencode passes safe='' to quote, so a key containing '/' is encoded as
+# %2F on the SIRI-VM path but left as '/' on the SIRI-SX path. An
+# alphanumeric key encodes identically everywhere and hides that entirely.
+# DUMMY_KEY is a fabricated credential used nowhere; it is deliberately
+# awkward, not realistic.
+DUMMY_KEY = "DUMMY/KEY+abc=123"
+
+
+def _leaked(text: str) -> list:
+    """Every encoding of DUMMY_KEY that appears in `text` (empty list = clean).
+
+    Asserting only `DUMMY_KEY not in text` is VACUOUS for this key: the
+    SIRI-VM URL carries quote(DUMMY_KEY, safe=''), which does not contain
+    DUMMY_KEY as a substring, so that assertion passes even with no
+    redaction at all. Check every form the builders can produce.
+    """
+    forms = {DUMMY_KEY, quote(DUMMY_KEY), quote(DUMMY_KEY, safe="")}
+    return sorted(f for f in forms if f in text)
+
+
+def test_24_api_key_is_redacted_from_tool_output(monkeypatch, seeded_route):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(401, json={}))))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        out = asyncio.run(server.estimate_live_eta(
+            "Charlie Road", "OPX", "12", day="mon"))
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
+    assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
+    assert "401" in out, "the failure must still be reported readably"
+
+
+def test_25_api_key_is_redacted_from_siri_sx_log(monkeypatch, capsys):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(403, json={}))))
+    server._SX_CACHE = server.TTLCache(60.0)
+    try:
+        assert asyncio.run(server._fetch_sx("disruptions")) is None
+    finally:
+        server.set_http_client(None)
+        server._SX_CACHE = server.TTLCache(60.0)
+    err = capsys.readouterr().err
+    assert not _leaked(err), f"API key reachable in the log stream: {_leaked(err)}"
+    assert "403" in err, "the failure must still be logged readably"
+
+
+# --- Test 26: the fares tool's error return is redacted too (ruling R22)
+# R22 found this site only after Task 6 added the fetch path, which is exactly the
+# staleness the sweep in this task's brief exists to prevent. It has no module cache
+# to reset -- get_fare_prices caches nothing -- so nothing is reset here.
+def test_26_api_key_is_redacted_from_fares_tool(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(401, json={}))))
+    try:
+        out = asyncio.run(server.get_fare_prices("DS1"))
+    finally:
+        server.set_http_client(None)
+    assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
+    assert "401" in out, "the failure must still be reported readably"
