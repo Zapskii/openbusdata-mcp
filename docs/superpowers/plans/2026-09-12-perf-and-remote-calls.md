@@ -617,17 +617,20 @@ def test_add_journey_writes_days_mask(writer, store):
 
 
 def test_days_mask_backfilled_on_legacy_db(writer):
-    # Simulate a legacy row written before days_mask existed.
+    # Simulate a legacy row written before days_mask existed. The per-test
+    # fixture already ran ensure_schema on an empty DB (setting the flag), so
+    # clear the flag first — exactly the state of a real legacy DB.
     writer.conn.execute(
         "INSERT INTO journeys (id, ds_id, op, route, direction, code, days, json) "
         "VALUES (10, 7, 'Op', '4b', 'outbound', 'J4b', '[\"thu\"]', '{}')")
     writer.commit()
+    writer.conn.execute("DELETE FROM meta WHERE k='days_mask_backfilled'")
+    writer.conn.commit()
     writer.ensure_schema()  # must backfill days_mask from the days JSON
     mask = writer.conn.execute(
         "SELECT days_mask FROM journeys WHERE id=10").fetchone()[0]
     assert mask == 8
-    # Backfill must not re-run: clear the flag only to prove idempotence via
-    # the meta key, then re-run ensure_schema and check stability.
+    # Second ensure_schema with the flag present must not touch the row.
     writer.ensure_schema()
     assert writer.conn.execute(
         "SELECT days_mask FROM journeys WHERE id=10").fetchone()[0] == 8
@@ -880,9 +883,7 @@ def test_candidate_journeys_sql_parity(writer, store):
     # First-occurrence semantics: A2 appears before B1; boarding at A2 works.
     c2 = list(store._candidate_journeys({"A2"}, {"B1"}, "mon", "09:30:00"))
     assert len(c2) == 1 and c2[0].seq_a == 1 and c2[0].seq_b == 2
-    # Day mask filters in SQL: no tue journeys on mon.
-    assert list(store._candidate_journeys({"A1"}, {"B1"}, "tue", "09:30:00")) == [
-        c for c in store._candidate_journeys({"A1"}, {"B1"}, "tue", "09:30:00")]
+    # Day mask filters in SQL: the tue journey only on tue.
     tue = list(store._candidate_journeys({"A1"}, {"B1"}, "tue", "09:30:00"))
     assert [x.code for x in tue] == ["J6b"]
     # Arrival target filters: nothing arrives by 09:19.
