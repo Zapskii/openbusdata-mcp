@@ -42,6 +42,23 @@ SPECS_DIR = Path(__file__).parent / "openapi-schema"
 CACHE_DIR = Path.home() / ".cache" / "openbusdata"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Shared pooled HTTP client: one TCP/TLS connection pool for the process
+# lifetime instead of a fresh client (new handshake) per tool call. Test seam:
+# set_http_client() injects a client (or None to reset to lazy creation).
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    return _http_client
+
+
+def set_http_client(client: Optional[httpx.AsyncClient]) -> None:
+    global _http_client
+    _http_client = client
+
 mcp = FastMCP("openbusdata")
 
 
@@ -680,13 +697,13 @@ def register_tools_from_specs(specs: dict[str, Any]):
                             sep = "&" if "?" in full_url else "?"
                             full_url += f"{sep}api_key={API_KEY}"
                         try:
-                            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                                resp = await client.get(full_url)
-                                resp.raise_for_status()
-                                try:
-                                    return json.dumps(resp.json(), indent=2, ensure_ascii=False)
-                                except Exception:
-                                    return resp.text
+                            client = get_http_client()
+                            resp = await client.get(full_url)
+                            resp.raise_for_status()
+                            try:
+                                return json.dumps(resp.json(), indent=2, ensure_ascii=False)
+                            except Exception:
+                                return resp.text
                         except httpx.HTTPStatusError as e:
                             return (f"HTTP Error {e.response.status_code}: "
                                     f"{e.response.text[:500]}")
@@ -887,32 +904,32 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
     query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
     full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            resp = await client.get(full_url)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            ns = "http://www.siri.org.uk/siri"
-            def get_text(tag):
-                el = mvj.find(f"{{{ns}}}{tag}")
-                return el.text if el is not None else "N/A"
-            buses = []
-            for activity in root.iter(f"{{{ns}}}VehicleActivity"):
-                mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
-                if mvj is None:
-                    continue
-                loc = mvj.find(f"{{{ns}}}VehicleLocation")
-                lat = lon = "N/A"
-                if loc is not None:
-                    lat_el = loc.find(f"{{{ns}}}Latitude")
-                    lon_el = loc.find(f"{{{ns}}}Longitude")
-                    lat = lat_el.text if lat_el is not None else "N/A"
-                    lon = lon_el.text if lon_el is not None else "N/A"
-                buses.append({
-                    "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
-                    "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
-                    "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
-                })
-            return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
+        client = get_http_client()
+        resp = await client.get(full_url)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        ns = "http://www.siri.org.uk/siri"
+        def get_text(tag):
+            el = mvj.find(f"{{{ns}}}{tag}")
+            return el.text if el is not None else "N/A"
+        buses = []
+        for activity in root.iter(f"{{{ns}}}VehicleActivity"):
+            mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
+            if mvj is None:
+                continue
+            loc = mvj.find(f"{{{ns}}}VehicleLocation")
+            lat = lon = "N/A"
+            if loc is not None:
+                lat_el = loc.find(f"{{{ns}}}Latitude")
+                lon_el = loc.find(f"{{{ns}}}Longitude")
+                lat = lat_el.text if lat_el is not None else "N/A"
+                lon = lon_el.text if lon_el is not None else "N/A"
+            buses.append({
+                "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
+                "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
+                "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
+            })
+        return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
 

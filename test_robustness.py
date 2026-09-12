@@ -229,10 +229,13 @@ class _PagedClient(_FakeClient):
 
 @pytest.fixture(autouse=True)
 def _restore_httpx_client():
-    """Each test swaps server.httpx.AsyncClient for a fake; restore the real one."""
+    """Each test swaps server.httpx.AsyncClient for a fake; restore the real one.
+    Also reset the shared pooled client singleton so no stale fake leaks
+    between tests (spec tools fetch via server.get_http_client())."""
     orig = server.httpx.AsyncClient
     yield
     server.httpx.AsyncClient = orig
+    server._http_client = None
 
 
 def _dataset_tool():
@@ -312,11 +315,34 @@ def test_5_plan_dedup_keeps_distinct_operators(writer):
         "dedup collapsed distinct operators"
 
 
-# --- Test 6: live-buses URL params are percent-encoded
+class _FakeLiveResponse:
+    def __init__(self, content):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeSharedClient:
+    def __init__(self):
+        self.urls = []
+
+    async def get(self, url):
+        captured.append(url)
+        return _FakeLiveResponse(
+            b'<?xml version="1.0"?><Siri><VehicleActivity>'
+            b'<MonitoredVehicleJourney><VehicleRef>V1</VehicleRef>'
+            b'</MonitoredVehicleJourney></VehicleActivity></Siri>')
+
+
+# --- Test 6: live-buses URL params are percent-encoded (shared client)
 def test_6_live_buses_params_url_encoded():
     captured.clear()
-    server.httpx.AsyncClient = _FakeClient
-    result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
+    server.set_http_client(_FakeSharedClient())
+    try:
+        result = asyncio.run(server.get_live_buses_on_route("A&B", "1 2"))
+    finally:
+        server.set_http_client(None)
     assert "operatorRef=A%26B" in captured[0], captured[0]
     assert "lineRef=1%202" in captured[0], captured[0]
 
