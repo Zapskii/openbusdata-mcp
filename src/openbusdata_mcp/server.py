@@ -17,6 +17,7 @@ import json
 import zipfile
 import xml.etree.ElementTree as ET
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode, urljoin
@@ -41,6 +42,49 @@ API_KEY = os.environ.get("OPENBUS_API_KEY", "")
 SPECS_DIR = Path(__file__).parent / "openapi-schema"
 CACHE_DIR = Path.home() / ".cache" / "openbusdata"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Shared pooled HTTP client: one TCP/TLS connection pool for the process
+# lifetime instead of a fresh client (new handshake) per tool call. Test seam:
+# set_http_client() injects a client (or None to reset to lazy creation).
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    return _http_client
+
+
+def set_http_client(client: Optional[httpx.AsyncClient]) -> None:
+    global _http_client
+    _http_client = client
+
+
+class TTLCache:
+    """Tiny process-local TTL cache: monotonic clock, bounded entry count."""
+
+    def __init__(self, ttl_seconds: float):
+        self.ttl = ttl_seconds
+        self._store: dict = {}
+
+    def get(self, key):
+        hit = self._store.get(key)
+        if hit is None:
+            return None
+        ts, val = hit
+        if time.monotonic() - ts > self.ttl:
+            del self._store[key]
+            return None
+        return val
+
+    def put(self, key, val):
+        if len(self._store) >= 256:
+            self._store.clear()  # simple bounded reset; keys are few
+        self._store[key] = (time.monotonic(), val)
+
+
+_LIVE_CACHE = TTLCache(20.0)  # bus positions are re-polled within seconds
 
 mcp = FastMCP("openbusdata")
 
@@ -401,18 +445,28 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             await client.aclose()
 
 
-async def _sweep_catalogue(client: httpx.AsyncClient) -> tuple[dict[int, dict], bool]:
+async def _sweep_catalogue(client: httpx.AsyncClient,
+                           modified_since: Optional[str] = None
+                           ) -> tuple[dict[int, dict], bool]:
     """Sweep the BODS catalogue, returning ({id: entry}, complete).
 
     complete is True only when the sweep finished normally (empty or short
     page); False when it broke on a non-200 page (partial view).
+
+    modified_since: when given, the API filters server-side on modifiedDate,
+    so the sweep pages only changed datasets instead of the whole catalogue.
+    A filtered sweep CANNOT detect catalogue withdrawals — callers that need
+    reconcile must sweep unfiltered.
     """
     catalog: dict[int, dict] = {}
     offset = 0
     limit = 100
     while True:
-        resp = await client.get(
-            f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}&api_key={API_KEY}")
+        url = f"{BASE_URL}/api/v1/dataset/?limit={limit}&offset={offset}"
+        if modified_since:
+            url += "&modifiedDate=" + quote(modified_since, safe="")
+        url += f"&api_key={API_KEY}"
+        resp = await client.get(url)
         if resp.status_code != 200:
             return catalog, False
         results = resp.json().get("results", [])
@@ -535,17 +589,25 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
 
     sweep_start = datetime.now(timezone.utc)
 
+    # Full sweep when the full-sweep watermark is stale or absent (withdrawal
+    # purges need the whole catalogue, so reconcile runs on full sweeps only);
+    # otherwise a server-side filtered sweep touches only changed datasets.
+    full = writer.full_sweep_due()
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        catalog, _ = await _sweep_catalogue(client)
+        catalog, sweep_complete = await _sweep_catalogue(
+            client, modified_since=None if full else reference.isoformat())
 
-    if not catalog:
+    # An empty catalogue is only a failure when the sweep broke before seeing
+    # anything; a completed sweep that returns no results is authoritative
+    # (filtered: nothing changed; full: everything withdrawn -> purge below).
+    if not catalog and not sweep_complete:
         return "Catalogue sweep failed (non-200 or empty) - watermark left untouched."
 
     updated = 0
     purged = 0
     errors = 0
     failed_ids: list[int] = []
-    if reconcile:
+    if reconcile and sweep_complete and full:
         for ds_id in [i for i in writer.loaded_ids() if i not in catalog]:
             writer.discard_dataset(ds_id)
             purged += 1
@@ -569,6 +631,13 @@ async def _load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
                     failed_ids.append(ds_id)
                     print(f"[loader] dataset {ds_id} failed: {type(e).__name__}: {e}",
                           file=sys.stderr, flush=True)
+
+    # Full-sweep watermark: written only AFTER the purge/load phase has been
+    # applied — a crash mid-apply leaves the watermark stale so the next run
+    # repeats the (paid-for) full sweep instead of trusting a half-applied one.
+    if full and sweep_complete:
+        writer.set_last_full_sweep(datetime.now(timezone.utc).isoformat())
+        writer.commit()
 
     # Watermark policy: advance when the run is essentially clean. A single
     # permanently-broken dataset must not freeze the watermark forever (that
@@ -680,13 +749,13 @@ def register_tools_from_specs(specs: dict[str, Any]):
                             sep = "&" if "?" in full_url else "?"
                             full_url += f"{sep}api_key={API_KEY}"
                         try:
-                            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                                resp = await client.get(full_url)
-                                resp.raise_for_status()
-                                try:
-                                    return json.dumps(resp.json(), indent=2, ensure_ascii=False)
-                                except Exception:
-                                    return resp.text
+                            client = get_http_client()
+                            resp = await client.get(full_url)
+                            resp.raise_for_status()
+                            try:
+                                return json.dumps(resp.json(), indent=2, ensure_ascii=False)
+                            except Exception:
+                                return resp.text
                         except httpx.HTTPStatusError as e:
                             return (f"HTTP Error {e.response.status_code}: "
                                     f"{e.response.text[:500]}")
@@ -726,6 +795,12 @@ async def load_timetable_delta(since: str = "", reconcile: bool = True) -> str:
     refresh (default watermark; pass an ISO timestamp to override) and
     purge datasets withdrawn from the catalogue. Minutes instead of hours
     versus a full load. No-op fallback to a full load if no cache exists.
+    Catalogue sweeps are server-side filtered by modifiedDate when the index
+    is fresh; a full (unfiltered) sweep - needed to detect withdrawn
+    datasets - runs at most every 7 days. reconcile=True does not force a
+    full sweep, but withdrawal purges happen only on full sweeps, so with
+    a fresh watermark withdrawals linger up to 7 days (self-heals on the
+    next full sweep).
 
     Parameters:
       since: Optional ISO timestamp (YYYY-MM-DDTHH:MM:SS). Empty = use the
@@ -886,33 +961,39 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
     """
     query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
     full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
+    cached = _LIVE_CACHE.get((operator_ref, line_ref))
+    if cached is not None:
+        return json.dumps(cached, indent=2, ensure_ascii=False)
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            resp = await client.get(full_url)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            ns = "http://www.siri.org.uk/siri"
-            def get_text(tag):
-                el = mvj.find(f"{{{ns}}}{tag}")
-                return el.text if el is not None else "N/A"
-            buses = []
-            for activity in root.iter(f"{{{ns}}}VehicleActivity"):
-                mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
-                if mvj is None:
-                    continue
-                loc = mvj.find(f"{{{ns}}}VehicleLocation")
-                lat = lon = "N/A"
-                if loc is not None:
-                    lat_el = loc.find(f"{{{ns}}}Latitude")
-                    lon_el = loc.find(f"{{{ns}}}Longitude")
-                    lat = lat_el.text if lat_el is not None else "N/A"
-                    lon = lon_el.text if lon_el is not None else "N/A"
-                buses.append({
-                    "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
-                    "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
-                    "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
-                })
-            return json.dumps(buses, indent=2, ensure_ascii=False) if buses else f"No live buses found."
+        client = get_http_client()
+        resp = await client.get(full_url)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        ns = "http://www.siri.org.uk/siri"
+        def get_text(tag):
+            el = mvj.find(f"{{{ns}}}{tag}")
+            return el.text if el is not None else "N/A"
+        buses = []
+        for activity in root.iter(f"{{{ns}}}VehicleActivity"):
+            mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
+            if mvj is None:
+                continue
+            loc = mvj.find(f"{{{ns}}}VehicleLocation")
+            lat = lon = "N/A"
+            if loc is not None:
+                lat_el = loc.find(f"{{{ns}}}Latitude")
+                lon_el = loc.find(f"{{{ns}}}Longitude")
+                lat = lat_el.text if lat_el is not None else "N/A"
+                lon = lon_el.text if lon_el is not None else "N/A"
+            buses.append({
+                "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
+                "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
+                "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
+            })
+        if buses:
+            _LIVE_CACHE.put((operator_ref, line_ref), buses)
+            return json.dumps(buses, indent=2, ensure_ascii=False)
+        return f"No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
 

@@ -154,7 +154,8 @@ def test_10_short_naptan_literal_resolution(writer, store):
 # --- Test 11: empty stop sets return empty, not SQL errors
 def test_11_empty_set_guards(store):
     assert store.find_routes_between(set(), {"010A"}) == []
-    assert store._journeys_touching(set()) == []
+    assert store.plan_one_change(set(), {"010A"}, "mon", "10:00:00") == []
+    assert store.plan_one_change({"010A"}, set(), "mon", "10:00:00") == []
 
 
 # --- Test 18: negative minutes/seconds are rejected
@@ -192,34 +193,6 @@ def test_12_journey_stops_populated_and_purged(writer, store):
     assert n == 0, "journey_stops not purged with dataset"
 
 
-# --- Test 13: _journeys_touching uses the index (same results, no json_each)
-def test_13_journeys_touching_uses_index(writer, store):
-    writer.add_journey("Op", "13", "outbound", "J13", {"mon"},
-                       [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
-                        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
-    writer.commit()
-    plan = writer.conn.execute(
-        "EXPLAIN QUERY PLAN SELECT DISTINCT journey_id FROM journey_stops WHERE naptan=?"
-        , ("010B",)).fetchall()
-    assert any("INDEX" in str(row) for row in plan), f"no index used: {plan}"
-    ids = store._journeys_touching({"010B"})
-    assert ids, "indexed lookup returned nothing"
-    assert store._journeys_touching({"010B"}) == store._journeys_touching({"010B"}), "nondeterministic"
-
-
-# --- Test 14: _fetch_journeys batches (results match per-id fetch)
-def test_14_fetch_journeys_batches(writer, store):
-    writer.add_journey("Op", "14", "outbound", "J14", {"mon"},
-                       [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
-                        {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
-    writer.commit()
-    ids = store._journeys_touching({"010A"})
-    batch = store._fetch_journeys(ids)
-    assert set(batch) == set(ids), "batch fetch missing ids"
-    for jid in ids:
-        assert batch[jid]["journey_code"] == store._fetch_journey(jid)["journey_code"]
-
-
 # --- Test 15: _candidate_journeys yields the same journeys both tools use
 def test_15_candidate_journeys_shared_helper(writer, store):
     writer.add_journey("Op", "15", "outbound", "J15", {"mon"},
@@ -227,7 +200,8 @@ def test_15_candidate_journeys_shared_helper(writer, store):
                         {"naptan": "15B", "arrival": "09:10:00", "departure": None}], 99)
     writer.commit()
     cands = list(store._candidate_journeys({"15A"}, {"15B"}, "mon", "09:30:00"))
-    assert len(cands) == 1 and cands[0][0]["journey_code"] == "J15"
+    assert len(cands) == 1 and cands[0].code == "J15"
+    assert (cands[0].naptan_a, cands[0].naptan_b) == ("15A", "15B")
     assert list(store._candidate_journeys({"15A"}, {"15B"}, "tue", "09:30:00")) == []
 
 
@@ -260,22 +234,6 @@ def test_21_ensure_schema_backfills_journey_stops():
     n = w2.conn.execute(
         "SELECT COUNT(*) FROM journey_stops WHERE journey_id=1").fetchone()[0]
     assert n == 2, f"backfill missing: {n}"
-
-
-# --- Test 22: _fetch_journeys chunks past SQLite's variable limit
-# 501 ids cross the 500-id chunk boundary; all must come back without
-# "too many SQL variables".
-def test_22_fetch_journeys_chunks_past_variable_limit(writer, store):
-    for _i in range(501):
-        writer.add_journey("Op", "22", "outbound", f"J22_{_i}", {"mon"},
-                           [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
-                            {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 99)
-    writer.commit()
-    ids = [r[0] for r in writer.conn.execute(
-        "SELECT id FROM journeys WHERE route='22'")]
-    assert len(ids) == 501
-    batch = store._fetch_journeys(ids)
-    assert set(batch) == set(ids), "chunked fetch missing ids"
 
 
 # --- Test 16: get_route_stops direction filter matches parsed directions

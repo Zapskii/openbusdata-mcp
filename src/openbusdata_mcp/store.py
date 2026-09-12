@@ -6,8 +6,9 @@ shapes, but memory is O(query) instead of O(entire UK timetable).
 import functools
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 DB_PATH = Path.home() / ".cache" / "openbusdata" / "index.db"
 
@@ -36,6 +37,39 @@ def _fts_query(query: str) -> Optional[str]:
 # binds BOTH sets in one query, so the combined count must stay under SQLite's
 # 999-variable limit (pre-3.32). 400 + 400 = 800 < 999.
 MAX_RESOLVE = 400
+
+# Operating-day bitmask for SQL-level day filtering: mon=1 .. sun=64.
+DAY_BITS = {"mon": 1, "tue": 2, "wed": 4, "thu": 8,
+            "fri": 16, "sat": 32, "sun": 64}
+
+
+def _days_mask(days: set) -> int:
+    return sum(DAY_BITS[d] for d in days if d in DAY_BITS)
+
+
+class Candidate(NamedTuple):
+    """One A-boards-before-B journey resolved entirely in SQL."""
+    journey_id: int
+    operator: str
+    route: str
+    direction: str
+    code: str
+    naptan_a: str
+    naptan_b: str
+    depart_a: Optional[str]
+    arrive_b: Optional[str]
+    seq_a: int
+    seq_b: int
+
+
+def _parse_iso(text: Optional[str]) -> Optional[datetime]:
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_time(text: str) -> Optional[str]:
@@ -201,78 +235,41 @@ class TimetableStore:
         return matches
 
     # -- journeys -----------------------------------------------------------
-    @staticmethod
-    def _journey_row_to_out(row) -> dict:
-        jid, ds_id, op, route, direction, code, days, jraw = row
-        j = json.loads(jraw)
-        return {"id": jid, "ds_id": ds_id, "operator": op, "route": route,
-                "direction": direction, "journey_code": code,
-                "days": json.loads(days), "stops": j["stops"]}
+    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str,
+                            target_s: str):
+        """Yield Candidates for journeys boarding in A, alighting in B, running
+        on day, arriving at B by target_s — resolved in one indexed SQL query.
 
-    def _fetch_journey(self, jid: int) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT id, ds_id, op, route, direction, code, days, json "
-            "FROM journeys WHERE id=?", (jid,)).fetchone()
-        return self._journey_row_to_out(row) if row else None
-
-    def _fetch_journeys(self, jids: list[int]) -> dict[int, dict]:
-        if not jids:
-            return {}
-        out: dict[int, dict] = {}
-        # Chunk past SQLite's variable limit (999 on older builds): a busy
-        # stop can touch thousands of journeys, and one giant IN clause would
-        # fail with "too many SQL variables".
-        for i in range(0, len(jids), 500):
-            chunk = jids[i:i + 500]
-            marks = ",".join("?" * len(chunk))
-            rows = self.conn.execute(
-                f"SELECT id, ds_id, op, route, direction, code, days, json "
-                f"FROM journeys WHERE id IN ({marks})", chunk).fetchall()
-            out.update({r[0]: self._journey_row_to_out(r) for r in rows})
-        return out
-
-    def _journeys_touching(self, naptans: set) -> list[int]:
-        """Journey ids whose stop list contains ANY of naptans (indexed)."""
-        if not naptans:
-            return []
-        marks = ",".join("?" * len(naptans))
-        rows = self.conn.execute(
-            f"SELECT DISTINCT journey_id FROM journey_stops WHERE naptan IN ({marks})",
-            list(naptans)).fetchall()
-        return [r[0] for r in rows]
-
-    def _journeys_departing(self, naptan: str, after: str) -> list[int]:
-        """Journey ids that depart `naptan` at/after `after` (indexed range seek)."""
-        rows = self.conn.execute(
-            "SELECT DISTINCT journey_id FROM journey_stop_times "
-            "WHERE naptan=? AND dep>=? ORDER BY journey_id", (naptan, after)).fetchall()
-        return [r[0] for r in rows]
-
-    def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str, target_s: str):
-        """Yield (journey, idx_a, idx_b) for journeys boarding in A, alighting in B,
-        running on day, arriving at B by target_s.
-
-        Stop matching uses FIRST occurrence of a naptan in the stop list
-        (next(...)). This is deliberate: plan_direct historically matched the
-        first occurrence, and the shared helper unifies both tools on it. It
-        only differs from last-occurrence for loop routes whose stop list
-        repeats a naptan from A or B — an accepted edge case.
-
-        Candidates are narrowed to journeys touching BOTH stop sets before any
-        JSON is fetched: journeys touching B but not A (or vice versa) can never
-        yield a plan, and fetching them dominates cost when B resolves to a
-        busy/fuzzy set (measured 198ms -> 71ms on a 6,720-journey driving set)."""
-        both = set(self._journeys_touching(naptans_a)) & set(self._journeys_touching(naptans_b))
-        for jid, j in self._fetch_journeys(sorted(both)).items():
-            if day not in j["days"]:
-                continue
-            idx_a = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_a), None)
-            idx_b = next((i for i, s in enumerate(j["stops"]) if s["naptan"] in naptans_b), None)
-            if idx_a is None or idx_b is None or idx_a >= idx_b:
-                continue
-            arr_b = j["stops"][idx_b].get("arrival")
-            if arr_b and arr_b[:8] <= target_s:
-                yield j, idx_a, idx_b
+        First-occurrence semantics preserved: MIN(seq) per journey reproduces
+        the previous Python next() scan. First-occurrence of a naptan in a
+        loop route's stop list differs from last-occurrence only for loop
+        routes repeating a naptan from A or B — an accepted edge case.
+        Variable budget: <= 400 + 400 + 2 = 802 < 999 (see MAX_RESOLVE)."""
+        if not naptans_a or not naptans_b:
+            return
+        a_marks = ",".join("?" * len(naptans_a))
+        b_marks = ",".join("?" * len(naptans_b))
+        rows = self.conn.execute(f"""
+            SELECT j.id, j.op, j.route, j.direction, j.code,
+                   sa.naptan, sb.naptan, sa.dep, sb.arr, aa.seq, bb.seq
+            FROM journeys j
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({a_marks}) GROUP BY journey_id) aa
+              ON aa.journey_id = j.id
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({b_marks}) GROUP BY journey_id) bb
+              ON bb.journey_id = j.id
+            JOIN journey_stop_times sa ON sa.journey_id = j.id AND sa.seq = aa.seq
+            JOIN journey_stop_times sb ON sb.journey_id = j.id AND sb.seq = bb.seq
+            WHERE j.days_mask & ? != 0
+              AND aa.seq < bb.seq
+              AND sb.arr IS NOT NULL AND sb.arr <= ?
+        """, list(naptans_a) + list(naptans_b)
+             + [DAY_BITS.get(day, 0), target_s]).fetchall()
+        for (jid, op, route, direction, code, na, nb, dep_a, arr_b,
+             seq_a, seq_b) in rows:
+            yield Candidate(jid, op, route, direction, code, na, nb,
+                            dep_a, arr_b, seq_a, seq_b)
 
     def _data_key(self) -> tuple:
         """Dataset state plan results depend on; changes after any load."""
@@ -290,18 +287,16 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _find_buses_cached(self, key: tuple, a: frozenset, b: frozenset,
                            day: str, target_s: str) -> list[dict]:
-        a, b = set(a), set(b)
-        out = []
-        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
-            names = self.stop_names_bulk(
-                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-            out.append({
-                "operator": j["operator"], "route": j["route"],
-                "direction": j["direction"], "journey_code": j["journey_code"],
-                "board_at": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                "depart": j["stops"][idx_a].get("departure"),
-                "alight_at": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                "arrive": j["stops"][idx_b].get("arrival")})
+        cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
+        names = self.stop_names_bulk(
+            [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
+        out = [{
+            "operator": c.operator, "route": c.route,
+            "direction": c.direction, "journey_code": c.code,
+            "board_at": names.get(c.naptan_a, "Unknown"),
+            "depart": c.depart_a,
+            "alight_at": names.get(c.naptan_b, "Unknown"),
+            "arrive": c.arrive_b} for c in cands]
         out.sort(key=lambda x: x["arrive"] or "")
         return out[:20]
 
@@ -313,21 +308,18 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _plan_direct_cached(self, key: tuple, a: frozenset, b: frozenset,
                             day: str, target_s: str) -> list[dict]:
-        a, b = set(a), set(b)
-        plans = []
-        for j, idx_a, idx_b in self._candidate_journeys(a, b, day, target_s):
-            names = self.stop_names_bulk(
-                [j["stops"][idx_a]["naptan"], j["stops"][idx_b]["naptan"]])
-            plans.append({
-                "type": "direct",
-                "legs": [{
-                    "operator": j["operator"], "route": j["route"],
-                    "board": names.get(j["stops"][idx_a]["naptan"], "Unknown"),
-                    "depart": j["stops"][idx_a].get("departure"),
-                    "alight": names.get(j["stops"][idx_b]["naptan"], "Unknown"),
-                    "arrive": j["stops"][idx_b].get("arrival")}],
-                "total_changes": 0})
-        return plans
+        cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
+        names = self.stop_names_bulk(
+            [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
+        return [{
+            "type": "direct",
+            "legs": [{
+                "operator": c.operator, "route": c.route,
+                "board": names.get(c.naptan_a, "Unknown"),
+                "depart": c.depart_a,
+                "alight": names.get(c.naptan_b, "Unknown"),
+                "arrive": c.arrive_b}],
+            "total_changes": 0} for c in cands]
 
     def plan_one_change(self, naptans_a: set, naptans_b: set, day: str,
                         target_s: str) -> list[dict]:
@@ -337,53 +329,69 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _plan_one_change_cached(self, key: tuple, a: frozenset, b: frozenset,
                                 day: str, target_s: str) -> list[dict]:
+        """One-change plans in a single SQL self-join over journey_stop_times.
+
+        Semantics preserved from the Python-loop version:
+          - leg1 boards at the FIRST occurrence of any A stop (MIN(seq)),
+            alights at any later stop with a published arrival;
+          - leg2 boards at the FIRST occurrence of that same mid stop,
+            departs at/after leg1's mid arrival (dep column is already
+            COALESCE(departure, arrival)), and alights at the FIRST
+            occurrence of any B stop, arriving by target_s;
+          - j2 != j1; both journeys run on `day` (days_mask).
+        Variable budget: <= 400 + 400 + 3 = 803 < 999. ORDER BY sb.arr +
+        LIMIT 2000 bounds the worst-case cross join deterministically (the
+        earliest-arriving 2000 survive; sb.arr is never NULL on surviving
+        rows); the tool-level dedup + top-15 cap follows."""
         a, b = set(a), set(b)
+        if not a or not b:
+            return []
+        a_marks = ",".join("?" * len(a))
+        b_marks = ",".join("?" * len(b))
+        mask = DAY_BITS.get(day, 0)  # malformed day -> no plans (matches _candidate_journeys)
+        rows = self.conn.execute(f"""
+            SELECT j1.id, j1.op, j1.route, j1.direction, j1.code,
+                   sa.naptan, sm.naptan, sa.dep, sm.arr,
+                   j2.id, j2.op, j2.route, j2.direction, j2.code,
+                   sm2.dep, sb.naptan, sb.arr
+            FROM journeys j1
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({a_marks}) GROUP BY journey_id) aa
+              ON aa.journey_id = j1.id
+            JOIN journey_stop_times sa ON sa.journey_id = j1.id AND sa.seq = aa.seq
+            JOIN journey_stop_times sm ON sm.journey_id = j1.id
+              AND sm.seq > aa.seq AND sm.arr IS NOT NULL
+            JOIN journeys j2 ON j2.id != j1.id AND j2.days_mask & ? != 0
+            JOIN journey_stop_times sm2 ON sm2.journey_id = j2.id
+              AND sm2.naptan = sm.naptan AND sm2.dep >= sm.arr
+              AND sm2.seq = (SELECT MIN(seq) FROM journey_stop_times
+                             WHERE journey_id = j2.id AND naptan = sm.naptan)
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({b_marks}) GROUP BY journey_id) bb
+              ON bb.journey_id = j2.id
+            JOIN journey_stop_times sb ON sb.journey_id = j2.id AND sb.seq = bb.seq
+            WHERE j1.days_mask & ? != 0
+              AND sa.dep IS NOT NULL
+              AND sm2.seq < bb.seq
+              AND sb.arr IS NOT NULL AND sb.arr <= ?
+            ORDER BY sb.arr
+            LIMIT 2000
+        """, list(a) + [mask] + list(b) + [mask, target_s]).fetchall()
+        naptans = {r[5] for r in rows} | {r[6] for r in rows} | {r[15] for r in rows}
+        names = self.stop_names_bulk(list(naptans))
         plans = []
-        for jid1, j1 in self._fetch_journeys(self._journeys_touching(a)).items():
-            if day not in j1["days"]:
-                continue
-            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in a), None)
-            if idx_a1 is None:
-                continue
-            arr_a1 = j1["stops"][idx_a1].get("arrival") or j1["stops"][idx_a1].get("departure")
-            if arr_a1 is None:
-                continue
-            for mid_idx in range(idx_a1 + 1, len(j1["stops"])):
-                mid = j1["stops"][mid_idx]
-                mid_arr = mid.get("arrival")
-                if mid_arr is None:
-                    continue
-                for jid2, j2 in self._fetch_journeys(
-                        self._journeys_departing(mid["naptan"], mid_arr[:8])).items():
-                    if j2["id"] == j1["id"]:
-                        continue
-                    if day not in j2["days"]:
-                        continue
-                    idx_mid2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] == mid["naptan"]), None)
-                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in b), None)
-                    if idx_mid2 is None or idx_b2 is None or idx_mid2 >= idx_b2:
-                        continue
-                    dep2 = j2["stops"][idx_mid2].get("departure") or j2["stops"][idx_mid2].get("arrival")
-                    arr2 = j2["stops"][idx_b2].get("arrival")
-                    if dep2 is None or arr2 is None or dep2 < mid_arr or arr2 > target_s:
-                        continue
-                    names = self.stop_names_bulk([
-                        j1["stops"][idx_a1]["naptan"], mid["naptan"],
-                        j2["stops"][idx_b2]["naptan"]])
-                    plans.append({
-                        "type": "change",
-                        "legs": [
-                            {"operator": j1["operator"], "route": j1["route"],
-                             "board": names.get(j1["stops"][idx_a1]["naptan"], "Unknown"),
-                             "depart": j1["stops"][idx_a1].get("departure"),
-                             "alight": names.get(mid["naptan"], "Unknown"),
-                             "arrive": mid_arr},
-                            {"operator": j2["operator"], "route": j2["route"],
-                             "board": names.get(mid["naptan"], "Unknown"),
-                             "depart": dep2,
-                             "alight": names.get(j2["stops"][idx_b2]["naptan"], "Unknown"),
-                             "arrive": arr2}],
-                        "total_changes": 1})
+        for (jid1, op1, route1, dir1, code1, na, mid, dep_a, mid_arr,
+             jid2, op2, route2, dir2, code2, dep2, nb, arr_b) in rows:
+            plans.append({
+                "type": "change",
+                "legs": [
+                    {"operator": op1, "route": route1,
+                     "board": names.get(na, "Unknown"), "depart": dep_a,
+                     "alight": names.get(mid, "Unknown"), "arrive": mid_arr},
+                    {"operator": op2, "route": route2,
+                     "board": names.get(mid, "Unknown"), "depart": dep2,
+                     "alight": names.get(nb, "Unknown"), "arrive": arr_b}],
+                "total_changes": 1})
         return plans
 
     # -- provenance / maintenance (used by delta loader) --------------------
@@ -443,7 +451,8 @@ class TimetableWriter:
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
-        CREATE TABLE IF NOT EXISTS journey_stop_times (naptan TEXT, journey_id INT, dep TEXT);
+        CREATE TABLE IF NOT EXISTS journey_stop_times (
+            journey_id INT, seq INT, naptan TEXT, dep TEXT, arr TEXT);
         CREATE INDEX IF NOT EXISTS jst_n ON journey_stop_times(naptan, dep);
         CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
             name, naptan UNINDEXED, tokenize='unicode61');
@@ -502,19 +511,61 @@ class TimetableWriter:
                 "INSERT INTO routes_fts(rowid, num, op, key) "
                 "SELECT rowid, num, op, key FROM routes")
             self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('routes_fts_backfilled', '1')")
-        # One-time backfill: journey_stop_times is populated by add_journey, so
-        # a DB upgraded in place (journeys already present) would have an empty
-        # departure index. Backfill from the stored stops JSON once, keyed on a
-        # meta flag so it never re-runs. dep follows COALESCE(departure, arrival)
-        # to match add_journey's write side.
-        if not self.conn.execute(
-                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'").fetchone():
+        # journey_stop_times v2 (seq + arr): populated by add_journey; a DB
+        # upgraded in place (pre-v2 rows, or an empty table with journeys
+        # present) is rebuilt from the stored stops JSON once. dep follows
+        # COALESCE(departure, arrival) to match add_journey's write side;
+        # arr is the raw arrival (NULL where the timetable publishes none).
+        # The gate is COLUMN-driven, not flag-driven: a legacy DB already
+        # carries the backfill flag ('1', set by the v1 backfill), so an
+        # existing flag must never skip a missing-column rebuild.
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(journey_stop_times)")}
+        if ("seq" not in cols or "arr" not in cols or not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'"
+            ).fetchone()):
+            for c in ("seq", "arr"):
+                if c not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE journey_stop_times ADD COLUMN {c} INT"
+                        if c == "seq" else
+                        f"ALTER TABLE journey_stop_times ADD COLUMN {c} TEXT")
+            self.conn.execute("DELETE FROM journey_stop_times")
             self.conn.execute(
-                "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
-                "SELECT json_extract(value, '$.naptan'), j.id, "
-                "       COALESCE(json_extract(value, '$.departure'), json_extract(value, '$.arrival')) "
-                "FROM journeys j, json_each(j.json, '$.stops')")
-            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('journey_stop_times_backfilled', '1')")
+                "INSERT INTO journey_stop_times (journey_id, seq, naptan, dep, arr) "
+                "SELECT j.id, e.key, "
+                "       json_extract(e.value, '$.naptan'), "
+                "       COALESCE(json_extract(e.value, '$.departure'),"
+                "                json_extract(e.value, '$.arrival')), "
+                "       json_extract(e.value, '$.arrival') "
+                "FROM journeys j, json_each(j.json, '$.stops') e")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES"
+                " ('journey_stop_times_backfilled', '2')")
+        # jst_j indexes (journey_id, seq): created here — AFTER the ALTERs
+        # above have guaranteed the seq column exists, because a legacy v1
+        # table (naptan/journey_id/dep only) would make an in-script
+        # CREATE INDEX fail with "no such column: seq" at startup.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS jst_j ON journey_stop_times(journey_id, seq)")
+        # journeys.days_mask: SQL-level day filter (7-bit, mon=1 .. sun=64).
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(journeys)")}
+        if "days_mask" not in cols:
+            self.conn.execute(
+                "ALTER TABLE journeys ADD COLUMN days_mask INT DEFAULT 0")
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='days_mask_backfilled'").fetchone():
+            for jid, days_json in self.conn.execute(
+                    "SELECT id, days FROM journeys WHERE days_mask=0").fetchall():
+                try:
+                    day_set = set(json.loads(days_json or "[]"))
+                except (ValueError, TypeError):
+                    day_set = set()
+                self.conn.execute(
+                    "UPDATE journeys SET days_mask=? WHERE id=?",
+                    (_days_mask(day_set), jid))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('days_mask_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
@@ -616,16 +667,19 @@ class TimetableWriter:
              "journey_code": code, "dataset_id": ds_id,
              "days": sorted(days), "stops": [dict(st) for st in stops]}
         cur = self.conn.execute(
-            "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (ds_id, op, num, direction, code, json.dumps(sorted(days)), json.dumps(j)))
+            "INSERT INTO journeys (ds_id, op, route, direction, code, days, days_mask, json) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ds_id, op, num, direction, code, json.dumps(sorted(days)),
+             _days_mask(days), json.dumps(j)))
         self.conn.executemany(
             "INSERT INTO journey_stops VALUES (?,?)",
             [(s["naptan"], cur.lastrowid) for s in stops])
         self.conn.executemany(
-            "INSERT INTO journey_stop_times VALUES (?,?,?)",
-            [(s["naptan"], cur.lastrowid, s.get("departure") or s.get("arrival"))
-             for s in stops])
+            "INSERT INTO journey_stop_times (naptan, journey_id, seq, dep, arr) "
+            "VALUES (?,?,?,?,?)",
+            [(s["naptan"], cur.lastrowid, i,
+              s.get("departure") or s.get("arrival"), s.get("arrival"))
+             for i, s in enumerate(stops)])
 
     def commit(self):
         self.conn.commit()
@@ -635,6 +689,27 @@ class TimetableWriter:
         self.conn.execute(
             "INSERT OR REPLACE INTO loaded_datasets VALUES (?,?,?)",
             (ds_id, modified, operator))
+
+    def last_full_sweep(self) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT v FROM meta WHERE k='last_full_sweep'").fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_last_full_sweep(self, iso: str):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('last_full_sweep', ?)", (iso,))
+
+    def full_sweep_due(self, max_age_days: int = 7) -> bool:
+        """True when a full (unfiltered) catalogue sweep is overdue.
+
+        Withdrawal purges need the full catalogue, so they run on full sweeps
+        only; otherwise a filtered delta sweep is enough until this watermark
+        ages out (default 7 days)."""
+        iso = self.last_full_sweep()
+        ts = _parse_iso(iso) if iso else None
+        if ts is None:
+            return True
+        return (datetime.now(timezone.utc) - ts).total_seconds() > max_age_days * 86400
 
     def set_last_refresh(self, iso: str):
         self.conn.execute(
