@@ -32,7 +32,7 @@ async def main():
             await session.initialize()
             tools = await session.list_tools()
             names = [t.name for t in tools.tools]
-            assert len(names) == 17, f"expected 17 tools, got {len(names)}"
+            assert len(names) == 22, f"expected 22 tools, got {len(names)}"
             print(f"TOOLS-OK: 17 registered", flush=True)
             t0 = time.time()
             res = await session.call_tool("search_stops", {"query": "Oaks Cross"})
