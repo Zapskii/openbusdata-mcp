@@ -1209,7 +1209,11 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str,
             buses.append({**v, "location": {"lat": "N/A" if lat is None else lat,
                                             "lon": "N/A" if lon is None else lon}})
         if buses:
-            return json.dumps(buses, indent=2, ensure_ascii=False)
+            # R29: the release-wide invariant is that EVERY return carrying
+            # remote-derived content passes through _redact -- success returns
+            # included, because a feed can echo the request URL (key and all)
+            # back into a field the parser hands to the caller.
+            return _redact(json.dumps(buses, indent=2, ensure_ascii=False))
         return "No live buses found."
     except Exception as e:
         return _redact(f"Error: {type(e).__name__}: {str(e)}")
@@ -1354,8 +1358,9 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
         note = f" ({skipped} vehicles unmatched to the route)" if skipped else ""
         return (f"No live buses matched to route {operator_ref}|{line_ref} "
                 f"near the target stop{note}.")
-    return json.dumps({"target_stop": target["name"], "vehicles": results},
-                      indent=2, ensure_ascii=False)
+    # R29: remote-derived content on the way out, so it goes through _redact.
+    return _redact(json.dumps({"target_stop": target["name"], "vehicles": results},
+                              indent=2, ensure_ascii=False))
 
 
 @mcp.tool()
@@ -1400,7 +1405,9 @@ async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
                     f"{dataset_id}: the downloaded document contained no "
                     f"recognised NeTEx price elements.")
         return f"No fare prices match the given zones ({len(prices)} prices extracted)."
-    return json.dumps(filtered, indent=2, ensure_ascii=False)
+    # R29: the downloaded NeTEx is remote-derived, so the success return is
+    # redacted like the error return above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
