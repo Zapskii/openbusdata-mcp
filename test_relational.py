@@ -1,5 +1,4 @@
 # test_relational.py
-import openbusdata_mcp.store as store_mod
 from openbusdata_mcp.store import DAY_BITS, _days_mask
 
 
@@ -13,7 +12,7 @@ def test_days_mask_bit_values():
     assert _days_mask({"bogus"}) == 0, "unknown day names contribute nothing"
 
 
-def test_add_journey_writes_days_mask(writer, store):
+def test_add_journey_writes_days_mask(writer):
     writer.add_journey("Op", "4", "outbound", "J4", {"sat", "sun"},
                        [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
                         {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 5)
