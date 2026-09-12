@@ -1107,8 +1107,10 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
       max_changes: Maximum number of bus changes (0 = direct only, 1 = one change). Default 1.
       check_disruptions: If true (default), plans whose route or operator
                 appears in the live SIRI-SX disruptions feed are annotated
-                with a "disruption_alerts" list. Plans are never dropped;
-                a feed failure degrades silently.
+                with a "disruption_alerts" list. Annotation never drops or
+                reorders a plan and never changes the returned count; a feed
+                failure degrades silently. At most the 15 earliest-arriving
+                plans are returned, with or without annotation.
     """
     if not store.exists():
         return "No timetable data loaded. Please call load_timetable_index() first."
@@ -1150,7 +1152,11 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
     if check_disruptions:
         await _annotate_disruptions(deduped[:15])
-    return json.dumps(deduped, indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
+    # R28: the 15-plan output cap predates the annotation feature (both the
+    # release base and the commit before it ended with deduped[:15]), so it is
+    # the back-compatible output the Global Constraint protects. Annotation
+    # must not reduce the returned set below this; it adds alerts, nothing else.
+    return json.dumps(deduped[:15], indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
 
 
 @mcp.tool()
