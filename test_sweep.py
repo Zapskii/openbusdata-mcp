@@ -20,6 +20,15 @@ def _sweep_client(captured):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
+def _check(condition, message: str) -> None:
+    """Assert without rendering the operand: these are request URLs carrying
+    ?api_key=..., and pytest renders an assert statement's operands on failure.
+    Call sites pass a thunk and a message naming what was expected. (Ruling R34.)
+    """
+    if not condition():
+        raise AssertionError(message)
+
+
 def test_sweep_catalogue_passes_modified_date():
     captured = []
     async def _run():
@@ -28,7 +37,8 @@ def test_sweep_catalogue_passes_modified_date():
                 client, modified_since="2026-09-01T00:00:00+00:00")
     catalog, complete = asyncio.run(_run())
     assert complete and catalog == {}
-    assert any("modifiedDate=2026-09-01" in u for u in captured), captured
+    _check(lambda: any("modifiedDate=2026-09-01" in u for u in captured),
+           "the incremental sweep must pass the modified-date filter")
 
 
 def test_sweep_catalogue_without_filter_has_no_modified_date():
@@ -37,7 +47,8 @@ def test_sweep_catalogue_without_filter_has_no_modified_date():
         async with _sweep_client(captured) as client:
             return await server._sweep_catalogue(client)
     asyncio.run(_run())
-    assert captured and all("modifiedDate" not in u for u in captured), captured
+    _check(lambda: bool(captured) and all("modifiedDate" not in u for u in captured),
+           "an unfiltered full sweep must not send modifiedDate")
 
 
 def test_full_sweep_due_default_and_watermark(writer):

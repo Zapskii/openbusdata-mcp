@@ -85,7 +85,10 @@ def test_get_disruptions_pins_request_path_and_unparseable_body():
     finally:
         _reset()
     assert out == "Disruptions feed unavailable (fetch or parse failed).", out
-    assert len(seen) == 1, seen
+    # Inline raise, not assert: the operand is a request URL carrying
+    # ?api_key=..., and pytest renders assert operands on failure. (Ruling R34.)
+    if len(seen) != 1:
+        raise AssertionError(f"expected exactly one feed request, got {len(seen)}")
     path = seen[0].split("?")[0]
     assert path == f"{server.BASE_URL}/api/v1/siri-sx/", path
     assert "cancellations" not in path, path
@@ -93,7 +96,9 @@ def test_get_disruptions_pins_request_path_and_unparseable_body():
 
 def test_get_cancellations_filters():
     def handler(request):
-        assert "/siri-sx/cancellations/" in str(request.url)
+        # Inline raise, not assert: the operand is the request URL, key included.
+        if "/siri-sx/cancellations/" not in str(request.url):
+            raise AssertionError("cancellations tool must hit the cancellations path")
         return httpx.Response(200, content=b'''<?xml version="1.0"?>
 <Siri xmlns="http://www.siri.org.uk/siri">
  <EstimatedVehicleJourneyCancellations>

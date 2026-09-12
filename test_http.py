@@ -85,6 +85,18 @@ def test_live_buses_ttl_cache_skips_second_request():
         server._LIVE_CACHE = server.TTLCache(20.0)
 
 
+def _assert_url_has(url, param: str) -> None:
+    """Check a query parameter is present without ever rendering the URL.
+
+    The captured URL carries ?api_key=..., and pytest renders an assert
+    statement's operands on failure -- with a real key in the environment that
+    would print the credential into the test output. Inline raise instead.
+    (Ruling R34.)
+    """
+    if param not in url:
+        raise AssertionError(f"request URL is missing {param}")
+
+
 def test_live_buses_passes_server_side_filters():
     captured = {}
 
@@ -98,12 +110,12 @@ def test_live_buses_passes_server_side_filters():
         out = asyncio.run(server.get_live_buses_on_route(
             "OPX", "12", origin_ref="490A", destination_ref="490B",
             vehicle_ref="V1", bounding_box="-0.2,51.4,0.0,51.6"))
-        assert "originRef=490A" in captured["url"]
-        assert "destinationRef=490B" in captured["url"]
-        assert "vehicleRef=V1" in captured["url"]
-        assert "boundingBox=-0.2%2C51.4%2C0.0%2C51.6" in captured["url"]
-        assert "operatorRef=OPX" in captured["url"]
-        assert "lineRef=12" in captured["url"]
+        _assert_url_has(captured["url"], "originRef=490A")
+        _assert_url_has(captured["url"], "destinationRef=490B")
+        _assert_url_has(captured["url"], "vehicleRef=V1")
+        _assert_url_has(captured["url"], "boundingBox=-0.2%2C51.4%2C0.0%2C51.6")
+        _assert_url_has(captured["url"], "operatorRef=OPX")
+        _assert_url_has(captured["url"], "lineRef=12")
         assert "No live buses found." in out
     finally:
         server.set_http_client(None)
