@@ -53,12 +53,14 @@ from defusedxml import ElementTree as SafeET
 #   <xsd:element name="FarePrice" abstract="true" substitutionGroup="FarePrice_"/>
 #
 # quoted verbatim from netex_part_3/part3_fares/netex_farePrice_version.xsd,
-# checked at the v1.2 tag and again at v2.0.0 of the CEN NeTEx schema (the
-# declaration is identical in both, so this is a stable design property rather
-# than a recent change). Abstract elements never appear in an instance
-# document, so matching on "FarePrice" can only ever silently miss — the
-# concrete substitutions below are what real documents actually carry. A later
-# reader "simplifying" this back to the abstract head would re-break extraction.
+# checked at the v1.2 tag and again at v2.0.0 of the CEN NeTEx schema. The
+# abstract="true" is identical at both versions — v2.0.0 changes only the
+# substitutionGroup value (FarePrice_ at v1.2, FarePrice_Dummy at v2.0.0) — so
+# the abstractness is a stable design property rather than a recent change.
+# Abstract elements never appear in an instance document, so matching on
+# "FarePrice" can only ever silently miss — the concrete substitutions below
+# are what real documents actually carry. A later reader "simplifying" this
+# back to the abstract head would re-break extraction.
 PRICE_TAGS = {"FareProductPrice", "DistanceMatrixElementPrice",
               "CappingRulePrice", "GeographicalIntervalPrice"}
 AMOUNT_TAGS = {"Amount", "PriceAmount", "amount"}

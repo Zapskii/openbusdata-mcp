@@ -206,10 +206,14 @@ async def get_disruptions(operator: Optional[str] = None, line: Optional[str] = 
     filtered (client-side — the endpoint itself accepts no query parameters).
 
     Parameters:
-      operator: Optional operator NOC code to filter by (substring of the
-                message's operator refs).
-      line: Optional line/route number to filter by.
-      stop: Optional NaPTAN stop ref to filter by.
+      operator: Optional operator NOC code. Matched by EXACT membership of the
+                message's operator refs — not a substring, so "OPX" matches a
+                message carrying <OperatorRef>OPX</OperatorRef> and nothing
+                else does.
+      line: Optional line/route number, matched by exact membership of the
+            message's line refs.
+      stop: Optional NaPTAN stop ref, matched by exact membership of the
+            message's stop point refs.
     """
     messages = await _fetch_sx("disruptions")
     if messages is None:
@@ -1160,6 +1164,10 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
             # lru-cached dicts, and _annotate_disruptions mutates what it is
             # given — annotating the originals would leak alerts into later
             # check_disruptions=False calls on the same cache key.
+            # Shallow is sufficient and deliberate: the only write is a
+            # top-level key ("disruption_alerts") and "legs" is only ever read,
+            # so nothing nested is shared mutably. A write INTO a nested value
+            # would need a deepcopy here, or it re-contaminates the cache.
             deduped.append(dict(plan))
 
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
