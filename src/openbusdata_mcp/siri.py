@@ -7,6 +7,12 @@ Recorded live structures (update the probes when the live steps run):
   /api/v1/datafeed/ (SIRI-VM): Siri > VehicleActivity >
     MonitoredVehicleJourney > VehicleRef, DirectionRef, OriginName,
     DestinationName, VehicleLocation > Latitude/Longitude, Bearing.
+  /api/v1/siri-sx/ (SIRI-SX disruptions): live probe pending — no
+    OPENBUS_API_KEY was available in the environment when this was written,
+    so the element paths below are the synthetic-fixture assumptions, not a
+    recorded live structure. Refresh this note the first time the probe runs.
+  /api/v1/siri-sx/cancellations/ (SIRI-SX cancellations): live probe
+    pending (same reason as above).
 
 Element paths are kept at the top of each parser so a live-structure change
 is a one-place fix. All parsing goes through defusedxml (safe against
@@ -30,6 +36,17 @@ def _refs(el, tag: str) -> list:
     """All descendant texts of a ref tag, deduplicated and sorted."""
     return sorted({n.text.strip() for n in el.iter(f"{{{SIRI_NS}}}{tag}")
                    if n.text and n.text.strip()})
+
+
+def _desc_text(el, tag: str, default=None):
+    """Descendant-search text lookup (first match), namespace-qualified.
+
+    BODS nests some fields one level down (e.g. <Severity> inside <Content>),
+    where the direct-child _text helper would miss them."""
+    found = el.find(f".//{{{SIRI_NS}}}{tag}")
+    if found is not None and found.text is not None:
+        return found.text
+    return default
 
 
 def parse_siri_vm(content: bytes) -> list:
@@ -64,3 +81,64 @@ def parse_siri_vm(content: bytes) -> list:
             "bearing": _text(mvj, "Bearing", "N/A"),
         })
     return buses
+
+
+# --- SIRI-SX (disruptions & cancellations) --------------------------------
+
+def parse_siri_sx(content: bytes) -> list:
+    """Flatten a SIRI-SX document into one dict per InfoMessage:
+    recorded_at, valid_until, channel, severity, operators, lines, stops,
+    summary. All refs use descendant search; a container InfoMessage that
+    wraps a nested one is skipped so its content is not reported twice."""
+    root = SafeET.fromstring(content)
+    messages = []
+    for info in root.iter(f"{{{SIRI_NS}}}InfoMessage"):
+        if info.find(f".//{{{SIRI_NS}}}InfoMessage") is not None:
+            continue  # container message; the nested leaf messages follow
+        summary = None
+        for tag in ("Summary", "Description"):
+            found = info.find(f".//{{{SIRI_NS}}}{tag}")
+            if found is not None and found.text:
+                summary = " ".join(found.text.split())
+                break
+        messages.append({
+            "recorded_at": _text(info, "RecordedAtTime"),
+            "valid_until": _text(info, "ValidUntilTime"),
+            "channel": _text(info, "InfoChannelRef"),
+            "severity": _desc_text(info, "Severity"),
+            "operators": _refs(info, "OperatorRef"),
+            "lines": _refs(info, "LineRef"),
+            "stops": _refs(info, "StopPointRef"),
+            "summary": summary,
+        })
+    return messages
+
+
+CANCELLATION_TAGS = {"VehicleJourneyCancellation",
+                     "EstimatedVehicleJourneyCancellations"}
+
+
+def parse_cancellations(content: bytes) -> list:
+    """Flatten the /siri-sx/cancellations document into one dict per
+    cancelled-vehicle entry. If the live probe (Step 1) shows the feed
+    carries InfoMessage-shaped records instead, replace this traversal with
+    parse_siri_sx and map the fields — the tool layer is unaffected."""
+    root = SafeET.fromstring(content)
+    out = []
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] not in CANCELLATION_TAGS:
+            continue
+        fjv = el.find(f".//{{{SIRI_NS}}}FramedVehicleJourneyRef")
+        vjr = None
+        if fjv is not None:
+            vjr = _text(fjv, "VehicleJourneyRef") or _text(fjv, "DatedVehicleJourneyRef")
+        out.append({
+            "recorded_at": _text(el, "RecordedAtTime"),
+            "vehicle_journey_ref": vjr or _text(el, "VehicleJourneyRef"),
+            "operator": _text(el, "OperatorRef"),
+            "line": _text(el, "LineRef"),
+            "origin": _text(el, "OriginRef") or _text(el, "OriginName"),
+            "destination": _text(el, "DestinationRef") or _text(el, "DestinationName"),
+            "reason": _text(el, "CancellationReason") or _text(el, "Reason"),
+        })
+    return out

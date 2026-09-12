@@ -36,3 +36,86 @@ def test_parse_siri_vm_missing_location_is_none():
 
 def test_parse_siri_vm_empty_feed():
     assert siri.parse_siri_vm(b'<Siri xmlns="http://www.siri.org.uk/siri"/>') == []
+
+
+SX = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <InfoMessageDelivery>
+   <InfoMessage>
+    <RecordedAtTime>2026-09-12T10:00:00Z</RecordedAtTime>
+    <InfoChannelRef>disruptions</InfoChannelRef>
+    <ValidUntilTime>2026-09-12T18:00:00Z</ValidUntilTime>
+    <Content>
+      <OperatorRef>OPX</OperatorRef>
+      <LineRef>12</LineRef>
+      <LineRef>15</LineRef>
+      <StopPointRef>010A</StopPointRef>
+      <Severity>severe</Severity>
+      <Summary>Road closure on Bravo Road</Summary>
+    </Content>
+   </InfoMessage>
+   <InfoMessage>
+    <RecordedAtTime>2026-09-12T10:05:00Z</RecordedAtTime>
+    <ValidUntilTime>2026-09-12T18:00:00Z</ValidUntilTime>
+    <Content><LineRef>99</LineRef><Summary>Diversion</Summary></Content>
+   </InfoMessage>
+  </InfoMessageDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_parse_siri_sx_records():
+    msgs = siri.parse_siri_sx(SX)
+    assert len(msgs) == 2
+    assert msgs[0] == {
+        "recorded_at": "2026-09-12T10:00:00Z",
+        "valid_until": "2026-09-12T18:00:00Z",
+        "channel": "disruptions", "severity": "severe",
+        "operators": ["OPX"], "lines": ["12", "15"], "stops": ["010A"],
+        "summary": "Road closure on Bravo Road"}
+    assert msgs[1]["lines"] == ["99"]
+    assert msgs[1]["summary"] == "Diversion"
+
+
+NESTED_SX = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <InfoMessageDelivery>
+   <InfoMessage>
+    <InfoChannelRef>disruptions</InfoChannelRef>
+    <Content><Siri><ServiceDelivery><InfoMessageDelivery>
+      <InfoMessage><RecordedAtTime>2026-09-12T11:00:00Z</RecordedAtTime>
+        <LineRef>77</LineRef><Summary>Diversion</Summary></InfoMessage>
+    </InfoMessageDelivery></ServiceDelivery></Siri></Content>
+   </InfoMessage>
+  </InfoMessageDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_parse_siri_sx_skips_container_messages():
+    msgs = siri.parse_siri_sx(NESTED_SX)
+    assert len(msgs) == 1, "the wrapping InfoMessage must not be reported twice"
+    assert msgs[0]["lines"] == ["77"]
+
+
+CXL = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <EstimatedVehicleJourneyCancellations>
+  <RecordedAtTime>2026-09-12T10:00:00Z</RecordedAtTime>
+  <OperatorRef>OPX</OperatorRef>
+  <LineRef>12</LineRef>
+  <OriginRef>010A</OriginRef>
+  <DestinationRef>010C</DestinationRef>
+  <FramedVehicleJourneyRef><VehicleJourneyRef>J-42</VehicleJourneyRef></FramedVehicleJourneyRef>
+  <CancellationReason>breakdown</CancellationReason>
+ </EstimatedVehicleJourneyCancellations>
+</Siri>'''
+
+
+def test_parse_cancellations():
+    assert siri.parse_cancellations(CXL) == [{
+        "recorded_at": "2026-09-12T10:00:00Z",
+        "vehicle_journey_ref": "J-42", "operator": "OPX", "line": "12",
+        "origin": "010A", "destination": "010C", "reason": "breakdown"}]

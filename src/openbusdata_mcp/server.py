@@ -24,7 +24,7 @@ from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
-from .siri import parse_siri_vm
+from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
 from collections import defaultdict
 
 import httpx
@@ -112,7 +112,90 @@ async def _fetch_siri_vm(filters: dict) -> bytes:
     return resp.content
 
 
+_SX_CACHE = TTLCache(60.0)  # SIRI-SX feeds refresh on their own cadence
+
+_SX_PATHS = {"disruptions": "/api/v1/siri-sx/",
+             "cancellations": "/api/v1/siri-sx/cancellations/"}
+
+
+async def _fetch_sx(kind: str) -> Optional[list]:
+    """Cached SIRI-SX fetch. Returns None when the feed is unreachable or
+    unparseable — callers degrade (never crash) on None."""
+    cached = _SX_CACHE.get(kind)
+    if cached is not None:
+        return cached
+    url = f"{BASE_URL}{_SX_PATHS[kind]}?api_key={quote(API_KEY)}"
+    try:
+        resp = await get_http_client().get(url)
+        resp.raise_for_status()
+        parsed = (parse_siri_sx if kind == "disruptions"
+                  else parse_cancellations)(resp.content)
+    except Exception as e:
+        print(f"[siri-sx] {kind} fetch/parse failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return None
+    _SX_CACHE.put(kind, parsed)
+    return parsed
+
+
 mcp = FastMCP("openbusdata")
+
+
+# ---------------------------------------------------------------------------
+# SIRI-SX tools (disruptions & cancellations)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def get_disruptions(operator: Optional[str] = None, line: Optional[str] = None,
+                          stop: Optional[str] = None) -> str:
+    """
+    Get active SIRI-SX disruption messages as structured JSON, optionally
+    filtered (client-side — the endpoint itself accepts no query parameters).
+
+    Parameters:
+      operator: Optional operator NOC code to filter by (substring of the
+                message's operator refs).
+      line: Optional line/route number to filter by.
+      stop: Optional NaPTAN stop ref to filter by.
+    """
+    messages = await _fetch_sx("disruptions")
+    if messages is None:
+        return "Disruptions feed unavailable (fetch or parse failed)."
+
+    def keep(m):
+        if operator and operator not in m["operators"]:
+            return False
+        if line and line not in m["lines"]:
+            return False
+        if stop and stop not in m["stops"]:
+            return False
+        return True
+
+    filtered = [m for m in messages if keep(m)]
+    if not filtered:
+        return "No matching disruption messages."
+    return json.dumps(filtered, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_cancellations(operator: Optional[str] = None,
+                            line: Optional[str] = None) -> str:
+    """
+    Get published operator cancellations (SIRI-SX /cancellations) as
+    structured JSON. Filtering is client-side and exact-match.
+
+    Parameters:
+      operator: Optional operator NOC code (exact match).
+      line: Optional line/route number (exact match).
+    """
+    entries = await _fetch_sx("cancellations")
+    if entries is None:
+        return "Cancellations feed unavailable (fetch or parse failed)."
+    filtered = [e for e in entries
+                if (not operator or e["operator"] == operator)
+                and (not line or e["line"] == line)]
+    if not filtered:
+        return "No matching cancellation entries."
+    return json.dumps(filtered, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
