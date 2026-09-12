@@ -47,49 +47,6 @@ def test_27_journey_stop_times_purged_on_discard(writer, store):
     assert writer.conn.execute("SELECT COUNT(*) FROM journey_stop_times").fetchone()[0] == 0
 
 
-def test_28_journeys_departing_uses_index_and_matches_old_semantics(writer, store):
-    writer.add_journey("Op", "28", "outbound", "J28a", {"mon"}, [
-        STOP("010A", None, "09:00:00"),
-        STOP("010B", "09:10:00", "09:11:00")], 1)
-    writer.add_journey("Op", "28", "outbound", "J28b", {"mon"}, [
-        STOP("010A", None, "10:00:00"),
-        STOP("010B", "09:10:00", None)], 1)
-    writer.commit()
-    # reference: the pre-index correlated json_each query (frozen semantics)
-    ref = [r[0] for r in store.conn.execute(
-        "SELECT id FROM journeys WHERE EXISTS ("
-        "  SELECT 1 FROM json_each(journeys.json, '$.stops')"
-        "  WHERE json_extract(value,'$.naptan')=?"
-        "    AND COALESCE(json_extract(value,'$.departure'),"
-        "                 json_extract(value,'$.arrival')) >= ?"
-        ") ORDER BY id", ("010B", "09:11:00")).fetchall()]
-    real_conn = store.conn
-    captured: list[str] = []
-
-    class _SpyConn:
-        def __init__(self, real):
-            self._real = real
-
-        def execute(self, sql, *args, **kw):
-            captured.append(sql)
-            return self._real.execute(sql, *args, **kw)
-
-        def __getattr__(self, name):  # delegate everything else to the real conn
-            return getattr(self._real, name)
-
-    try:
-        store._conn = _SpyConn(real_conn)   # conn property returns the spy
-        assert store._journeys_departing("010B", "09:11:00") == ref, "parity with old semantics"
-    finally:
-        store._conn = real_conn
-    assert any("journey_stop_times" in s and "json_each" not in s for s in captured), (
-        f"_journeys_departing did not query the index table: {captured}")
-    plan = writer.conn.execute(
-        "EXPLAIN QUERY PLAN SELECT DISTINCT journey_id FROM journey_stop_times "
-        "WHERE naptan=? AND dep>=? ORDER BY journey_id", ("010B", "09:11:00")).fetchall()
-    assert any("jst_n" in str(row) for row in plan), f"index not used: {plan}"
-
-
 def _old_candidates(store, na, nb, day, target_s):
     """Pre-change implementation — frozen reference reading journeys.json."""
     import json as _json

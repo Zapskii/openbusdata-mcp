@@ -235,53 +235,6 @@ class TimetableStore:
         return matches
 
     # -- journeys -----------------------------------------------------------
-    @staticmethod
-    def _journey_row_to_out(row) -> dict:
-        jid, ds_id, op, route, direction, code, days, jraw = row
-        j = json.loads(jraw)
-        return {"id": jid, "ds_id": ds_id, "operator": op, "route": route,
-                "direction": direction, "journey_code": code,
-                "days": json.loads(days), "stops": j["stops"]}
-
-    def _fetch_journey(self, jid: int) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT id, ds_id, op, route, direction, code, days, json "
-            "FROM journeys WHERE id=?", (jid,)).fetchone()
-        return self._journey_row_to_out(row) if row else None
-
-    def _fetch_journeys(self, jids: list[int]) -> dict[int, dict]:
-        if not jids:
-            return {}
-        out: dict[int, dict] = {}
-        # Chunk past SQLite's variable limit (999 on older builds): a busy
-        # stop can touch thousands of journeys, and one giant IN clause would
-        # fail with "too many SQL variables".
-        for i in range(0, len(jids), 500):
-            chunk = jids[i:i + 500]
-            marks = ",".join("?" * len(chunk))
-            rows = self.conn.execute(
-                f"SELECT id, ds_id, op, route, direction, code, days, json "
-                f"FROM journeys WHERE id IN ({marks})", chunk).fetchall()
-            out.update({r[0]: self._journey_row_to_out(r) for r in rows})
-        return out
-
-    def _journeys_touching(self, naptans: set) -> list[int]:
-        """Journey ids whose stop list contains ANY of naptans (indexed)."""
-        if not naptans:
-            return []
-        marks = ",".join("?" * len(naptans))
-        rows = self.conn.execute(
-            f"SELECT DISTINCT journey_id FROM journey_stops WHERE naptan IN ({marks})",
-            list(naptans)).fetchall()
-        return [r[0] for r in rows]
-
-    def _journeys_departing(self, naptan: str, after: str) -> list[int]:
-        """Journey ids that depart `naptan` at/after `after` (indexed range seek)."""
-        rows = self.conn.execute(
-            "SELECT DISTINCT journey_id FROM journey_stop_times "
-            "WHERE naptan=? AND dep>=? ORDER BY journey_id", (naptan, after)).fetchall()
-        return [r[0] for r in rows]
-
     def _candidate_journeys(self, naptans_a: set, naptans_b: set, day: str,
                             target_s: str):
         """Yield Candidates for journeys boarding in A, alighting in B, running
