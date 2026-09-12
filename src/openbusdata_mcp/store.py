@@ -38,6 +38,14 @@ def _fts_query(query: str) -> Optional[str]:
 # 999-variable limit (pre-3.32). 400 + 400 = 800 < 999.
 MAX_RESOLVE = 400
 
+# Operating-day bitmask for SQL-level day filtering: mon=1 .. sun=64.
+DAY_BITS = {"mon": 1, "tue": 2, "wed": 4, "thu": 8,
+            "fri": 16, "sat": 32, "sun": 64}
+
+
+def _days_mask(days: set) -> int:
+    return sum(DAY_BITS[d] for d in days if d in DAY_BITS)
+
 
 def _parse_iso(text: Optional[str]) -> Optional[datetime]:
     if not text:
@@ -526,6 +534,24 @@ class TimetableWriter:
                 "       COALESCE(json_extract(value, '$.departure'), json_extract(value, '$.arrival')) "
                 "FROM journeys j, json_each(j.json, '$.stops')")
             self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('journey_stop_times_backfilled', '1')")
+        # journeys.days_mask: SQL-level day filter (7-bit, mon=1 .. sun=64).
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(journeys)")}
+        if "days_mask" not in cols:
+            self.conn.execute(
+                "ALTER TABLE journeys ADD COLUMN days_mask INT DEFAULT 0")
+        if not self.conn.execute(
+                "SELECT 1 FROM meta WHERE k='days_mask_backfilled'").fetchone():
+            for jid, days_json in self.conn.execute(
+                    "SELECT id, days FROM journeys WHERE days_mask=0").fetchall():
+                try:
+                    day_set = set(json.loads(days_json or "[]"))
+                except (ValueError, TypeError):
+                    day_set = set()
+                self.conn.execute(
+                    "UPDATE journeys SET days_mask=? WHERE id=?",
+                    (_days_mask(day_set), jid))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('days_mask_backfilled', '1')")
         # Legacy DBs: routes table predates ds_id tagging.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(routes)")}
         if "ds_id" not in cols:
@@ -627,9 +653,10 @@ class TimetableWriter:
              "journey_code": code, "dataset_id": ds_id,
              "days": sorted(days), "stops": [dict(st) for st in stops]}
         cur = self.conn.execute(
-            "INSERT INTO journeys (ds_id, op, route, direction, code, days, json) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (ds_id, op, num, direction, code, json.dumps(sorted(days)), json.dumps(j)))
+            "INSERT INTO journeys (ds_id, op, route, direction, code, days, days_mask, json) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ds_id, op, num, direction, code, json.dumps(sorted(days)),
+             _days_mask(days), json.dumps(j)))
         self.conn.executemany(
             "INSERT INTO journey_stops VALUES (?,?)",
             [(s["naptan"], cur.lastrowid) for s in stops])
