@@ -376,53 +376,66 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _plan_one_change_cached(self, key: tuple, a: frozenset, b: frozenset,
                                 day: str, target_s: str) -> list[dict]:
+        """One-change plans in a single SQL self-join over journey_stop_times.
+
+        Semantics preserved from the Python-loop version:
+          - leg1 boards at the FIRST occurrence of any A stop (MIN(seq)),
+            alights at any later stop with a published arrival;
+          - leg2 boards at the FIRST occurrence of that same mid stop,
+            departs at/after leg1's mid arrival (dep column is already
+            COALESCE(departure, arrival)), and alights at the FIRST
+            occurrence of any B stop, arriving by target_s;
+          - j2 != j1; both journeys run on `day` (days_mask).
+        Variable budget: <= 400 + 400 + 2 = 802 < 999. LIMIT 2000 bounds the
+        worst-case cross join; the tool-level dedup + top-15 cap follows."""
         a, b = set(a), set(b)
+        if not a or not b:
+            return []
+        a_marks = ",".join("?" * len(a))
+        b_marks = ",".join("?" * len(b))
+        mask = DAY_BITS.get(day, 0)  # malformed day -> no plans (matches _candidate_journeys)
+        rows = self.conn.execute(f"""
+            SELECT j1.id, j1.op, j1.route, j1.direction, j1.code,
+                   sa.naptan, sm.naptan, sa.dep, sm.arr,
+                   j2.id, j2.op, j2.route, j2.direction, j2.code,
+                   sm2.dep, sb.naptan, sb.arr
+            FROM journeys j1
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({a_marks}) GROUP BY journey_id) aa
+              ON aa.journey_id = j1.id
+            JOIN journey_stop_times sa ON sa.journey_id = j1.id AND sa.seq = aa.seq
+            JOIN journey_stop_times sm ON sm.journey_id = j1.id
+              AND sm.seq > aa.seq AND sm.arr IS NOT NULL
+            JOIN journeys j2 ON j2.id != j1.id AND j2.days_mask & ? != 0
+            JOIN journey_stop_times sm2 ON sm2.journey_id = j2.id
+              AND sm2.naptan = sm.naptan AND sm2.dep >= sm.arr
+              AND sm2.seq = (SELECT MIN(seq) FROM journey_stop_times
+                             WHERE journey_id = j2.id AND naptan = sm.naptan)
+            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
+                  WHERE naptan IN ({b_marks}) GROUP BY journey_id) bb
+              ON bb.journey_id = j2.id
+            JOIN journey_stop_times sb ON sb.journey_id = j2.id AND sb.seq = bb.seq
+            WHERE j1.days_mask & ? != 0
+              AND sa.dep IS NOT NULL
+              AND sm2.seq < bb.seq
+              AND sb.arr IS NOT NULL AND sb.arr <= ?
+            LIMIT 2000
+        """, list(a) + [mask] + list(b) + [mask, target_s]).fetchall()
+        naptans = {r[5] for r in rows} | {r[6] for r in rows} | {r[15] for r in rows}
+        names = self.stop_names_bulk(list(naptans))
         plans = []
-        for jid1, j1 in self._fetch_journeys(self._journeys_touching(a)).items():
-            if day not in j1["days"]:
-                continue
-            idx_a1 = next((i for i, s in enumerate(j1["stops"]) if s["naptan"] in a), None)
-            if idx_a1 is None:
-                continue
-            arr_a1 = j1["stops"][idx_a1].get("arrival") or j1["stops"][idx_a1].get("departure")
-            if arr_a1 is None:
-                continue
-            for mid_idx in range(idx_a1 + 1, len(j1["stops"])):
-                mid = j1["stops"][mid_idx]
-                mid_arr = mid.get("arrival")
-                if mid_arr is None:
-                    continue
-                for jid2, j2 in self._fetch_journeys(
-                        self._journeys_departing(mid["naptan"], mid_arr[:8])).items():
-                    if j2["id"] == j1["id"]:
-                        continue
-                    if day not in j2["days"]:
-                        continue
-                    idx_mid2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] == mid["naptan"]), None)
-                    idx_b2 = next((i for i, s in enumerate(j2["stops"]) if s["naptan"] in b), None)
-                    if idx_mid2 is None or idx_b2 is None or idx_mid2 >= idx_b2:
-                        continue
-                    dep2 = j2["stops"][idx_mid2].get("departure") or j2["stops"][idx_mid2].get("arrival")
-                    arr2 = j2["stops"][idx_b2].get("arrival")
-                    if dep2 is None or arr2 is None or dep2 < mid_arr or arr2 > target_s:
-                        continue
-                    names = self.stop_names_bulk([
-                        j1["stops"][idx_a1]["naptan"], mid["naptan"],
-                        j2["stops"][idx_b2]["naptan"]])
-                    plans.append({
-                        "type": "change",
-                        "legs": [
-                            {"operator": j1["operator"], "route": j1["route"],
-                             "board": names.get(j1["stops"][idx_a1]["naptan"], "Unknown"),
-                             "depart": j1["stops"][idx_a1].get("departure"),
-                             "alight": names.get(mid["naptan"], "Unknown"),
-                             "arrive": mid_arr},
-                            {"operator": j2["operator"], "route": j2["route"],
-                             "board": names.get(mid["naptan"], "Unknown"),
-                             "depart": dep2,
-                             "alight": names.get(j2["stops"][idx_b2]["naptan"], "Unknown"),
-                             "arrive": arr2}],
-                        "total_changes": 1})
+        for (jid1, op1, route1, dir1, code1, na, mid, dep_a, mid_arr,
+             jid2, op2, route2, dir2, code2, dep2, nb, arr_b) in rows:
+            plans.append({
+                "type": "change",
+                "legs": [
+                    {"operator": op1, "route": route1,
+                     "board": names.get(na, "Unknown"), "depart": dep_a,
+                     "alight": names.get(mid, "Unknown"), "arrive": mid_arr},
+                    {"operator": op2, "route": route2,
+                     "board": names.get(mid, "Unknown"), "depart": dep2,
+                     "alight": names.get(nb, "Unknown"), "arrive": arr_b}],
+                "total_changes": 1})
         return plans
 
     # -- provenance / maintenance (used by delta loader) --------------------
