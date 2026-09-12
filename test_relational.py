@@ -42,7 +42,7 @@ def test_days_mask_backfilled_on_legacy_db(writer):
         "SELECT days_mask FROM journeys WHERE id=10").fetchone()[0] == 8
 
 
-def test_journey_stop_times_v2_rows(writer, store):
+def test_journey_stop_times_v2_rows(writer):
     writer.add_journey("Op", "5", "outbound", "J5", {"mon"}, [
         {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
         {"naptan": "010B", "arrival": "09:10:00", "departure": "09:11:00"},
@@ -70,7 +70,9 @@ def test_journey_stop_times_v2_backfill(writer):
         "                json_extract(value, '$.arrival')) "
         "FROM journeys j, json_each(j.json, '$.stops')")
     writer.conn.commit()
-    writer.ensure_schema()  # flag present -> no v2 rebuild expected here;
+    writer.ensure_schema()  # flag present -> no v2 rebuild: rows stay old-shape
+    assert writer.conn.execute(
+        "SELECT seq FROM journey_stop_times LIMIT 1").fetchone()[0] is None
     # the real legacy path is exercised by resetting the flag:
     writer.conn.execute(
         "DELETE FROM meta WHERE k='journey_stop_times_backfilled'")
