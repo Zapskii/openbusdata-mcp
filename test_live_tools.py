@@ -84,7 +84,13 @@ def test_get_disruptions_pins_request_path_and_unparseable_body():
         out = asyncio.run(server.get_disruptions())
     finally:
         _reset()
-    assert out == "Disruptions feed unavailable (fetch or parse failed).", out
+    # Inline raise, not `assert ..., out`: `out` is a tool return from a tool
+    # that just made an HTTP request, so on a feed that echoes the request URL
+    # the value would carry ?api_key=..., and pytest renders a failing assert's
+    # operands. The message therefore names the expectation without
+    # interpolating the value. (Rulings R34 and R37.)
+    if out != "Disruptions feed unavailable (fetch or parse failed).":
+        raise AssertionError("an unparseable 200 body must degrade, not raise through")
     # Inline raise, not assert: the operand is a request URL carrying
     # ?api_key=..., and pytest renders assert operands on failure. (Ruling R34.)
     if len(seen) != 1:
