@@ -359,3 +359,50 @@ def test_plan_journey_survives_message_null_refs(seeded_route, monkeypatch):
     plans = json.loads(asyncio.run(server.plan_journey(
         "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
     assert plans and all("disruption_alerts" not in p for p in plans)
+
+
+FARES_NETEX = b'''<?xml version="1.0"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex">
+ <dataObjects><CompositeFrame><FaresFrame><FareTable id="FT1">
+  <Name>Single fares</Name>
+  <preAssignedFareProducts><PreassignedFareProduct id="P1">
+   <Name>Zone 1-2 single</Name>
+   <AccessRightsInProduct><AccessRightInProduct><PreassignedFare>
+    <StartTariffZoneRef ref="Z1"/><EndTariffZoneRef ref="Z2"/>
+    <FarePrice currency="GBP"><Amount>250</Amount></FarePrice>
+   </PreassignedFare></AccessRightInProduct></AccessRightsInProduct>
+  </PreassignedFareProduct></preAssignedFareProducts>
+ </FareTable></FaresFrame></CompositeFrame></dataObjects>
+</PublicationDelivery>'''
+
+
+def test_get_fare_prices_tool():
+    def handler(request):
+        url = str(request.url)
+        if "/api/v1/fares/dataset/DS1/" in url:
+            return httpx.Response(200, json={"url": "https://example.test/dl"})
+        if url.startswith("https://example.test/dl"):
+            return httpx.Response(200, content=FARES_NETEX)
+        raise AssertionError(f"unexpected URL fetched: {url}")
+
+    _install(handler)
+    try:
+        prices = json.loads(asyncio.run(server.get_fare_prices("DS1")))
+        assert prices[0]["amount"] == "250"
+        assert prices[0]["start_zones"] == ["Z1"]
+        filtered = json.loads(asyncio.run(
+            server.get_fare_prices("DS1", origin_zone="Z1")))
+        assert filtered[0]["amount"] == "250"
+        assert asyncio.run(server.get_fare_prices("DS1", origin_zone="Z9")) == \
+            "No fare prices match the given zones (1 prices extracted)."
+    finally:
+        _reset()
+
+
+def test_get_fare_prices_no_download_url():
+    _install(lambda request: httpx.Response(200, json={}))
+    try:
+        out = asyncio.run(server.get_fare_prices("DS2"))
+        assert "no download URL" in out
+    finally:
+        _reset()

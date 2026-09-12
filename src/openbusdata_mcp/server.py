@@ -26,6 +26,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
 from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
+from .fares import parse_fare_prices
 from collections import defaultdict
 
 import httpx
@@ -1294,6 +1295,48 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
                 f"near the target stop{note}.")
     return json.dumps({"target_stop": target["name"], "vehicles": results},
                       indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
+                          destination_zone: Optional[str] = None) -> str:
+    """
+    Download a BODS fares dataset (NeTEx) and extract its published fare
+    prices as structured JSON, optionally filtered by tariff zone. Find
+    dataset ids with the fares catalogue passthrough tool
+    (Data_set_api_v1_fares_dataset).
+
+    Parameters:
+      dataset_id: Fares dataset id from the fares catalogue.
+      origin_zone: Optional start tariff zone ref to filter by.
+      destination_zone: Optional end tariff zone ref to filter by.
+    """
+    try:
+        meta = await get_http_client().get(
+            f"{BASE_URL}/api/v1/fares/dataset/{quote(dataset_id)}/?api_key={API_KEY}")
+        meta.raise_for_status()
+        download_url = meta.json().get("url")
+        if not download_url:
+            return (f"Dataset {dataset_id} exposes no download URL in its "
+                    f"catalogue metadata.")
+        dl = await get_http_client().get(f"{download_url}?api_key={API_KEY}")
+        dl.raise_for_status()
+        prices = parse_fare_prices(dl.content)
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {str(e)}"
+
+    def keep(p):
+        if origin_zone and origin_zone not in p["start_zones"] + p["zones"]:
+            return False
+        if destination_zone and destination_zone not in p["end_zones"] + p["zones"]:
+            return False
+        return True
+
+    filtered = [p for p in prices if keep(p)]
+    if not filtered:
+        note = f" ({len(prices)} prices extracted)" if prices else ""
+        return f"No fare prices match the given zones{note}."
+    return json.dumps(filtered, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
