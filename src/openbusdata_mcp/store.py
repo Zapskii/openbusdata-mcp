@@ -462,8 +462,10 @@ class TimetableWriter:
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
-        CREATE TABLE IF NOT EXISTS journey_stop_times (naptan TEXT, journey_id INT, dep TEXT);
+        CREATE TABLE IF NOT EXISTS journey_stop_times (
+            journey_id INT, seq INT, naptan TEXT, dep TEXT, arr TEXT);
         CREATE INDEX IF NOT EXISTS jst_n ON journey_stop_times(naptan, dep);
+        CREATE INDEX IF NOT EXISTS jst_j ON journey_stop_times(journey_id, seq);
         CREATE VIRTUAL TABLE IF NOT EXISTS stops_fts USING fts5(
             name, naptan UNINDEXED, tokenize='unicode61');
         CREATE TRIGGER IF NOT EXISTS stops_fts_ai AFTER INSERT ON stops BEGIN
@@ -521,19 +523,33 @@ class TimetableWriter:
                 "INSERT INTO routes_fts(rowid, num, op, key) "
                 "SELECT rowid, num, op, key FROM routes")
             self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('routes_fts_backfilled', '1')")
-        # One-time backfill: journey_stop_times is populated by add_journey, so
-        # a DB upgraded in place (journeys already present) would have an empty
-        # departure index. Backfill from the stored stops JSON once, keyed on a
-        # meta flag so it never re-runs. dep follows COALESCE(departure, arrival)
-        # to match add_journey's write side.
+        # journey_stop_times v2 (seq + arr): populated by add_journey; a DB
+        # upgraded in place (pre-v2 rows, or an empty table with journeys
+        # present) is rebuilt from the stored stops JSON once. dep follows
+        # COALESCE(departure, arrival) to match add_journey's write side;
+        # arr is the raw arrival (NULL where the timetable publishes none).
         if not self.conn.execute(
                 "SELECT 1 FROM meta WHERE k='journey_stop_times_backfilled'").fetchone():
+            cols = {r[1] for r in self.conn.execute(
+                "PRAGMA table_info(journey_stop_times)")}
+            for c in ("seq", "arr"):
+                if c not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE journey_stop_times ADD COLUMN {c} INT"
+                        if c == "seq" else
+                        f"ALTER TABLE journey_stop_times ADD COLUMN {c} TEXT")
+            self.conn.execute("DELETE FROM journey_stop_times")
             self.conn.execute(
-                "INSERT INTO journey_stop_times (naptan, journey_id, dep) "
-                "SELECT json_extract(value, '$.naptan'), j.id, "
-                "       COALESCE(json_extract(value, '$.departure'), json_extract(value, '$.arrival')) "
-                "FROM journeys j, json_each(j.json, '$.stops')")
-            self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('journey_stop_times_backfilled', '1')")
+                "INSERT INTO journey_stop_times (journey_id, seq, naptan, dep, arr) "
+                "SELECT j.id, e.key, "
+                "       json_extract(e.value, '$.naptan'), "
+                "       COALESCE(json_extract(e.value, '$.departure'),"
+                "                json_extract(e.value, '$.arrival')), "
+                "       json_extract(e.value, '$.arrival') "
+                "FROM journeys j, json_each(j.json, '$.stops') e")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES"
+                " ('journey_stop_times_backfilled', '1')")
         # journeys.days_mask: SQL-level day filter (7-bit, mon=1 .. sun=64).
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(journeys)")}
         if "days_mask" not in cols:
@@ -661,9 +677,11 @@ class TimetableWriter:
             "INSERT INTO journey_stops VALUES (?,?)",
             [(s["naptan"], cur.lastrowid) for s in stops])
         self.conn.executemany(
-            "INSERT INTO journey_stop_times VALUES (?,?,?)",
-            [(s["naptan"], cur.lastrowid, s.get("departure") or s.get("arrival"))
-             for s in stops])
+            "INSERT INTO journey_stop_times (naptan, journey_id, seq, dep, arr) "
+            "VALUES (?,?,?,?,?)",
+            [(s["naptan"], cur.lastrowid, i,
+              s.get("departure") or s.get("arrival"), s.get("arrival"))
+             for i, s in enumerate(stops)])
 
     def commit(self):
         self.conn.commit()
