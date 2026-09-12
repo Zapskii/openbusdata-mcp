@@ -83,3 +83,25 @@ def test_live_buses_ttl_cache_skips_second_request():
     finally:
         server.set_http_client(None)
         server._LIVE_CACHE = server.TTLCache(20.0)
+
+
+def test_live_buses_passes_server_side_filters():
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, content=b'<Siri xmlns="http://www.siri.org.uk/siri"/>')
+
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        out = asyncio.run(server.get_live_buses_on_route(
+            "OPX", "12", origin_ref="490A", bounding_box="-0.2,51.4,0.0,51.6"))
+        assert "originRef=490A" in captured["url"]
+        assert "boundingBox=-0.2%2C51.4%2C0.0%2C51.6" in captured["url"]
+        assert "operatorRef=OPX" in captured["url"]
+        assert "lineRef=12" in captured["url"]
+        assert "No live buses found." in out
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)

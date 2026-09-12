@@ -24,6 +24,7 @@ from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
+from .siri import parse_siri_vm
 from collections import defaultdict
 
 import httpx
@@ -85,6 +86,31 @@ class TTLCache:
 
 
 _LIVE_CACHE = TTLCache(20.0)  # bus positions are re-polled within seconds
+
+_SIRI_VM_FILTER_KEYS = ("operatorRef", "lineRef", "originRef",
+                        "destinationRef", "vehicleRef", "boundingBox")
+
+
+def _siri_vm_url(filters: dict) -> str:
+    params = {k: v for k, v in filters.items() if v}
+    params["api_key"] = API_KEY
+    return f"{BASE_URL}/api/v1/datafeed/?{urlencode(params, quote_via=quote)}"
+
+
+async def _fetch_siri_vm(filters: dict) -> bytes:
+    """Fetch raw SIRI-VM bytes for the given datafeed filters, cached on the
+    full filter tuple with the 20s TTL. Empty feeds (no VehicleActivity) are
+    never cached so the next poll re-requests. Raises on HTTP errors."""
+    key = tuple(filters.get(k) for k in _SIRI_VM_FILTER_KEYS)
+    cached = _LIVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resp = await get_http_client().get(_siri_vm_url(filters))
+    resp.raise_for_status()
+    if parse_siri_vm(resp.content):
+        _LIVE_CACHE.put(key, resp.content)
+    return resp.content
+
 
 mcp = FastMCP("openbusdata")
 
@@ -951,49 +977,36 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
 
 
 @mcp.tool()
-async def get_live_buses_on_route(operator_ref: str, line_ref: str) -> str:
+async def get_live_buses_on_route(operator_ref: str, line_ref: str,
+                                  origin_ref: Optional[str] = None,
+                                  destination_ref: Optional[str] = None,
+                                  vehicle_ref: Optional[str] = None,
+                                  bounding_box: Optional[str] = None) -> str:
     """
     Get real-time bus locations for a specific operator and route.
+    Filters are applied server-side by the BODS datafeed, shrinking payloads.
 
     Parameters:
       operator_ref: Operator NOC code (e.g. ARBB, SCCM, CBBH).
       line_ref: Route number (e.g. 12, MK1, 100).
+      origin_ref: Optional origin stop ref filter.
+      destination_ref: Optional destination stop ref filter.
+      vehicle_ref: Optional single-vehicle filter.
+      bounding_box: Optional filter "minLon,minLat,maxLon,maxLat" (WGS84).
     """
-    query = urlencode({"operatorRef": operator_ref, "lineRef": line_ref, "api_key": API_KEY}, quote_via=quote)
-    full_url = f"{BASE_URL}/api/v1/datafeed/?{query}"
-    cached = _LIVE_CACHE.get((operator_ref, line_ref))
-    if cached is not None:
-        return json.dumps(cached, indent=2, ensure_ascii=False)
+    filters = {"operatorRef": operator_ref, "lineRef": line_ref,
+               "originRef": origin_ref, "destinationRef": destination_ref,
+               "vehicleRef": vehicle_ref, "boundingBox": bounding_box}
     try:
-        client = get_http_client()
-        resp = await client.get(full_url)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        ns = "http://www.siri.org.uk/siri"
-        def get_text(tag):
-            el = mvj.find(f"{{{ns}}}{tag}")
-            return el.text if el is not None else "N/A"
+        content = await _fetch_siri_vm(filters)
         buses = []
-        for activity in root.iter(f"{{{ns}}}VehicleActivity"):
-            mvj = activity.find(f"{{{ns}}}MonitoredVehicleJourney")
-            if mvj is None:
-                continue
-            loc = mvj.find(f"{{{ns}}}VehicleLocation")
-            lat = lon = "N/A"
-            if loc is not None:
-                lat_el = loc.find(f"{{{ns}}}Latitude")
-                lon_el = loc.find(f"{{{ns}}}Longitude")
-                lat = lat_el.text if lat_el is not None else "N/A"
-                lon = lon_el.text if lon_el is not None else "N/A"
-            buses.append({
-                "vehicle_id": get_text("VehicleRef"), "direction": get_text("DirectionRef"),
-                "origin": get_text("OriginName"), "destination": get_text("DestinationName"),
-                "location": {"lat": lat, "lon": lon}, "bearing": get_text("Bearing"),
-            })
+        for v in parse_siri_vm(content):
+            lat, lon = v["location"]["lat"], v["location"]["lon"]
+            buses.append({**v, "location": {"lat": "N/A" if lat is None else lat,
+                                            "lon": "N/A" if lon is None else lon}})
         if buses:
-            _LIVE_CACHE.put((operator_ref, line_ref), buses)
             return json.dumps(buses, indent=2, ensure_ascii=False)
-        return f"No live buses found."
+        return "No live buses found."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
 
