@@ -312,7 +312,7 @@ class TimetableStore:
               AND aa.seq < bb.seq
               AND sb.arr IS NOT NULL AND sb.arr <= ?
         """, list(naptans_a) + list(naptans_b)
-             + [DAY_BITS[day], target_s]).fetchall()
+             + [DAY_BITS.get(day, 0), target_s]).fetchall()
         for (jid, op, route, direction, code, na, nb, dep_a, arr_b,
              seq_a, seq_b) in rows:
             yield Candidate(jid, op, route, direction, code, na, nb,

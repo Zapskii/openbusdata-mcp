@@ -86,7 +86,6 @@ def test_journey_stop_times_v2_backfill(writer):
 
 
 def test_candidate_journeys_sql_parity(writer, store):
-    import json as _json
     writer.add_journey("Op", "6", "outbound", "J6", {"mon"}, [
         {"naptan": "A1", "arrival": None, "departure": "09:00:00"},
         {"naptan": "A2", "arrival": "09:05:00", "departure": None},
