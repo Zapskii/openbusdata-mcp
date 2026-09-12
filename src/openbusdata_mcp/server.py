@@ -231,7 +231,9 @@ async def get_disruptions(operator: Optional[str] = None, line: Optional[str] = 
     filtered = [m for m in messages if keep(m)]
     if not filtered:
         return "No matching disruption messages."
-    return json.dumps(filtered, indent=2, ensure_ascii=False)
+    # R32: message text is remote-derived, so the success return goes through
+    # _redact like the failure returns above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 @mcp.tool()
@@ -253,7 +255,9 @@ async def get_cancellations(operator: Optional[str] = None,
                 and (not line or e["line"] == line)]
     if not filtered:
         return "No matching cancellation entries."
-    return json.dumps(filtered, indent=2, ensure_ascii=False)
+    # R32: entry text is remote-derived, so the success return goes through
+    # _redact like the failure returns above it.
+    return _redact(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -1209,10 +1213,13 @@ async def get_live_buses_on_route(operator_ref: str, line_ref: str,
             buses.append({**v, "location": {"lat": "N/A" if lat is None else lat,
                                             "lon": "N/A" if lon is None else lon}})
         if buses:
-            # R29: the release-wide invariant is that EVERY return carrying
-            # remote-derived content passes through _redact -- success returns
-            # included, because a feed can echo the request URL (key and all)
-            # back into a field the parser hands to the caller.
+            # R29: this return carries remote-derived content, so it leaves
+            # through _redact on the success path too, not only on the error
+            # path below -- a feed can echo the request URL (key and all) back
+            # into a field the parser hands to the caller. Every tool that
+            # returns parsed remote content needs its own wrap of this kind;
+            # that is a per-tool review obligation, not something the code
+            # enforces for you. R32 found two tools this one had missed.
             return _redact(json.dumps(buses, indent=2, ensure_ascii=False))
         return "No live buses found."
     except Exception as e:
