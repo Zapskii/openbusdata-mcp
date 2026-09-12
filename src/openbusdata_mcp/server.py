@@ -16,6 +16,7 @@ import yaml
 import json
 import zipfile
 import xml.etree.ElementTree as ET
+import math
 import re
 import time
 from pathlib import Path
@@ -136,6 +137,24 @@ async def _fetch_sx(kind: str) -> Optional[list]:
         return None
     _SX_CACHE.put(kind, parsed)
     return parsed
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
+    if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
+        return None
+    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _hms_minutes(s: str) -> int:
+    """'HH:MM:SS' -> minutes since service-day start. Hours are NOT clamped
+    at 24 (past-midnight times publish as 24:xx+), matching the store."""
+    h, m, _sec = s.split(":")
+    return int(h) * 60 + int(m)
 
 
 mcp = FastMCP("openbusdata")
@@ -1126,6 +1145,115 @@ async def get_departures_board(stop: str, day: Optional[str] = None,
     if not board:
         return f"No departures found at '{stop}' on {day} after {from_s}."
     return json.dumps(board, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
+                            day: Optional[str] = None) -> str:
+    """
+    Estimate when live buses on a route will reach a stop. Each vehicle is
+    matched to its nearest stop on the timetable route; the ETA is the
+    schedule offset from that position (or, when the next service hasn't
+    reached the vehicle's position yet, its scheduled arrival). Honest
+    estimation, not prediction: it assumes vehicles run to schedule from
+    their matched position. Route stop lists are direction-merged and
+    past-midnight times compare as published.
+
+    Parameters:
+      stop: Target stop (NaPTAN code or name).
+      operator_ref: Operator NOC code.
+      line_ref: Route number.
+      day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
+    """
+    if not store.exists():
+        return "No timetable data loaded. Please call load_timetable_index() first."
+    naptans = store.resolve_stop(stop)
+    if not naptans:
+        return f'Could not resolve stop: "{stop}". Try search_stops().'
+    coords = store.route_stop_coords(operator_ref, line_ref)
+    if coords is None:
+        return (f"Route {operator_ref}|{line_ref} is not in the timetable index. "
+                f"Try get_route_stops().")
+    target = next((c for c in coords if c["naptan"] in naptans), None)
+    if target is None:
+        return f'"{stop}" is not served by route {operator_ref}|{line_ref}.'
+
+    filters = {"operatorRef": operator_ref, "lineRef": line_ref}
+    try:
+        content = await _fetch_siri_vm(filters)
+        vehicles = parse_siri_vm(content)
+    except Exception as e:
+        return f"Error fetching live data: {type(e).__name__}: {str(e)}"
+
+    if day is None:
+        day = datetime.now().strftime("%a").lower()
+    day = day.lower()[:3]
+    profiles = store.journeys_on_route(operator_ref, line_ref, day)
+    now_s = datetime.now().strftime("%H:%M:%S")
+
+    results = []
+    skipped = 0
+    for v in vehicles:
+        vlat, vlon = v["location"]["lat"], v["location"]["lon"]
+        if vlat is None or vlon is None:
+            continue
+        nearest, dist = None, None
+        for c in coords:
+            d = _haversine_km(vlat, vlon, c["lat"], c["lon"])
+            if d is not None and (dist is None or d < dist):
+                nearest, dist = c, d
+        if nearest is None or dist is None or dist > 2.0:
+            skipped += 1
+            continue
+        cands = ([p for p in profiles
+                  if v["direction"] in ("inbound", "outbound")
+                  and p["direction"] == v["direction"]] or profiles)
+        at_nearest = []
+        for p in cands:
+            for st in p["stops"]:
+                if st["naptan"] == nearest["naptan"]:
+                    t = st["arr"] or st["dep"]
+                    if t:
+                        at_nearest.append((t, p))
+                    break  # first occurrence of the nearest stop in the profile
+        running = [tp for tp in at_nearest if tp[0] <= now_s]
+        if running:
+            t_k, profile = max(running, key=lambda tp: tp[0])
+            basis = "schedule-offset"
+        elif at_nearest:
+            t_k, profile = min(at_nearest, key=lambda tp: tp[0])
+            basis = "scheduled"
+        else:
+            continue
+        t_target = None
+        for i, st in enumerate(profile["stops"]):
+            if st["naptan"] == target["naptan"] and i >= nearest["seq"]:
+                t_target = st["arr"] or st["dep"]
+                break
+        if not t_target or t_target < t_k:
+            results.append({"vehicle_id": v["vehicle_id"],
+                            "vehicle_at": nearest["name"],
+                            "distance_km": round(dist, 2), "eta": None,
+                            "note": "past the target stop or no onward scheduled time"})
+            continue
+        if basis == "scheduled":
+            minutes = _hms_minutes(t_target) - _hms_minutes(now_s)
+        else:
+            minutes = _hms_minutes(t_target) - _hms_minutes(t_k)
+        minutes = max(0, min(int(minutes), 180))
+        results.append({"vehicle_id": v["vehicle_id"],
+                        "vehicle_at": nearest["name"],
+                        "distance_km": round(dist, 2),
+                        "eta": {"minutes": minutes, "basis": basis,
+                                "journey_code": profile["code"],
+                                "scheduled_time": t_target}})
+    results.sort(key=lambda r: (r["eta"] or {}).get("minutes", 10 ** 6))
+    if not results:
+        note = f" ({skipped} vehicles unmatched to the route)" if skipped else ""
+        return (f"No live buses matched to route {operator_ref}|{line_ref} "
+                f"near the target stop{note}.")
+    return json.dumps({"target_stop": target["name"], "vehicles": results},
+                      indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

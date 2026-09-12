@@ -187,3 +187,25 @@ def test_next_departures_keeps_departure_when_terminus_has_no_stop_row(writer, s
     board = store.next_departures({"010A"}, "mon", "08:00:00", 10)
     assert [d["depart"] for d in board] == ["09:00:00"]
     assert board[0]["destination"] == "Unknown"
+
+
+def test_route_stop_coords_ordered_with_names(seeded_route):
+    coords = seeded_route.route_stop_coords("OPX", "12")
+    assert [c["naptan"] for c in coords] == ["010A", "010B", "010C"]
+    assert coords[0] == {"seq": 0, "naptan": "010A", "name": "Alpha Street",
+                         "lat": 51.5, "lon": -0.1}
+
+
+def test_route_stop_coords_unknown_route_is_none(seeded_route):
+    assert seeded_route.route_stop_coords("OPX", "999") is None
+
+
+def test_journeys_on_route_full_profiles(seeded_route):
+    profiles = seeded_route.journeys_on_route("OPX", "12", "mon")
+    assert len(profiles) == 2
+    j1 = next(p for p in profiles if p["code"] == "J1")
+    assert j1["direction"] == "outbound"
+    assert j1["stops"] == [
+        {"naptan": "010A", "dep": "09:00:00", "arr": None},
+        {"naptan": "010B", "dep": "09:11:00", "arr": "09:10:00"},
+        {"naptan": "010C", "dep": "09:20:00", "arr": "09:20:00"}]

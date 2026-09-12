@@ -421,6 +421,45 @@ class TimetableStore:
                  "journey_code": r[3], "depart": r[4], "destination": r[5]}
                 for r in rows]
 
+    def route_stop_coords(self, operator: str, route: str) -> Optional[list]:
+        """The route's ordered stop list with names and coordinates (the
+        routes.stops JSON joined to stops). None when the route is unknown.
+        The list is direction-merged (upsert_route keeps the longest sequence)."""
+        row = self.conn.execute(
+            "SELECT stops FROM routes WHERE key=?", (f"{operator}|{route}",)).fetchone()
+        if row is None:
+            return None
+        naptans = json.loads(row[0])
+        if not naptans:
+            return []
+        marks = ",".join("?" * len(naptans))
+        info = {r[0]: (r[1], r[2], r[3]) for r in self.conn.execute(
+            f"SELECT naptan, name, lat, lon FROM stops WHERE naptan IN ({marks})",
+            list(naptans)).fetchall()}
+        return [{"seq": i, "naptan": n,
+                 "name": info.get(n, ("Unknown", None, None))[0],
+                 "lat": info.get(n, ("Unknown", None, None))[1],
+                 "lon": info.get(n, ("Unknown", None, None))[2]}
+                for i, n in enumerate(naptans)]
+
+    def journeys_on_route(self, operator: str, route: str, day: str,
+                          limit: int = 300) -> list:
+        """Today's journeys for a route with their full stop-time profiles
+        (dep = COALESCE(departure, arrival), arr = raw arrival)."""
+        rows = self.conn.execute(
+            "SELECT id, direction, code FROM journeys "
+            "WHERE op=? AND route=? AND days_mask & ? != 0 LIMIT ?",
+            (operator, route, DAY_BITS.get(day, 0), limit)).fetchall()
+        profiles = []
+        for jid, direction, code in rows:
+            stops = self.conn.execute(
+                "SELECT naptan, dep, arr FROM journey_stop_times "
+                "WHERE journey_id=? ORDER BY seq", (jid,)).fetchall()
+            profiles.append({"journey_id": jid, "direction": direction, "code": code,
+                             "stops": [{"naptan": n, "dep": d, "arr": a}
+                                       for n, d, a in stops]})
+        return profiles
+
     # -- provenance / maintenance (used by delta loader) --------------------
     def dataset_meta(self, ds_id: int) -> Optional[dict]:
         row = self.conn.execute(
