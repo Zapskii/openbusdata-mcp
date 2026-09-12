@@ -3,6 +3,7 @@ import io
 import json
 import zipfile
 from urllib.parse import quote
+from xml.sax.saxutils import escape as xml_escape
 
 import httpx
 import pytest
@@ -641,4 +642,119 @@ def test_27_api_key_is_redacted_from_passthrough_success(monkeypatch):
         server.set_http_client(None)
     assert not _leaked(out), f"API key reachable in tool output: {_leaked(out)}"
     assert "api/v1/dataset" in out, "the successful response must still be returned"
+
+
+# --- Test 28: every success path carrying remote-derived content is redacted
+# (ruling R29). P31 closed one instance of this class; this pins the property
+# instead of the lines -- three tools, three mocked remote documents, each
+# echoing the request URL (key included) into a field its parser hands back to
+# the caller.
+#
+# The leak check takes a THUNK, not the body, on purpose: pytest renders a
+# failing frame's arguments, so passing the body itself (or asserting on
+# _leaked(body)) publishes the very credential this test exists to keep out of
+# output -- measured, not assumed. For the same reason every check below is an
+# inline `raise`, never an `assert`: pytest renders an assert's operands, and on
+# the unfixed code this body carries the key. The messages report how many
+# encodings leaked, never which.
+def _assert_success_path_is_clean(get_body, marker: str, tool: str) -> None:
+    body = get_body()  # a local, not an argument: locals are not rendered
+    if marker not in body:
+        raise AssertionError(f"{tool} did not return the parsed remote content")
+    forms = _leaked(body)
+    if forms:
+        raise AssertionError(
+            f"API key encoding reached {tool} output ({len(forms)} form(s))")
+    if "api_key=***" not in body:
+        raise AssertionError(f"{tool} output kept no redacted URL to show")
+
+
+def _vm_echo_client():
+    """Mock SIRI-VM feed whose VehicleRef is the request URL it was asked for.
+
+    The URL's '&' separators must be XML-escaped or the document is malformed;
+    the parser hands the unescaped text straight into the vehicle dict."""
+    def handler(request):
+        ref = xml_escape(str(request.url))
+        return httpx.Response(200, content=(
+            '<?xml version="1.0"?>'
+            '<Siri xmlns="http://www.siri.org.uk/siri"><VehicleActivity>'
+            '<MonitoredVehicleJourney>'
+            f'<VehicleRef>{ref}</VehicleRef>'
+            '<DirectionRef>outbound</DirectionRef>'
+            # near seeded_route's 010B (51.51, -0.11), so estimate_live_eta
+            # matches this vehicle instead of taking the no-match branch
+            '<VehicleLocation><Latitude>51.511</Latitude>'
+            '<Longitude>-0.111</Longitude></VehicleLocation>'
+            '</MonitoredVehicleJourney></VehicleActivity></Siri>').encode())
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _fares_echo_handler(request):
+    """Catalogue metadata, then a NeTEx document whose zone ref echoes the
+    download request URL (the fares download URL is the one built with the
+    raw, unquoted key)."""
+    url = str(request.url)
+    if "/api/v1/fares/dataset/" in url:
+        return httpx.Response(200, json={"url": "https://example.test/dl"})
+    ref = xml_escape(url)
+    return httpx.Response(200, content=(
+        '<?xml version="1.0"?>'
+        '<PublicationDelivery xmlns="http://www.netex.org.uk/netex">'
+        '<dataObjects><CompositeFrame><FaresFrame>'
+        '<FareFrame version="1.0" id="FF">'
+        '<fareStructureElements>'
+        '<FareStructureElement version="1.0" id="FSE">'
+        '<distanceMatrixElements>'
+        '<DistanceMatrixElement version="1.0" id="Z1+Z2">'
+        f'<StartTariffZoneRef version="1.0" ref="{ref}"/>'
+        '<GeographicalIntervalPrice version="1.0" id="p">'
+        '<Amount>1.20</Amount>'
+        '</GeographicalIntervalPrice>'
+        '</DistanceMatrixElement>'
+        '</distanceMatrixElements>'
+        '</FareStructureElement>'
+        '</fareStructureElements>'
+        '</FareFrame>'
+        '</FaresFrame></CompositeFrame></dataObjects>'
+        '</PublicationDelivery>').encode())
+
+
+@pytest.mark.parametrize("tool", ["get_live_buses_on_route", "estimate_live_eta",
+                                  "get_fare_prices"])
+def test_28_remote_echo_is_redacted_from_every_success_path(
+        tool, monkeypatch, seeded_route):
+    """A mocked remote document echoes the request URL (key included) into a
+    field each tool's parser carries to the caller; the credential must not
+    surface. Parametrized so a regression names the tool that leaked."""
+    monkeypatch.setattr(server, "API_KEY", DUMMY_KEY)
+
+    if tool == "get_fare_prices":
+        server.set_http_client(httpx.AsyncClient(
+            transport=httpx.MockTransport(_fares_echo_handler)))
+        try:
+            body = asyncio.run(server.get_fare_prices("DS1"))
+        finally:
+            server.set_http_client(None)
+    else:
+        server.set_http_client(_vm_echo_client())
+        server._LIVE_CACHE = server.TTLCache(20.0)
+        try:
+            if tool == "get_live_buses_on_route":
+                body = asyncio.run(server.get_live_buses_on_route("OPX", "12"))
+            else:
+                body = asyncio.run(server.estimate_live_eta(
+                    "Charlie Road", "OPX", "12", day="mon"))
+        finally:
+            server.set_http_client(None)
+            server._LIVE_CACHE = server.TTLCache(20.0)
+
+    # Order matters: if the phase went vacuous (nothing parsed, or the ETA
+    # tool's no-match branch) the leak check would pass for the wrong reason.
+    # The marker is the parsed-content tell for each tool.
+    marker = {"get_live_buses_on_route": "vehicle_id",
+              "estimate_live_eta": '"vehicles"',
+              "get_fare_prices": '"start_zones"'}[tool]
+    _assert_success_path_is_clean(lambda: body, marker, tool)
+
 
