@@ -405,13 +405,13 @@ class TimetableStore:
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(f"""
             SELECT j.op, j.route, j.direction, j.code,
-                   MIN(jst.dep) AS dep, s.name
+                   MIN(jst.dep) AS dep, COALESCE(s.name, 'Unknown') AS dest
             FROM journey_stop_times jst
             JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
             JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
                  AND lastj.seq = (SELECT MAX(seq) FROM journey_stop_times
                                   WHERE journey_id = jst.journey_id)
-            JOIN stops s ON s.naptan = lastj.naptan
+            LEFT JOIN stops s ON s.naptan = lastj.naptan
             WHERE jst.naptan IN ({marks}) AND jst.dep IS NOT NULL AND jst.dep >= ?
             GROUP BY jst.journey_id
             ORDER BY dep

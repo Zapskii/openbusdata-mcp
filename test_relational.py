@@ -173,3 +173,17 @@ def test_next_departures_respects_day_and_limit(seeded_route):
 def test_next_departures_unknown_day_and_empty_set(seeded_route):
     assert seeded_route.next_departures({"010A"}, "bogus", "08:00:00", 10) == []
     assert seeded_route.next_departures(set(), "mon", "08:00:00", 10) == []
+
+
+def test_next_departures_keeps_departure_when_terminus_has_no_stop_row(writer, store):
+    """A journey whose final stop has no `stops` row must still be reported:
+    the origin resolves, so dropping the row would silently under-report."""
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A", "010Z"], 1)
+    writer.add_journey("OPX", "12", "outbound", "J9", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010Z", "arrival": "09:20:00", "departure": None}], 1)
+    writer.commit()
+    board = store.next_departures({"010A"}, "mon", "08:00:00", 10)
+    assert [d["depart"] for d in board] == ["09:00:00"]
+    assert board[0]["destination"] == "Unknown"
