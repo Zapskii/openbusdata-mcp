@@ -308,7 +308,7 @@ def test_5_plan_dedup_keeps_distinct_operators(writer):
                        [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
                         {"naptan": "010B", "arrival": "09:12:00", "departure": None}], 2)
     writer.commit()
-    result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0))
+    result = asyncio.run(server.plan_journey("A St", "B St", "09:30", "mon", 0, check_disruptions=False))
     plans = json.loads(result)
     assert len(plans) == 2, f"expected 2 distinct plans, got {len(plans)}"
     assert {p["legs"][0]["operator"] for p in plans} == {"OpOne", "OpTwo"}, \

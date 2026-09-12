@@ -190,3 +190,55 @@ def test_estimate_live_eta_unmatched_vehicle(seeded_route, monkeypatch):
 def test_estimate_live_eta_route_not_indexed(seeded_route):
     out = asyncio.run(server.estimate_live_eta("Charlie Road", "OPX", "77", day="mon"))
     assert "not in the timetable index" in out
+
+
+def test_plan_journey_annotates_disrupted_legs(seeded_route, monkeypatch):
+    async def fake_fetch(kind):
+        return [{"recorded_at": "2026-09-12T10:00:00Z", "valid_until": None,
+                 "channel": "disruptions", "severity": "severe",
+                 "operators": [], "lines": ["12"], "stops": [],
+                 "summary": "Road closure on Bravo Road"}]
+
+    monkeypatch.setattr(server, "_fetch_sx", fake_fetch)
+    plans = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
+    assert plans, "a plan must exist for the seeded route"
+    assert all(p["disruption_alerts"] == ["route 12 has an active disruption"]
+               for p in plans)
+
+
+def test_plan_journey_clean_legs_untouched(seeded_route, monkeypatch):
+    async def fake_fetch(kind):
+        return [{"recorded_at": "2026-09-12T10:00:00Z", "valid_until": None,
+                 "channel": "disruptions", "severity": "severe",
+                 "operators": [], "lines": ["999"], "stops": [],
+                 "summary": "Somewhere else"}]
+
+    monkeypatch.setattr(server, "_fetch_sx", fake_fetch)
+    plans = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
+    assert plans and all("disruption_alerts" not in p for p in plans)
+
+
+def test_plan_journey_survives_feed_failure(seeded_route, monkeypatch):
+    async def broken(kind):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(server, "_fetch_sx", broken)
+    plans = json.loads(asyncio.run(server.plan_journey(
+        "Alpha Street", "Charlie Road", arrive_by="10:00", day="mon")))
+    assert plans and all("disruption_alerts" not in p for p in plans)
+
+
+def test_plan_journey_check_disruptions_false_skips_fetch(seeded_route, monkeypatch):
+    called = []
+
+    async def spy(kind):
+        called.append(kind)
+        return []
+
+    monkeypatch.setattr(server, "_fetch_sx", spy)
+    asyncio.run(server.plan_journey("Alpha Street", "Charlie Road",
+                                    arrive_by="10:00", day="mon",
+                                    check_disruptions=False))
+    assert called == []

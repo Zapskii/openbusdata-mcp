@@ -1028,8 +1028,38 @@ async def find_buses_by_arrival_time(stop_a: str, stop_b: str, arrive_by: str, d
     return json.dumps(results, indent=2, ensure_ascii=False) if results else f"No buses found arriving at '{stop_b}' by {arrive_by} on {day}."
 
 
+async def _annotate_disruptions(plans: list) -> list:
+    """Attach disruption_alerts to plans whose legs' route or operator refs
+    appear in the live SIRI-SX feed. Annotation only — plans are never
+    dropped — and a feed failure degrades to silent, unannotated output."""
+    try:
+        messages = await _fetch_sx("disruptions")
+    except Exception as e:
+        print(f"[siri-sx] disruption annotation skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return plans
+    if not messages:
+        return plans
+    line_refs, op_refs = set(), set()
+    for m in messages:
+        line_refs.update(m["lines"])
+        op_refs.update(m["operators"])
+    for p in plans:
+        alerts = []
+        for leg in p["legs"]:
+            if leg.get("route") in line_refs:
+                alerts.append(f"route {leg.get('route')} has an active disruption")
+            elif leg.get("operator") in op_refs:
+                alerts.append(f"operator {leg.get('operator')} has an active disruption notice")
+        if alerts:
+            p["disruption_alerts"] = sorted(set(alerts))
+    return plans
+
+
 @mcp.tool()
-async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[str] = None, max_changes: int = 1) -> str:
+async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
+                       day: Optional[str] = None, max_changes: int = 1,
+                       check_disruptions: bool = True) -> str:
     """
     Plan a journey from stop_a to stop_b arriving by a given time.
     Supports direct routes and single changes.
@@ -1040,6 +1070,10 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
       arrive_by: Target arrival time (HH:MM, 24h format).
       day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
       max_changes: Maximum number of bus changes (0 = direct only, 1 = one change). Default 1.
+      check_disruptions: If true (default), plans whose route or operator
+                appears in the live SIRI-SX disruptions feed are annotated
+                with a "disruption_alerts" list. Plans are never dropped;
+                a feed failure degrades silently.
     """
     if not store.exists():
         return "No timetable data loaded. Please call load_timetable_index() first."
@@ -1075,7 +1109,9 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str, day: Optional[s
             deduped.append(plan)
 
     deduped.sort(key=lambda p: p["legs"][-1]["arrive"] or "")
-    return json.dumps(deduped[:15], indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
+    if check_disruptions:
+        deduped = await _annotate_disruptions(deduped[:15])
+    return json.dumps(deduped, indent=2, ensure_ascii=False) if deduped else f"No journey found from '{stop_a}' to '{stop_b}' by {arrive_by} on {day}."
 
 
 @mcp.tool()
