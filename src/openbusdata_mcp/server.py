@@ -137,6 +137,11 @@ async def _fetch_siri_vm(filters: dict) -> bytes:
         return cached
     resp = await get_http_client().get(_siri_vm_url(filters))
     resp.raise_for_status()
+    # An empty AVL feed is not cached: vehicles appear and vanish constantly, so
+    # an empty response is usually transient and a 20s cache of it would hide a
+    # bus that is already running. The asymmetry with _fetch_sx is deliberate —
+    # SIRI-SX carries messages that stay valid for hours, so an empty SX
+    # response is authoritative and worth caching. Do not "fix" this to match.
     if parse_siri_vm(resp.content):
         _LIVE_CACHE.put(key, resp.content)
     return resp.content

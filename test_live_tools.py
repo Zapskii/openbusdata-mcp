@@ -67,6 +67,30 @@ def test_get_disruptions_degrades_on_http_error():
         _reset()
 
 
+def test_get_disruptions_pins_request_path_and_unparseable_body():
+    # Two untested halves at once: the actual request path behind
+    # _SX_PATHS["disruptions"] (a wrong entry would otherwise pass the suite),
+    # and the unparseable-body half of _fetch_sx's contract -- only the
+    # 500/unreachable half was covered, and a 200 with junk must degrade
+    # exactly like a failure rather than raise through the tool.
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, content=b"<not-xml")
+
+    _install(handler)
+    try:
+        out = asyncio.run(server.get_disruptions())
+    finally:
+        _reset()
+    assert out == "Disruptions feed unavailable (fetch or parse failed).", out
+    assert len(seen) == 1, seen
+    path = seen[0].split("?")[0]
+    assert path == f"{server.BASE_URL}/api/v1/siri-sx/", path
+    assert "cancellations" not in path, path
+
+
 def test_get_cancellations_filters():
     def handler(request):
         assert "/siri-sx/cancellations/" in str(request.url)
@@ -207,6 +231,55 @@ def test_estimate_live_eta_unmatched_vehicle(seeded_route, monkeypatch):
 def test_estimate_live_eta_route_not_indexed(seeded_route):
     out = asyncio.run(server.estimate_live_eta("Charlie Road", "OPX", "77", day="mon"))
     assert "not in the timetable index" in out
+
+
+EMPTY_VM = b'<Siri xmlns="http://www.siri.org.uk/siri"/>'
+
+
+def test_live_buses_empty_feed_is_not_cached():
+    # The guard at server.py:140 is deliberate: an empty AVL feed is usually
+    # transient, so it must not be cached (unlike an authoritative empty SX
+    # response). Deleting the guard leaves every other test green, so pin it.
+    counts = {"n": 0}
+
+    def handler(request):
+        counts["n"] += 1
+        return httpx.Response(200, content=EMPTY_VM)
+
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        assert asyncio.run(server.get_live_buses_on_route("OPX", "12")) == "No live buses found."
+        asyncio.run(server.get_live_buses_on_route("OPX", "12"))
+        assert counts["n"] == 2, "an empty AVL feed must not be cached"
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
+
+
+def test_live_buses_missing_coordinate_renders_na():
+    # Location is present but has no Longitude, and V2 has no VehicleLocation.
+    # Both must render the missing coordinate as "N/A" rather than null (the
+    # shape get_live_buses_on_route has always published).
+    partial_vm = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <VehicleActivity>
+  <MonitoredVehicleJourney>
+   <VehicleRef>V9</VehicleRef>
+   <VehicleLocation><Latitude>51.5</Latitude></VehicleLocation>
+  </MonitoredVehicleJourney>
+ </VehicleActivity>
+</Siri>'''
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=partial_vm))))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    try:
+        out = json.loads(asyncio.run(server.get_live_buses_on_route("OPX", "12")))
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
+    assert out[0]["vehicle_id"] == "V9"
+    assert out[0]["location"] == {"lat": 51.5, "lon": "N/A"}, out[0]["location"]
 
 
 def test_plan_journey_annotates_disrupted_legs(seeded_route, monkeypatch):

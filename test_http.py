@@ -96,8 +96,11 @@ def test_live_buses_passes_server_side_filters():
     server._LIVE_CACHE = server.TTLCache(20.0)
     try:
         out = asyncio.run(server.get_live_buses_on_route(
-            "OPX", "12", origin_ref="490A", bounding_box="-0.2,51.4,0.0,51.6"))
+            "OPX", "12", origin_ref="490A", destination_ref="490B",
+            vehicle_ref="V1", bounding_box="-0.2,51.4,0.0,51.6"))
         assert "originRef=490A" in captured["url"]
+        assert "destinationRef=490B" in captured["url"]
+        assert "vehicleRef=V1" in captured["url"]
         assert "boundingBox=-0.2%2C51.4%2C0.0%2C51.6" in captured["url"]
         assert "operatorRef=OPX" in captured["url"]
         assert "lineRef=12" in captured["url"]
