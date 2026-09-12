@@ -1334,8 +1334,11 @@ async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
 
     filtered = [p for p in prices if keep(p)]
     if not filtered:
-        note = f" ({len(prices)} prices extracted)" if prices else ""
-        return f"No fare prices match the given zones{note}."
+        if not prices:
+            return (f"No fare prices could be extracted from dataset "
+                    f"{dataset_id}: the downloaded document contained no "
+                    f"recognised NeTEx price elements.")
+        return f"No fare prices match the given zones ({len(prices)} prices extracted)."
     return json.dumps(filtered, indent=2, ensure_ascii=False)
 
 

@@ -361,18 +361,50 @@ def test_plan_journey_survives_message_null_refs(seeded_route, monkeypatch):
     assert plans and all("disruption_alerts" not in p for p in plans)
 
 
+# Profile-shaped fares document (BODS NeTEx Fares Profile v0.4, section 6.3.3
+# and section 7.2): the price lives in a PriceGroup that the
+# DistanceMatrixElement references by PriceGroupRef, so the zone refs are
+# reachable only by resolving that reference.
 FARES_NETEX = b'''<?xml version="1.0"?>
 <PublicationDelivery xmlns="http://www.netex.org.uk/netex">
- <dataObjects><CompositeFrame><FaresFrame><FareTable id="FT1">
-  <Name>Single fares</Name>
-  <preAssignedFareProducts><PreassignedFareProduct id="P1">
-   <Name>Zone 1-2 single</Name>
-   <AccessRightsInProduct><AccessRightInProduct><PreassignedFare>
-    <StartTariffZoneRef ref="Z1"/><EndTariffZoneRef ref="Z2"/>
-    <FarePrice currency="GBP"><Amount>250</Amount></FarePrice>
-   </PreassignedFare></AccessRightInProduct></AccessRightsInProduct>
-  </PreassignedFareProduct></preAssignedFareProducts>
- </FareTable></FaresFrame></CompositeFrame></dataObjects>
+ <dataObjects><CompositeFrame><FaresFrame>
+  <FareFrame version="1.0" id="FF-PRICE">
+   <priceGroups>
+    <PriceGroup version="1.0" id="price_band_1.20">
+     <members>
+      <GeographicalIntervalPrice version="1.0" id="price_band_1.20@adult">
+       <Amount>1.20</Amount>
+      </GeographicalIntervalPrice>
+     </members>
+    </PriceGroup>
+   </priceGroups>
+  </FareFrame>
+  <FareFrame version="1.0" id="FF-PRODUCT">
+   <fareStructureElements>
+    <FareStructureElement version="1.0" id="Tariff@single">
+     <distanceMatrixElements>
+      <DistanceMatrixElement version="1.0" id="Z1+Z2">
+       <priceGroups>
+        <PriceGroupRef version="1.0" ref="price_band_1.20"/>
+       </priceGroups>
+       <StartTariffZoneRef version="1.0" ref="Z1"/>
+       <EndTariffZoneRef version="1.0" ref="Z2"/>
+      </DistanceMatrixElement>
+     </distanceMatrixElements>
+    </FareStructureElement>
+   </fareStructureElements>
+  </FareFrame>
+ </FaresFrame></CompositeFrame></dataObjects>
+</PublicationDelivery>'''
+
+# A well-formed NeTEx document carrying no price element at all.
+FARES_NETEX_EMPTY = b'''<?xml version="1.0"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex">
+ <dataObjects><CompositeFrame><FaresFrame>
+  <FareFrame version="1.0" id="FF-PRICE">
+   <priceGroups/>
+  </FareFrame>
+ </FaresFrame></CompositeFrame></dataObjects>
 </PublicationDelivery>'''
 
 
@@ -383,16 +415,18 @@ def test_get_fare_prices_tool():
             return httpx.Response(200, json={"url": "https://example.test/dl"})
         if url.startswith("https://example.test/dl"):
             return httpx.Response(200, content=FARES_NETEX)
-        raise AssertionError(f"unexpected URL fetched: {url}")
+        # Do not interpolate the URL: it carries ?api_key=... and pytest
+        # prints the message, which would leak the credential.
+        raise AssertionError("unexpected URL fetched")
 
     _install(handler)
     try:
         prices = json.loads(asyncio.run(server.get_fare_prices("DS1")))
-        assert prices[0]["amount"] == "250"
+        assert prices[0]["amount"] == "1.20"
         assert prices[0]["start_zones"] == ["Z1"]
         filtered = json.loads(asyncio.run(
             server.get_fare_prices("DS1", origin_zone="Z1")))
-        assert filtered[0]["amount"] == "250"
+        assert filtered[0]["amount"] == "1.20"
         assert asyncio.run(server.get_fare_prices("DS1", origin_zone="Z9")) == \
             "No fare prices match the given zones (1 prices extracted)."
     finally:
@@ -404,5 +438,30 @@ def test_get_fare_prices_no_download_url():
     try:
         out = asyncio.run(server.get_fare_prices("DS2"))
         assert "no download URL" in out
+    finally:
+        _reset()
+
+
+def test_get_fare_prices_distinguishes_no_extraction_from_no_match():
+    """Nothing extracted must not be reported as a zone-filter miss: with no
+    filter passed, naming a zone filter is a lie about what happened."""
+    def handler(request):
+        url = str(request.url)
+        if "/api/v1/fares/dataset/DS3/" in url:
+            return httpx.Response(200, json={"url": "https://example.test/empty"})
+        if url.startswith("https://example.test/empty"):
+            return httpx.Response(200, content=FARES_NETEX_EMPTY)
+        raise AssertionError("unexpected URL fetched")
+
+    _install(handler)
+    try:
+        out = asyncio.run(server.get_fare_prices("DS3"))
+        assert "match the given zones" not in out, (
+            "named a zone filter the caller never passed")
+        assert "no fare prices could be extracted" in out.lower()
+        # ...and the same is true when a filter *was* passed: the filter is
+        # still not the reason nothing came back.
+        filtered = asyncio.run(server.get_fare_prices("DS3", origin_zone="Z1"))
+        assert "match the given zones" not in filtered
     finally:
         _reset()
