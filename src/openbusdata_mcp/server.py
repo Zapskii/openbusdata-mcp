@@ -15,7 +15,8 @@ import tempfile
 import yaml
 import json
 import zipfile
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as SafeET
+from defusedxml.common import DefusedXmlException
 import math
 import re
 import time
@@ -326,8 +327,8 @@ def _parse_days(op_profile) -> set[str]:
 def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], list[Route], list[Journey]]:
     """Parse a single TransXChange XML string. Returns (stops, routes, journeys)."""
     try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
+        root = SafeET.fromstring(content)
+    except (SafeET.ParseError, DefusedXmlException):
         return [], [], []
 
     ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""

@@ -506,3 +506,21 @@ def test_22_zip_download_streams(writer):
     assert "get" in kinds, f"meta not fetched via get: {_StreamRecordingClient.calls}"
     stream_urls = [c[1] for c in _StreamRecordingClient.calls if c[0] == "stream"]
     assert stream_urls and "http://x/y.zip" in stream_urls[0], stream_urls
+
+
+# --- Test 23: remote TransXChange XML is parsed entity-safe (defusedxml)
+# stdlib ElementTree *expands* an internal entity; defusedxml refuses the
+# document outright. The observable difference is whether the stop parses.
+ENTITY_DOC = (
+    '<?xml version="1.0"?>'
+    '<!DOCTYPE TransXChange [<!ENTITY nm "Alpha Street">]>'
+    '<TransXChange xmlns="http://www.transxchange.org.uk/">'
+    '<StopPoints><AnnotatedStopPointRef>'
+    '<StopPointRef>010A</StopPointRef><CommonName>&nm;</CommonName>'
+    '</AnnotatedStopPointRef></StopPoints></TransXChange>')
+
+
+def test_23_transxchange_entities_are_refused():
+    stops, routes, journeys = server.parse_transxchange(ENTITY_DOC, "OpX")
+    assert (stops, routes, journeys) == ([], [], []), (
+        "an entity-bearing document must be refused, not expanded")
