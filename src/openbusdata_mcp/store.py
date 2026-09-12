@@ -386,7 +386,7 @@ class TimetableStore:
             COALESCE(departure, arrival)), and alights at the FIRST
             occurrence of any B stop, arriving by target_s;
           - j2 != j1; both journeys run on `day` (days_mask).
-        Variable budget: <= 400 + 400 + 2 = 802 < 999. LIMIT 2000 bounds the
+        Variable budget: <= 400 + 400 + 3 = 803 < 999. LIMIT 2000 bounds the
         worst-case cross join; the tool-level dedup + top-15 cap follows."""
         a, b = set(a), set(b)
         if not a or not b:
