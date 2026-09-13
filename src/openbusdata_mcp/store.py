@@ -3,6 +3,7 @@
 Replaces the in-memory timetable index for query tools. Same tool output
 shapes, but memory is O(query) instead of O(entire UK timetable).
 """
+import bisect
 import functools
 import json
 import sqlite3
@@ -329,59 +330,127 @@ class TimetableStore:
     @functools.lru_cache(maxsize=128)
     def _plan_one_change_cached(self, key: tuple, a: frozenset, b: frozenset,
                                 day: str, target_s: str) -> list[dict]:
-        """One-change plans in a single SQL self-join over journey_stop_times.
+        """One-change plans, staged so the worst case stays seconds.
 
-        Semantics preserved from the Python-loop version:
-          - leg1 boards at the FIRST occurrence of any A stop (MIN(seq)),
-            alights at any later stop with a published arrival;
-          - leg2 boards at the FIRST occurrence of that same mid stop,
-            departs at/after leg1's mid arrival (dep column is already
-            COALESCE(departure, arrival)), and alights at the FIRST
-            occurrence of any B stop, arriving by target_s;
-          - j2 != j1; both journeys run on `day` (days_mask).
-        Variable budget: <= 400 + 400 + 3 = 803 < 999. ORDER BY sb.arr +
-        LIMIT 2000 bounds the worst-case cross join deterministically (the
-        earliest-arriving 2000 survive; sb.arr is never NULL on surviving
-        rows); the tool-level dedup + top-15 cap follows."""
+        The previous single SQL self-join was driven from the A-side: for
+        every leg-1 journey x every downstream stop it fanned out over all
+        later departures at that stop (jst_n) plus a correlated MIN(seq)
+        subquery, and its ORDER BY + LIMIT 2000 only pruned AFTER the cross
+        product — a request with an empty result set (or a busy corridor)
+        ground the 43M-row table for minutes and head-of-line-blocked every
+        other tool. Staged version:
+          1) mid candidates = stops downstream of an A-journey with a
+             published arrival AND before the first B stop on some
+             day-running journey; one bounded DISTINCT query per side,
+             intersected in Python. Empty intersection -> instant "none".
+          2) per-mid leg-1 rides (board at FIRST A occurrence, sa.dep
+             published, alight mid with arr published) and leg-2 rides
+             (board at FIRST mid occurrence, alight at FIRST B occurrence,
+             sb.arr <= target); paired on dep >= leg-1 mid arrival, j2 != j1.
+          3) streaming top-2000 pairs by final arrival — the old
+             ORDER BY sb.arr + LIMIT 2000 truncation, heap-bounded instead
+             of sort-bounded. The tool-level dedupe + top-15 cap follow.
+        ponytail: pairing is O(leg1 x leg2) per mid in Python; push it back
+        into SQL with a mid temp table if profiling ever shows it hot."""
         a, b = set(a), set(b)
         if not a or not b:
             return []
         a_marks = ",".join("?" * len(a))
         b_marks = ",".join("?" * len(b))
         mask = DAY_BITS.get(day, 0)  # malformed day -> no plans (matches _candidate_journeys)
-        rows = self.conn.execute(f"""
+        board = ("SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times "
+                 "WHERE naptan IN ({marks}) GROUP BY journey_id")
+
+        # 1) transfer-stop candidates, one semi-join per side, intersected.
+        mids_a = {r[0] for r in self.conn.execute(f"""
+            SELECT DISTINCT sm.naptan
+            FROM ({board.format(marks=a_marks)}) aa
+            JOIN journeys j1 ON j1.id = aa.journey_id AND j1.days_mask & ? != 0
+            JOIN journey_stop_times sm ON sm.journey_id = aa.journey_id
+              AND sm.seq > aa.seq AND sm.arr IS NOT NULL
+        """, list(a) + [mask]).fetchall()}
+        mids_b = {r[0] for r in self.conn.execute(f"""
+            SELECT DISTINCT sm2.naptan
+            FROM ({board.format(marks=b_marks)}) bb
+            JOIN journeys j2 ON j2.id = bb.journey_id AND j2.days_mask & ? != 0
+            JOIN journey_stop_times sm2 ON sm2.journey_id = bb.journey_id
+              AND sm2.seq < bb.seq
+        """, list(b) + [mask]).fetchall()}
+        mids = mids_a & mids_b
+        if not mids:
+            return []
+
+        # 2a) leg-1 rides into any candidate mid.
+        mid_marks = ",".join("?" * len(mids))
+        leg1 = self.conn.execute(f"""
             SELECT j1.id, j1.op, j1.route, j1.direction, j1.code,
-                   sa.naptan, sm.naptan, sa.dep, sm.arr,
-                   j2.id, j2.op, j2.route, j2.direction, j2.code,
-                   sm2.dep, sb.naptan, sb.arr
-            FROM journeys j1
-            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
-                  WHERE naptan IN ({a_marks}) GROUP BY journey_id) aa
-              ON aa.journey_id = j1.id
-            JOIN journey_stop_times sa ON sa.journey_id = j1.id AND sa.seq = aa.seq
+                   sa.naptan, sa.dep, sm.naptan, sm.arr
+            FROM ({board.format(marks=a_marks)}) aa
+            JOIN journeys j1 ON j1.id = aa.journey_id AND j1.days_mask & ? != 0
+            JOIN journey_stop_times sa ON sa.journey_id = j1.id
+              AND sa.seq = aa.seq
             JOIN journey_stop_times sm ON sm.journey_id = j1.id
               AND sm.seq > aa.seq AND sm.arr IS NOT NULL
-            JOIN journeys j2 ON j2.id != j1.id AND j2.days_mask & ? != 0
-            JOIN journey_stop_times sm2 ON sm2.journey_id = j2.id
-              AND sm2.naptan = sm.naptan AND sm2.dep >= sm.arr
-              AND sm2.seq = (SELECT MIN(seq) FROM journey_stop_times
-                             WHERE journey_id = j2.id AND naptan = sm.naptan)
-            JOIN (SELECT journey_id, MIN(seq) AS seq FROM journey_stop_times
-                  WHERE naptan IN ({b_marks}) GROUP BY journey_id) bb
-              ON bb.journey_id = j2.id
-            JOIN journey_stop_times sb ON sb.journey_id = j2.id AND sb.seq = bb.seq
-            WHERE j1.days_mask & ? != 0
-              AND sa.dep IS NOT NULL
-              AND sm2.seq < bb.seq
-              AND sb.arr IS NOT NULL AND sb.arr <= ?
-            ORDER BY sb.arr
+              AND sm.naptan IN ({mid_marks})
+            WHERE sa.dep IS NOT NULL
+            ORDER BY sm.arr
             LIMIT 2000
-        """, list(a) + [mask] + list(b) + [mask, target_s]).fetchall()
-        naptans = {r[5] for r in rows} | {r[6] for r in rows} | {r[15] for r in rows}
+        """, list(a) + [mask] + list(mids)).fetchall()
+        if not leg1:
+            return []
+        leg1_by_mid = {}
+        for row in leg1:
+            leg1_by_mid.setdefault(row[7], []).append(row)
+
+        # 2b) leg-2 rides out of each mid, paired against that mid's leg-1
+        #     arrivals. Keep the earliest-arriving 2000 pairs: a bisect list
+        #     ascending by final arrival, evicting from the tail (times are
+        #     strings, so no heap-negation trick is available).
+        top: list = []  # ascending by arr_b; tail = worst plan
+        for mid in mids:
+            leg2 = self.conn.execute(f"""
+                SELECT j2.id, j2.op, j2.route, j2.code,
+                       sm2.dep, sb.naptan, sb.arr
+                FROM (SELECT journey_id, MIN(seq) AS seq
+                      FROM journey_stop_times WHERE naptan = ?
+                      GROUP BY journey_id) fo
+                JOIN journey_stop_times sm2 ON sm2.journey_id = fo.journey_id
+                  AND sm2.naptan = ? AND sm2.seq = fo.seq
+                JOIN journeys j2 ON j2.id = sm2.journey_id
+                  AND j2.days_mask & ? != 0
+                JOIN ({board.format(marks=b_marks)}) bb
+                  ON bb.journey_id = j2.id
+                JOIN journey_stop_times sb ON sb.journey_id = j2.id
+                  AND sb.seq = bb.seq
+                WHERE fo.seq < bb.seq AND sb.arr IS NOT NULL AND sb.arr <= ?
+            """, [mid, mid, mask] + list(b) + [target_s]).fetchall()
+            if not leg2:
+                continue
+            leg2.sort(key=lambda r: r[4] or "")
+            deps = [r[4] or "" for r in leg2]
+            for (jid1, op1, route1, dir1, code1, na, dep_a, _mid, mid_arr) \
+                    in leg1_by_mid.get(mid, ()):
+                lo = bisect.bisect_left(deps, mid_arr)
+                for (jid2, op2, route2, code2, dep2, nb, arr_b) \
+                        in leg2[lo:]:
+                    if jid2 == jid1 or dep2 is None:
+                        continue
+                    row = (op1, route1, na, dep_a, mid, mid_arr,
+                           op2, route2, code2, dep2, nb, arr_b)
+                    if len(top) < 2000:
+                        bisect.insort(top, row, key=lambda p: p[11])
+                    elif arr_b < top[-1][11]:
+                        top.pop()
+                        bisect.insort(top, row, key=lambda p: p[11])
+        if not top:
+            return []
+        rows = top  # already ascending by final arrival
+
+        naptans = {r[2] for r in rows} | {r[4] for r in rows} | {r[10] for r in rows}
         names = self.stop_names_bulk(list(naptans))
         plans = []
-        for (jid1, op1, route1, dir1, code1, na, mid, dep_a, mid_arr,
-             jid2, op2, route2, dir2, code2, dep2, nb, arr_b) in rows:
+        for (op1, route1, na, dep_a, mid, mid_arr,
+             op2, route2, code2, dep2, nb, arr_b) in rows:
             plans.append({
                 "type": "change",
                 "legs": [

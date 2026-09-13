@@ -357,7 +357,14 @@ def _parse_days(op_profile) -> set[str]:
 
     for regular in op_profile.iter():
         tag = regular.tag.split("}")[-1] if "}" in regular.tag else regular.tag
-        if tag in day_map and regular.text and regular.text.lower() in ("true", "1"):
+        # TransXChange marks a regular operating day by the MERE PRESENCE of
+        # an empty element (<Monday/>); regular.text is None there, not
+        # "true". Requiring non-empty text left `days` empty for virtually
+        # every feed and the all-days fallback below marked every journey
+        # days_mask=127. Empty element = day applies; explicit "false"/"0"
+        # = it doesn't.
+        text = (regular.text or "").strip().lower()
+        if tag in day_map and text in ("", "true", "1"):
             days.add(day_map[tag])
 
     if not days:
