@@ -821,10 +821,18 @@ class TimetableWriter:
 
     # -- writers -------------------------------------------------------------
     def add_stop(self, naptan: str, name: str, lat=None, lon=None):
+        # Conflict update fills blanks (and never blanks a value): name wins
+        # only when non-empty, coords win only when the new pair is present.
+        # stops are shared across datasets and survive force_refresh's purge
+        # (discard_dataset), so this upsert is what backfills coordinates into
+        # pre-existing rows when a refreshed dataset re-reports its stops.
         self.conn.execute(
             "INSERT INTO stops (naptan, name, lat, lon) VALUES (?,?,?,?) "
-            "ON CONFLICT(naptan) DO UPDATE SET name="
-            "CASE WHEN excluded.name != '' THEN excluded.name ELSE stops.name END",
+            "ON CONFLICT(naptan) DO UPDATE SET "
+            "name=CASE WHEN excluded.name != '' THEN excluded.name "
+            "ELSE stops.name END, "
+            "lat=COALESCE(excluded.lat, stops.lat), "
+            "lon=COALESCE(excluded.lon, stops.lon)",
             (naptan, name, lat, lon))
 
     def upsert_route(self, op: str, num: str, directions: set, stop_list: list,

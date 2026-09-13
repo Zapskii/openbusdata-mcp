@@ -200,6 +200,44 @@ def test_route_stop_coords_unknown_route_is_none(seeded_route):
     assert seeded_route.route_stop_coords("OPX", "999") is None
 
 
+# --- Tests 41-44: add_stop upsert fills blanks, never blanks values ---
+# BUG_REPORT.md BUG 2 follow-up: force_refresh cannot purge `stops` (shared
+# across datasets — discard_dataset leaves them), so coordinate backfill rides
+# the add_stop conflict update. The old ON CONFLICT updated name only, leaving
+# lat/lon NULL on every pre-existing row, so a refresh alone fixed nothing.
+
+def test_41_add_stop_coords_set_on_first_insert(writer):
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    row = writer.conn.execute(
+        "SELECT lat, lon FROM stops WHERE naptan='010A'").fetchone()
+    assert row == (51.5, -0.1)
+
+
+def test_42_add_stop_conflict_fills_blank_coords(writer):
+    writer.add_stop("010A", "Alpha Street", None, None)
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    row = writer.conn.execute(
+        "SELECT name, lat, lon FROM stops WHERE naptan='010A'").fetchone()
+    assert row == ("Alpha Street", 51.5, -0.1), "conflict update must backfill coords"
+
+
+def test_43_add_stop_conflict_never_blanks_existing_coords(writer):
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    # A coord-less dataset re-reporting the same stop must not wipe them.
+    writer.add_stop("010A", "Alpha Street", None, None)
+    row = writer.conn.execute(
+        "SELECT lat, lon FROM stops WHERE naptan='010A'").fetchone()
+    assert row == (51.5, -0.1), "COALESCE must keep the existing pair"
+
+
+def test_44_add_stop_coords_parse_to_query_roundtrip(writer, store):
+    writer.add_stop("010A", "Alpha Street", 51.887582, -0.160167)
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A"], 1)
+    writer.commit()
+    coords = store.route_stop_coords("OPX", "12")
+    assert coords and coords[0]["lat"] == 51.887582 and coords[0]["lon"] == -0.160167
+
+
 def test_journeys_on_route_full_profiles(seeded_route):
     profiles = seeded_route.journeys_on_route("OPX", "12", "mon")
     assert len(profiles) == 2

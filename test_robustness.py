@@ -892,3 +892,47 @@ def test_28_remote_echo_is_redacted_from_every_success_path(
     _assert_success_path_is_clean(lambda: body, _MARKER[tool], tool)
 
 
+# --- Tests 37-40: stop coordinates parse out of AnnotatedStopPointRef/Location ---
+# BUG_REPORT.md BUG 2 (retest 2026-09-13): the parser read only StopPointRef +
+# CommonName, every stops row kept lat/lon NULL, _haversine_km returned None for
+# every vehicle and estimate_live_eta could never match anything. BODS files
+# carry <Location><Longitude>/<Latitude> per stop (dataset 15766: 62/62).
+
+_STOP_XML = (
+    '<TransXChange xmlns="http://www.transxchange.org.uk/">'
+    '<StopPoints><AnnotatedStopPointRef>'
+    '<StopPointRef>010A</StopPointRef><CommonName>Alpha Street</CommonName>'
+    '{coords}'
+    '</AnnotatedStopPointRef></StopPoints></TransXChange>'
+)
+
+_COORDS = ('<Location><Longitude>-0.160167</Longitude>'
+           '<Latitude>51.887582</Latitude></Location>')
+
+
+def test_37_parse_stop_coordinates_present():
+    stops, _, _ = server.parse_transxchange(_STOP_XML.format(coords=_COORDS), "Op")
+    assert len(stops) == 1, f"expected one stop, got {len(stops)}"
+    assert stops[0].lat == 51.887582, "latitude not parsed from Location"
+    assert stops[0].lon == -0.160167, "longitude not parsed from Location"
+
+
+def test_38_parse_stop_without_location_leaves_coords_none():
+    stops, _, _ = server.parse_transxchange(_STOP_XML.format(coords=""), "Op")
+    assert stops and stops[0].naptan == "010A"
+    assert stops[0].lat is None and stops[0].lon is None
+
+
+def test_39_parse_stop_half_coord_pair_is_dropped():
+    half = "<Location><Latitude>51.887582</Latitude></Location>"
+    stops, _, _ = server.parse_transxchange(_STOP_XML.format(coords=half), "Op")
+    assert stops[0].lat is None and stops[0].lon is None
+
+
+def test_40_parse_stop_malformed_coords_are_dropped():
+    bad = ('<Location><Latitude>not-a-float</Latitude>'
+           '<Longitude>-0.2</Longitude></Location>')
+    stops, _, _ = server.parse_transxchange(_STOP_XML.format(coords=bad), "Op")
+    assert stops[0].lat is None and stops[0].lon is None
+
+

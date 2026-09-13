@@ -388,13 +388,28 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
     journeys: list[Journey] = []
 
     # --- Extract StopPoints ---
+    # BODS TXC files carry <Location><Latitude>/<Longitude> in every
+    # AnnotatedStopPointRef; without them vehicle→stop distance is always
+    # None and estimate_live_eta can never match a vehicle (BUG_REPORT.md
+    # retest 2026-09-13). Parse them; tolerate absent/half/malformed pairs.
     for asp in root.iter(q("AnnotatedStopPointRef")):
         ref_elem = asp.find(q("StopPointRef"))
         name_elem = asp.find(q("CommonName"))
         if ref_elem is not None:
             naptan = ref_elem.text
             name = name_elem.text if name_elem is not None else "Unknown"
-            stops.append(Stop(naptan=naptan, name=name))
+            lat = lon = None
+            loc = asp.find(q("Location"))
+            if loc is not None:
+                lat_elem = loc.find(q("Latitude"))
+                lon_elem = loc.find(q("Longitude"))
+                if lat_elem is not None and lat_elem.text and \
+                        lon_elem is not None and lon_elem.text:
+                    try:
+                        lat, lon = float(lat_elem.text), float(lon_elem.text)
+                    except ValueError:
+                        pass  # malformed pair: leave coords unset
+            stops.append(Stop(naptan=naptan, name=name, lat=lat, lon=lon))
 
     # --- Extract JourneyPatternSections with timing ---
     # jps_id -> list of (from_stop, to_stop, runtime)
