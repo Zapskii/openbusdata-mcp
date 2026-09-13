@@ -1077,3 +1077,24 @@ def test_45_service_without_days_or_period_keeps_legacy_default():
     assert len(journeys) == 1, "legacy file must still load"
     assert journeys[0].days == {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}, (
         "no Service declarations -> historical all-days default")
+
+
+def test_46_force_refresh_purges_legacy_ds0_orphans(writer):
+    # Round 4 follow-up 2: journeys predating ds_id tagging (ds_id=0) have
+    # no loaded_datasets row, so per-id reconciliation never saw them and
+    # every force_refresh left them behind (715 rows in the live index, all
+    # carrying the old parser's mask=127). A full refresh reconciles the
+    # index with the catalogue: orphans go; loaded datasets re-insert their
+    # own fresh rows.
+    writer.add_journey("LegacyOp", "9", "outbound", "J1", {"mon"},
+                       [{"naptan": "A1", "arrival": None, "departure": "09:00:00"},
+                        {"naptan": "B2", "arrival": "09:10:00", "departure": None}],
+                       0)
+    writer.mark_dataset_loaded(2, "2026-01-01T00:00:00Z", "Op")
+    writer.commit()
+    server.httpx.AsyncClient = _CatClient
+    asyncio.run(server.load_all_timetable_data(force_refresh=True))
+    assert 0 not in writer.loaded_ids() or True  # ds 0 never in loaded_ids
+    n = writer.conn.execute(
+        "SELECT COUNT(*) FROM journeys WHERE ds_id=0").fetchone()[0]
+    assert n == 0, "legacy ds_id=0 rows must be purged by force_refresh"

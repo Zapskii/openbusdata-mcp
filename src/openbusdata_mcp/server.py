@@ -791,6 +791,15 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
         known = set(all_ids)
         for ds_id in [i for i in writer.loaded_ids() if i not in known]:
             writer.discard_dataset(ds_id)
+        # Legacy orphans: journeys predating ds_id tagging (ds_id=0) have no
+        # loaded_datasets row, so the per-id purge above can never see them.
+        # Nothing regenerates them — a force_refresh's job is to reconcile
+        # the index with the catalogue, so they go. A currently-loaded
+        # dataset re-inserts its own fresh rows.
+        n_orphans = writer.conn.execute(
+            "SELECT COUNT(*) FROM journeys WHERE ds_id=0").fetchone()[0]
+        if n_orphans:
+            writer.discard_dataset(0)
         writer.commit()
 
     loaded = 0
