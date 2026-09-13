@@ -28,6 +28,20 @@ uvx openbusdata-mcp
 pip install openbusdata-mcp
 ```
 
+### Option 3: via Docker (recommended for always-on deployments)
+
+```bash
+docker build -f Dockerfile.image -t openbusdata-mcp:latest .
+
+# The named volume persists the SQLite timetable index across container
+# restarts — first bootstrap downloads ~940 datasets, after that startup is
+# instant with no re-download.
+docker run -i --rm \
+  -e OPENBUS_API_KEY \
+  -v openbusdata-cache:/root/.cache/openbusdata \
+  openbusdata-mcp
+```
+
 ## Configuration
 
 Set your Bus Open Data Service API key as an environment variable:
@@ -72,6 +86,27 @@ Add to your MCP client (Claude Desktop, Cursor, etc.):
   }
 }
 ```
+
+### With Docker
+
+```json
+{
+  "mcpServers": {
+    "openbusdata": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "OPENBUS_API_KEY",
+               "-v", "openbusdata-cache:/root/.cache/openbusdata",
+               "openbusdata-mcp"],
+      "env": {
+        "OPENBUS_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+For the full ops detail — initial bootstrap (~940 datasets), scheduled delta
+refreshes, key rotation and verification — see [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Development
 
