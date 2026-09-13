@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
 from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
 from .fares import parse_fare_prices
@@ -345,31 +345,94 @@ def _fmt_seconds(total: int) -> str:
     return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
 
 
-def _parse_days(op_profile) -> set[str]:
-    """Extract operating days from OperatingProfile or SpecialDaysOperation."""
+_DAY_NAMES = {
+    "Monday": "mon", "Tuesday": "tue", "Wednesday": "wed",
+    "Thursday": "thu", "Friday": "fri", "Saturday": "sat", "Sunday": "sun",
+}
+_ALL_DAYS = set(_DAY_NAMES.values())
+
+
+def _day_set_from_days_of_week(el) -> set[str]:
+    """Days declared by a <DaysOfWeek> (or any container of <Monday/>-style
+    children). Presence of an empty day element = the day applies; explicit
+    'false'/'0' = it doesn't."""
     days = set()
-    day_map = {
-        "Monday": "mon", "Tuesday": "tue", "Wednesday": "wed",
-        "Thursday": "thu", "Friday": "fri", "Saturday": "sat", "Sunday": "sun",
-    }
-    if op_profile is None:
-        return set(day_map.values())  # Assume every day if not specified
-
-    for regular in op_profile.iter():
-        tag = regular.tag.split("}")[-1] if "}" in regular.tag else regular.tag
-        # TransXChange marks a regular operating day by the MERE PRESENCE of
-        # an empty element (<Monday/>); regular.text is None there, not
-        # "true". Requiring non-empty text left `days` empty for virtually
-        # every feed and the all-days fallback below marked every journey
-        # days_mask=127. Empty element = day applies; explicit "false"/"0"
-        # = it doesn't.
-        text = (regular.text or "").strip().lower()
-        if tag in day_map and text in ("", "true", "1"):
-            days.add(day_map[tag])
-
-    if not days:
-        return set(day_map.values())
+    for child in el.iter():
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        text = (child.text or "").strip().lower()
+        if tag in _DAY_NAMES and text in ("", "true", "1"):
+            days.add(_DAY_NAMES[tag])
     return days
+
+
+def _parse_days(op_profile) -> set[str]:
+    """Operating days from a per-vehicle-journey <OperatingProfile>."""
+    if op_profile is None:
+        return set()  # nothing declared here; caller falls back to Service level
+    return _day_set_from_days_of_week(op_profile)
+
+
+def _service_level(root, q) -> dict:
+    """First <Service> element's operating days and validity period.
+
+    BODS TXC files declare day-of-week operation at the SERVICE level (one
+    Service per file: Sunday-only, Mon-Fri, Saturday), not per VehicleJourney
+    - dataset 15766 files carry zero per-VJ OperatingProfiles. Files that
+    don't use Service-level declarations return all-days + no period, which
+    preserves the historical default."""
+    out = {"days": set(_ALL_DAYS), "start": None, "end": None}
+    svc = root.find(".//" + q("Service"))
+    if svc is None:
+        return out
+    dow = svc.find(".//" + q("DaysOfWeek"))
+    if dow is not None:
+        days = _day_set_from_days_of_week(dow)
+        if days:
+            out["days"] = days
+    op = svc.find(".//" + q("OperatingPeriod"))
+    if op is not None:
+        out["start"] = _parse_txc_date(op.findtext(q("StartDate")))
+        out["end"] = _parse_txc_date(op.findtext(q("EndDate")))
+    return out
+
+
+def _parse_txc_date(text):
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text.strip()[:10])
+    except ValueError:
+        return None
+
+
+def _operating_period_covers_today(period, today) -> bool:
+    """True when the Service's validity window includes `today` (or is
+    undated - legacy files with no OperatingPeriod must still load)."""
+    start, end = period.get("start"), period.get("end")
+    if start is not None and today < start:
+        return False
+    if end is not None and today > end:
+        return False
+    return True
+
+
+def _dedupe_journeys(journeys):
+    """Drop journeys identical to an earlier one (same code, days, and full
+    stop profile). BODS operator packs legitimately ship the same journeys
+    under several registration variants - an expired period's files are
+    exact copies of the current ones (dataset 15766: 6 SB4 files = 2 periods
+    x 3 day-of-week files, byte-identical per variant) - and loading all of
+    them double-counts every departure on the board."""
+    seen = set()
+    unique = []
+    for j in journeys:
+        key = (j.journey_code, tuple(sorted(j.days)),
+               tuple((s.naptan, s.arrival, s.departure) for s in j.stops))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(j)
+    return unique
 
 
 def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], list[Route], list[Journey]]:
@@ -475,8 +538,23 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
             directions=all_directions, stops=longest,
         ))
 
+    # --- Service-level days + validity period ---
+    # BODS TXC declares operating days and the registration period on the
+    # <Service> element; per-VJ OperatingProfiles are usually absent. Without
+    # the Service fallback every journey inherited the all-7-days default
+    # (337,809/1,103,820 rows in the post-refresh index), putting weekday
+    # patterns on Sunday boards; without the period gate, expired twins of
+    # the current registration loaded alongside it (every board row twice).
+    svc_level = _service_level(root, q)
+    # The Service's validity window gates the whole file: an expired
+    # registration's journeys must not join the index even when the operator
+    # pack still ships them alongside the current period.
+    period_ok = _operating_period_covers_today(svc_level, date.today())
+
     # --- Extract VehicleJourneys with times ---
     for vj in root.iter(q("VehicleJourney")):
+        if not period_ok:
+            break
         jpref = vj.find(q("JourneyPatternRef"))
         if jpref is None or jpref.text not in jp_map:
             continue
@@ -490,9 +568,10 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
         vj_code_elem = vj.find(q("VehicleJourneyCode"))
         journey_code = vj_code_elem.text if vj_code_elem is not None else "unknown"
 
-        # Operating profile (days)
+        # Operating profile (days): per-VJ profile wins; otherwise the days
+        # declared at Service level; otherwise the historical all-days default.
         op_profile = vj.find(q("OperatingProfile"))
-        days = _parse_days(op_profile)
+        days = _parse_days(op_profile) or svc_level["days"]
 
         # Build stop schedule by accumulating run times as seconds since the
         # start of the service day (no 24-hour wraparound — see _fmt_seconds)
@@ -519,6 +598,10 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
                 direction=jp_data["direction"], journey_code=journey_code,
                 stops=journey_stops, days=days,
             ))
+
+    # Same journeys ship under several registration variants in one operator
+    # pack; keep the first occurrence of each distinct profile.
+    journeys = _dedupe_journeys(journeys)
 
     return stops, routes, journeys
 

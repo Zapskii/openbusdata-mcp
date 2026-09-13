@@ -94,5 +94,9 @@ def test_parse_days_explicit_text_still_applies():
     assert _parse_days(op) == {"mon", "fri"}
 
 
-def test_parse_days_none_profile_all_days():
-    assert _parse_days(None) == {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+def test_parse_days_none_profile_is_empty_service_level_decides():
+    # Contract change (BUG_REPORT round 4): a VJ with no OperatingProfile no
+    # longer means "runs every day". BODS declares days on the <Service>
+    # element; parse_transxchange falls back per-VJ -> Service -> all-days.
+    # At this level, None simply means "nothing declared here".
+    assert _parse_days(None) == set()

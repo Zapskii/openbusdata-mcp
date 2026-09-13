@@ -936,3 +936,136 @@ def test_40_parse_stop_malformed_coords_are_dropped():
     assert stops[0].lat is None and stops[0].lon is None
 
 
+
+
+# --- Tests 41-45: Service-level days, validity period gating, journey dedupe ---
+# BUG_REPORT.md round 4 (2026-09-13, dataset 15766): BODS TXC declares
+# operating days on <Service><DaysOfWeek> (not per-VJ) and the registration
+# window on <Service><OperatingPeriod>. The parser ignored both: every VJ
+# fell back to all-7-days (337,809/1,103,820 index rows carried
+# days_mask=127, putting weekday patterns on Sunday boards), and expired-
+# period twins of the current registration loaded alongside it (every board
+# row twice). Real shape: one dataset = Sun + Mon-Fri + Sat files for the
+# current period plus byte-identical copies of the expired period.
+
+from datetime import date as _date, timedelta as _timedelta
+
+_SERVICE_XML = (
+    '<TransXChange xmlns="http://www.transxchange.org.uk/">'
+    '<StopPoints>'
+    '<AnnotatedStopPointRef><StopPointRef>010A</StopPointRef>'
+    '<CommonName>Alpha</CommonName></AnnotatedStopPointRef>'
+    '<AnnotatedStopPointRef><StopPointRef>010B</StopPointRef>'
+    '<CommonName>Beta</CommonName></AnnotatedStopPointRef>'
+    '</StopPoints>'
+    '<Services><Service>'
+    '<ServiceCode>PF1:1</ServiceCode>'
+    '<OperatingPeriod><StartDate>{start}</StartDate><EndDate>{end}</EndDate></OperatingPeriod>'
+    '<DaysOfWeek>{days}</DaysOfWeek>'
+    '</Service></Services>'
+    '<JourneyPatternSections>'
+    '<JourneyPatternSection id="jps1">'
+    '<JourneyPatternTimingLink>'
+    '<From><StopPointRef>010A</StopPointRef></From>'
+    '<To><StopPointRef>010B</StopPointRef></To>'
+    '<RunTime>PT5M</RunTime>'
+    '</JourneyPatternTimingLink>'
+    '</JourneyPatternSection>'
+    '</JourneyPatternSections>'
+    '<JourneyPatterns><JourneyPattern id="jp1">'
+    '<Direction>outbound</Direction>'
+    '<JourneyPatternSectionRefs>jps1</JourneyPatternSectionRefs>'
+    '</JourneyPattern></JourneyPatterns>'
+    '{vjs}'
+    '</TransXChange>'
+)
+
+
+def _svc_vj(code, dep):
+    return ('<VehicleJourney>'
+            f'<VehicleJourneyCode>{code}</VehicleJourneyCode>'
+            '<JourneyPatternRef>jp1</JourneyPatternRef>'
+            f'<DepartureTime>{dep}</DepartureTime>'
+            '</VehicleJourney>')
+
+
+def test_41_service_level_days_of_week_apply_to_vjs():
+    today = _date.today()
+    xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
+                              end="", days="<Sunday/>",
+                              vjs=_svc_vj("vj_1", "08:45:00")
+                              + _svc_vj("vj_2", "09:45:00"))
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 2, "expected both VJs to survive the period gate"
+    assert all(j.days == {"sun"} for j in journeys), (
+        "VJs without an OperatingProfile must inherit the Service's days")
+
+
+def test_42_per_vj_profile_beats_service_days():
+    today = _date.today()
+    vj = ('<VehicleJourney><VehicleJourneyCode>vj_1</VehicleJourneyCode>'
+          '<JourneyPatternRef>jp1</JourneyPatternRef>'
+          '<DepartureTime>08:45:00</DepartureTime>'
+          '<OperatingProfile><RegularDayType><DaysOfWeek><Monday/>'
+          '</DaysOfWeek></RegularDayType></OperatingProfile>'
+          '</VehicleJourney>')
+    xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
+                              end="", days="<Sunday/>", vjs=vj)
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 1
+    assert journeys[0].days == {"mon"}, "per-VJ profile must win over Service days"
+
+
+def test_43_expired_or_future_period_gates_all_journeys():
+    today = _date.today()
+    vjs = _svc_vj("vj_1", "08:45:00")
+    expired = _SERVICE_XML.format(
+        start=(today - _timedelta(days=30)).isoformat(),
+        end=(today - _timedelta(days=7)).isoformat(),
+        days="<Sunday/>", vjs=vjs)
+    _, _, journeys = server.parse_transxchange(expired, "Op")
+    assert journeys == [], "expired registration must contribute no journeys"
+
+    future = _SERVICE_XML.format(
+        start=(today + _timedelta(days=7)).isoformat(),
+        end="", days="<Sunday/>", vjs=vjs)
+    _, _, journeys = server.parse_transxchange(future, "Op")
+    assert journeys == [], "not-yet-started registration must contribute no journeys"
+
+    current = _SERVICE_XML.format(
+        start=(today - _timedelta(days=1)).isoformat(),
+        end="", days="<Sunday/>", vjs=vjs)
+    _, _, journeys = server.parse_transxchange(current, "Op")
+    assert len(journeys) == 1, "current open-ended registration must load"
+
+
+def test_44_identical_journey_profiles_dedupe():
+    today = _date.today()
+    # Two byte-identical VJ profiles (the expired-twin shape): keep one.
+    xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
+                              end="", days="<Sunday/>",
+                              vjs=_svc_vj("vj_1", "08:45:00")
+                              + _svc_vj("vj_1", "08:45:00"))
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 1, "identical profiles must collapse to one journey"
+
+    # Distinct departure times are distinct journeys, even with the same code.
+    xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
+                              end="", days="<Sunday/>",
+                              vjs=_svc_vj("vj_1", "08:45:00")
+                              + _svc_vj("vj_1", "08:55:00"))
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 2, "distinct stop profiles must not be collapsed"
+
+
+def test_45_service_without_days_or_period_keeps_legacy_default():
+    today = _date.today()
+    xml = _SERVICE_XML.format(start="", end="", days="",
+                              vjs=_svc_vj("vj_1", "08:45:00"))
+    xml = xml.replace("<DaysOfWeek></DaysOfWeek>", "")
+    xml = xml.replace("<OperatingPeriod><StartDate></StartDate>"
+                      "<EndDate></EndDate></OperatingPeriod>", "")
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 1, "legacy file must still load"
+    assert journeys[0].days == {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}, (
+        "no Service declarations -> historical all-days default")
