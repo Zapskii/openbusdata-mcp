@@ -209,3 +209,37 @@ def test_journeys_on_route_full_profiles(seeded_route):
         {"naptan": "010A", "dep": "09:00:00", "arr": None},
         {"naptan": "010B", "dep": "09:11:00", "arr": "09:10:00"},
         {"naptan": "010C", "dep": "09:20:00", "arr": "09:20:00"}]
+
+
+# --- operator name <-> NOC resolution -------------------------------------
+
+def test_resolve_operator_by_name(seeded_route_named_noc):
+    assert seeded_route_named_noc.resolve_operator("Op Express Ltd", "12") == (
+        "Op Express Ltd", ["OPX"])
+
+
+def test_resolve_operator_by_noc(seeded_route_named_noc):
+    # A NOC input must still find the index route, keyed by the NAME.
+    assert seeded_route_named_noc.resolve_operator("OPX", "12") == (
+        "Op Express Ltd", ["OPX"])
+
+
+def test_resolve_operator_unknown_is_none(seeded_route_named_noc):
+    assert seeded_route_named_noc.resolve_operator("NOPE", "12") is None
+    assert seeded_route_named_noc.resolve_operator("OPX", "999") is None
+
+
+def test_resolve_operator_without_provenance(writer, store):
+    # A pre-fix index: route rows, no dataset provenance at all. The name still
+    # resolves (the route is there) but there is no NOC to send to BODS.
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A"], 1)
+    writer.commit()
+    assert store.resolve_operator("OPX", "12") == ("OPX", [])
+
+
+def test_resolve_operator_with_blank_noc_column(writer, store):
+    # A DB upgraded in place: the column exists but predates any noc value.
+    writer.upsert_route("OPX", "12", {"outbound"}, ["010A"], 1)
+    writer.mark_dataset_loaded(1, None, "OPX", "")
+    writer.commit()
+    assert store.resolve_operator("OPX", "12") == ("OPX", [])

@@ -606,7 +606,16 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
                         journey.journey_code, journey.days,
                         [asdict(s) for s in journey.stops], ds_id)
 
-            writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator)
+            # The NOC is what the SIRI-VM datafeed wants, while the index keys
+            # routes by operatorName. Both come from this same metadata
+            # response so the pair cannot drift apart. A dataset may carry
+            # several NOCs; the API documents a comma-separated list, so store
+            # them comma-joined. Guard the str case: joining a bare string
+            # would split it into one character per NOC.
+            nocs = meta.get("noc") or []
+            writer.mark_dataset_loaded(ds_id, meta.get("modified"), operator,
+                                       nocs if isinstance(nocs, str)
+                                       else ",".join(nocs))
             writer.commit()  # one transaction per dataset: implicit checkpoint
         except Exception:
             # A failure mid-rewrite must not leave the purge uncommitted:
@@ -1281,7 +1290,9 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
 
     Parameters:
       stop: Target stop (NaPTAN code or name).
-      operator_ref: Operator NOC code.
+      operator_ref: Operator NOC code (e.g. ARHE), or the operator name as it
+                    appears in the timetable index. The two are resolved to
+                    the same route; the NOC is what reaches the live feed.
       line_ref: Route number.
       day: Optional day filter: mon, tue, wed, thu, fri, sat, sun. Defaults to today.
     """
@@ -1290,15 +1301,28 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
     naptans = store.resolve_stop(stop)
     if not naptans:
         return f'Could not resolve stop: "{stop}". Try search_stops().'
-    coords = store.route_stop_coords(operator_ref, line_ref)
-    if coords is None:
+    resolved = store.resolve_operator(operator_ref, line_ref)
+    if resolved is None:
         return (f"Route {operator_ref}|{line_ref} is not in the timetable index. "
+                f"Try get_route_stops().")
+    # The index keys routes by the dataset's operator NAME; the datafeed only
+    # accepts a NOC in operatorRef. Resolve once, then use each where it
+    # belongs — one input can no longer serve both.
+    operator, nocs = resolved
+    if not nocs:
+        return (f'No NOC on record for operator "{operator}". The timetable '
+                f"index predates operator codes — re-run "
+                f"load_timetable_index(force_refresh=True) to rebuild it, then "
+                f"retry with the operator name or its NOC.")
+    coords = store.route_stop_coords(operator, line_ref)
+    if coords is None:
+        return (f"Route {operator}|{line_ref} is not in the timetable index. "
                 f"Try get_route_stops().")
     target = next((c for c in coords if c["naptan"] in naptans), None)
     if target is None:
-        return f'"{stop}" is not served by route {operator_ref}|{line_ref}.'
+        return f'"{stop}" is not served by route {operator}|{line_ref}.'
 
-    filters = {"operatorRef": operator_ref, "lineRef": line_ref}
+    filters = {"operatorRef": ",".join(nocs), "lineRef": line_ref}
     try:
         content = await _fetch_siri_vm(filters)
         vehicles = parse_siri_vm(content)
@@ -1308,7 +1332,7 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
     if day is None:
         day = datetime.now().strftime("%a").lower()
     day = day.lower()[:3]
-    profiles = store.journeys_on_route(operator_ref, line_ref, day)
+    profiles = store.journeys_on_route(operator, line_ref, day)
     now_s = datetime.now().strftime("%H:%M:%S")
 
     results = []
@@ -1370,7 +1394,7 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
     results.sort(key=lambda r: (r["eta"] or {}).get("minutes", 10 ** 6))
     if not results:
         note = f" ({skipped} vehicles unmatched to the route)" if skipped else ""
-        return (f"No live buses matched to route {operator_ref}|{line_ref} "
+        return (f"No live buses matched to route {operator}|{line_ref} "
                 f"near the target stop{note}.")
     # R29: remote-derived content on the way out, so it goes through _redact.
     return _redact(json.dumps({"target_stop": target["name"], "vehicles": results},

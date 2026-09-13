@@ -89,5 +89,31 @@ def seeded_route(writer, store):
         {"naptan": "010A", "arrival": None, "departure": "09:30:00"},
         {"naptan": "010B", "arrival": "09:40:00", "departure": None},
         {"naptan": "010C", "arrival": "09:50:00", "departure": None}], 1)
+    # Dataset provenance, as the loader writes it. Here the NOC equals the
+    # operator name, so the two identifiers coincide.
+    writer.mark_dataset_loaded(1, "2026-09-01T00:00:00Z", "OPX", "OPX")
+    writer.commit()
+    return store
+
+
+@pytest.fixture
+def seeded_route_named_noc(writer, store):
+    """seeded_route, but the dataset's operator NAME is not its NOC.
+
+    The index keys routes by the BODS `operatorName` ("Op Express Ltd"), while
+    the SIRI-VM datafeed wants the NOC ("OPX") — the split that makes a single
+    operator_ref string unable to serve both backends. Same stops and Monday
+    timetable as `seeded_route`, so the ETA assertions carry over.
+    """
+    writer.add_stop("010A", "Alpha Street", 51.5, -0.1)
+    writer.add_stop("010B", "Bravo Road", 51.51, -0.11)
+    writer.add_stop("010C", "Charlie Road", 51.52, -0.12)
+    writer.upsert_route("Op Express Ltd", "12", {"outbound"},
+                        ["010A", "010B", "010C"], 1)
+    writer.add_journey("Op Express Ltd", "12", "outbound", "J1", {"mon"}, [
+        {"naptan": "010A", "arrival": None, "departure": "09:00:00"},
+        {"naptan": "010B", "arrival": "09:10:00", "departure": "09:11:00"},
+        {"naptan": "010C", "arrival": "09:20:00", "departure": None}], 1)
+    writer.mark_dataset_loaded(1, "2026-09-01T00:00:00Z", "Op Express Ltd", "OPX")
     writer.commit()
     return store

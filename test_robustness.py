@@ -326,6 +326,54 @@ def test_4_soft_failures_counted_as_errors():
     assert asyncio.run(server._load_dataset(2)) is not None, "good zip not reported as success"
 
 
+class _ZipNocClient(_FakeClient):
+    """Meta carries the dataset's NOCs alongside the operator name."""
+    async def get(self, url):
+        if "/dataset/3/" in url:
+            return _Resp(200, json.dumps({
+                "operatorName": "Arriva UK Bus", "noc": ["ARHE", "ARHV"],
+                "url": "http://x/y.zip",
+                "modified": "2026-01-01T00:00:00Z"}).encode())
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
+        assert method == "GET", f"unexpected stream method: {method}"
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
+
+
+class _ZipNocStringClient(_FakeClient):
+    """Same, but noc arrives as a bare string rather than the documented list."""
+    async def get(self, url):
+        if "/dataset/4/" in url:
+            return _Resp(200, json.dumps({
+                "operatorName": "Arriva UK Bus", "noc": "ARHE",
+                "url": "http://x/y.zip",
+                "modified": "2026-01-01T00:00:00Z"}).encode())
+        return _Resp(404, b"")
+
+    def stream(self, method, url):
+        return _Resp(200, _make_zip(b"<TransXChange/>"))
+
+
+def test_4b_load_dataset_records_operator_nocs(writer):
+    """The NOC must be persisted at load time: it is the only mapping from the
+    index's operator name to the identifier the live feed accepts."""
+    server.httpx.AsyncClient = _ZipNocClient
+    assert asyncio.run(server._load_dataset(3)) is not None, "load reported failure"
+    row = writer.conn.execute(
+        "SELECT operator, noc FROM loaded_datasets WHERE ds_id=3").fetchone()
+    # Stored comma-joined, one entry per NOC — not one char per NOC.
+    assert row == ("Arriva UK Bus", "ARHE,ARHV"), f"stored noc {row!r}"
+
+
+def test_4c_load_dataset_noc_string_is_not_split(writer):
+    server.httpx.AsyncClient = _ZipNocStringClient
+    assert asyncio.run(server._load_dataset(4)) is not None, "load reported failure"
+    row = writer.conn.execute(
+        "SELECT noc FROM loaded_datasets WHERE ds_id=4").fetchone()
+    assert row == ("ARHE",), f"bare-string noc mangled to {row!r}"
+
+
 # --- Test 5: plan_journey dedup keeps distinct operators on the same route
 # Seed two journeys: same route number + depart, different operators.
 def test_5_plan_dedup_keeps_distinct_operators(writer):

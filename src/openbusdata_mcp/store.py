@@ -48,6 +48,18 @@ def _days_mask(days: set) -> int:
     return sum(DAY_BITS[d] for d in days if d in DAY_BITS)
 
 
+def _split_nocs(text) -> list[str]:
+    """Parse a loaded_datasets.noc value (comma-joined, as stored) into a
+    de-duplicated list, preserving order."""
+    seen, out = set(), []
+    for noc in (text or "").split(","):
+        noc = noc.strip()
+        if noc and noc not in seen:
+            seen.add(noc)
+            out.append(noc)
+    return out
+
+
 class Candidate(NamedTuple):
     """One A-boards-before-B journey resolved entirely in SQL."""
     journey_id: int
@@ -493,6 +505,42 @@ class TimetableStore:
                  "journey_code": r[3], "depart": r[4], "destination": r[5]}
                 for r in rows]
 
+    def resolve_operator(self, operator: str, route: str
+                         ) -> Optional[tuple[str, list[str]]]:
+        """Resolve a caller's operator_ref to (index operator name, NOC list)
+        for `route`, or None when no route matches under either reading.
+
+        The two identifiers live in different key spaces: the index is keyed by
+        the BODS dataset `operatorName` (upsert_route's `key = op|num`), while
+        the SIRI-VM datafeed wants a NOC. Accepting either here is what lets
+        estimate_live_eta serve both backends from one input.
+
+        The NOC list is empty for an index built before NOCs were recorded —
+        callers must report that rather than sending the name to the datafeed,
+        which rejects it with a 400."""
+        row = self.conn.execute(
+            "SELECT r.op, d.noc FROM routes r "
+            "LEFT JOIN loaded_datasets d ON d.ds_id = r.ds_id "
+            "WHERE r.key=?", (f"{operator}|{route}",)).fetchone()
+        if row is not None:
+            return row[0], _split_nocs(row[1])
+        # Not a known name: read the input as a NOC. A NOC belongs to a
+        # dataset; its routes carry that dataset's operator name. The
+        # ','||noc||',' guard makes the LIKE an exact membership test.
+        rows = self.conn.execute(
+            "SELECT DISTINCT r.op, d.noc FROM routes r "
+            "JOIN loaded_datasets d ON d.ds_id = r.ds_id "
+            "WHERE r.num=? "
+            "  AND (','||REPLACE(d.noc,' ','')||',') LIKE '%,'||?||',%'",
+            (route, operator)).fetchall()
+        # One route number can be published by several operators, so a NOC
+        # matching more than one leaves the index route undetermined. Report
+        # that as a miss rather than picking one and answering from the wrong
+        # operator's timetable.
+        if len({r[0] for r in rows}) != 1:
+            return None
+        return rows[0][0], _split_nocs(rows[0][1])
+
     def route_stop_coords(self, operator: str, route: str) -> Optional[list]:
         """The route's ordered stop list with names and coordinates (the
         routes.stops JSON joined to stops). None when the route is unknown.
@@ -582,7 +630,8 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS stop_to_routes (naptan TEXT, key TEXT);
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS loaded_datasets (
-            ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT);
+            ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT,
+            noc TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
         CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
         CREATE INDEX IF NOT EXISTS js_j ON journey_stops(journey_id);
@@ -709,6 +758,14 @@ class TimetableWriter:
         if "ds_id" not in cols:
             self.conn.execute(
                 "ALTER TABLE routes ADD COLUMN ds_id INT DEFAULT 0")
+        # Legacy DBs: loaded_datasets predates NOC storage. Old rows keep the
+        # '' default, so resolve_operator reports "no NOC on record" (the
+        # caller then asks for a force_refresh) rather than inventing one.
+        cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(loaded_datasets)")}
+        if "noc" not in cols:
+            self.conn.execute(
+                "ALTER TABLE loaded_datasets ADD COLUMN noc TEXT DEFAULT ''")
         # Legacy DBs kept provenance in meta.dataset_meta JSON: promote it.
         row = self.conn.execute(
             "SELECT v FROM meta WHERE k='dataset_meta'").fetchone()
@@ -722,7 +779,8 @@ class TimetableWriter:
                 # abort the schema upgrade — skip them.
                 try:
                     self.conn.execute(
-                        "INSERT OR IGNORE INTO loaded_datasets VALUES (?,?,?)",
+                        "INSERT OR IGNORE INTO loaded_datasets "
+                        "(ds_id, modified, operator) VALUES (?,?,?)",
                         (int(ds_id_str), m.get("modified"), m.get("operator")))
                 except (ValueError, TypeError, AttributeError):
                     continue
@@ -823,10 +881,11 @@ class TimetableWriter:
         self.conn.commit()
 
     def mark_dataset_loaded(self, ds_id: int, modified: Optional[str],
-                            operator: str):
+                            operator: str, noc: str = ""):
         self.conn.execute(
-            "INSERT OR REPLACE INTO loaded_datasets VALUES (?,?,?)",
-            (ds_id, modified, operator))
+            "INSERT OR REPLACE INTO loaded_datasets (ds_id, modified, operator, noc) "
+            "VALUES (?,?,?,?)",
+            (ds_id, modified, operator, noc))
 
     def last_full_sweep(self) -> Optional[str]:
         row = self.conn.execute(
