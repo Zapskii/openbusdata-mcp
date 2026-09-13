@@ -318,3 +318,18 @@ now `{}` at VJ level, Service level decides).
 **Note:** existing indexes keep the wrong masks until a FULL
 force_refresh — a delta cannot see an unchanged dataset, and 30.6% of rows
 carry mask=127. Rebuild is required; boards will self-heal afterwards.
+
+## Round 4 follow-up (same day, post-refresh): dedupe must be DATASET-scope
+
+Full force_refresh with 90b48d8 landed (113 min, 940/941 datasets, 1
+error: 19731 Stowmarket Minibus, 4 journeys intact via transaction
+rollback — retry queued). Results: 1,103,820 → 778,304 journeys
+(expired twins gone), SB4 board now exactly bustimes.org (15:58 present,
+no :10/:20/:40/:50 phantoms), mask=127 rows 337,809 → 11,318.
+
+Residual: 17,319 exact-twin rows remained, all WITHIN single datasets —
+Go-Ahead packs ship 4 byte-identical copies per journey across 4 files
+of one zip. The round-4 dedupe ran per-file, so cross-file twins inside
+one dataset survived. Fix: loader accumulates all files of a dataset,
+then applies _dedupe_journeys at dataset scope (parse_transxchange no
+longer dedupes). Tests 157/157 (test_44 recut to the new contract).

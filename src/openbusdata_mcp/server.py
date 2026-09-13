@@ -419,10 +419,11 @@ def _operating_period_covers_today(period, today) -> bool:
 def _dedupe_journeys(journeys):
     """Drop journeys identical to an earlier one (same code, days, and full
     stop profile). BODS operator packs legitimately ship the same journeys
-    under several registration variants - an expired period's files are
-    exact copies of the current ones (dataset 15766: 6 SB4 files = 2 periods
-    x 3 day-of-week files, byte-identical per variant) - and loading all of
-    them double-counts every departure on the board."""
+    under several registration variants AND across several files of one
+    dataset (dataset 15766: 2 periods x 3 day-of-week files; Go-Ahead
+    packs: 4 identical copies per journey across files) - loading all of
+    them double-counts every departure on the board. The caller applies
+    this at DATASET scope, after all files of the zip are parsed."""
     seen = set()
     unique = []
     for j in journeys:
@@ -599,10 +600,6 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
                 stops=journey_stops, days=days,
             ))
 
-    # Same journeys ship under several registration variants in one operator
-    # pack; keep the first occurrence of each distinct profile.
-    journeys = _dedupe_journeys(journeys)
-
     return stops, routes, journeys
 
 
@@ -688,21 +685,29 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             if force_reload:
                 writer.discard_dataset(ds_id)
 
+            acc_stops, acc_routes, acc_journeys = [], [], []
             for content in contents:
                 stops, routes, journeys = parse_transxchange(content, operator)
-                for stop in stops:
-                    writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
-                for route in routes:
-                    # Legacy (untagged) journeys for this op+route are superseded
-                    # by this tagged write.
-                    writer.discard_untagged_for(route.operator, route.route_num)
-                    writer.upsert_route(route.operator, route.route_num,
-                                        route.directions, route.stops, ds_id)
-                for journey in journeys:
-                    writer.add_journey(
-                        journey.operator, journey.route_num, journey.direction,
-                        journey.journey_code, journey.days,
-                        [asdict(s) for s in journey.stops], ds_id)
+                acc_stops.extend(stops)
+                acc_routes.extend(routes)
+                acc_journeys.extend(journeys)
+            for stop in acc_stops:
+                writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
+            for route in acc_routes:
+                # Legacy (untagged) journeys for this op+route are superseded
+                # by this tagged write.
+                writer.discard_untagged_for(route.operator, route.route_num)
+                writer.upsert_route(route.operator, route.route_num,
+                                    route.directions, route.stops, ds_id)
+            # Same journeys ship under several registration variants AND in
+            # several files of one operator pack (Go-Ahead packs carry 4
+            # byte-identical copies per journey across files). Dedupe at
+            # DATASET scope: a per-file dedupe cannot see cross-file twins.
+            for journey in _dedupe_journeys(acc_journeys):
+                writer.add_journey(
+                    journey.operator, journey.route_num, journey.direction,
+                    journey.journey_code, journey.days,
+                    [asdict(s) for s in journey.stops], ds_id)
 
             # The NOC is what the SIRI-VM datafeed wants, while the index keys
             # routes by operatorName. Both come from this same metadata

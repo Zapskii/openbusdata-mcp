@@ -1039,15 +1039,22 @@ def test_43_expired_or_future_period_gates_all_journeys():
     assert len(journeys) == 1, "current open-ended registration must load"
 
 
-def test_44_identical_journey_profiles_dedupe():
+def test_44_dedupe_is_dataset_scope_not_file_scope():
+    # Contract (round 4 follow-up): Go-Ahead packs carry byte-identical
+    # journeys in DIFFERENT files of one dataset, so dedupe must run across
+    # the whole zip at loader scope - a per-file dedupe cannot see them.
+    # parse_transxchange therefore returns every journey it parses; the
+    # loader applies _dedupe_journeys() to the accumulated list.
     today = _date.today()
-    # Two byte-identical VJ profiles (the expired-twin shape): keep one.
     xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
                               end="", days="<Sunday/>",
                               vjs=_svc_vj("vj_1", "08:45:00")
                               + _svc_vj("vj_1", "08:45:00"))
     _, _, journeys = server.parse_transxchange(xml, "Op")
-    assert len(journeys) == 1, "identical profiles must collapse to one journey"
+    assert len(journeys) == 2, "parser must not dedupe (dedupe is loader-scope)"
+
+    deduped = server._dedupe_journeys(journeys)
+    assert len(deduped) == 1, "loader dedupe must collapse identical profiles"
 
     # Distinct departure times are distinct journeys, even with the same code.
     xml = _SERVICE_XML.format(start=(today - _timedelta(days=1)).isoformat(),
@@ -1055,7 +1062,8 @@ def test_44_identical_journey_profiles_dedupe():
                               vjs=_svc_vj("vj_1", "08:45:00")
                               + _svc_vj("vj_1", "08:55:00"))
     _, _, journeys = server.parse_transxchange(xml, "Op")
-    assert len(journeys) == 2, "distinct stop profiles must not be collapsed"
+    deduped = server._dedupe_journeys(journeys)
+    assert len(deduped) == 2, "distinct stop profiles must not be collapsed"
 
 
 def test_45_service_without_days_or_period_keeps_legacy_default():
