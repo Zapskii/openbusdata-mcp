@@ -1,4 +1,7 @@
 # test_planner.py
+from defusedxml import ElementTree as SafeET
+
+from openbusdata_mcp.server import _parse_days
 from openbusdata_mcp.store import _days_mask  # noqa: F401  (import sanity)
 
 A_TO_M = [{"naptan": "A1", "arrival": None, "departure": "09:00:00"},
@@ -58,3 +61,38 @@ def test_one_change_direct_first_occurrence_not_reboarded(writer, store):
         {"naptan": "B1", "arrival": "09:25:00", "departure": None}], 2)
     writer.commit()
     assert store.plan_one_change({"A1"}, {"B1"}, "mon", "10:00:00") == []
+
+
+def test_one_change_disjoint_mids_is_empty(writer, store):
+    # A-side and B-side networks share NO transfer stop: the mid-candidate
+    # intersection is empty, so the plan is empty and cheap to prove.
+    writer.add_journey("OpA", "7", "outbound", "J7e", {"mon"},
+                       A_TO_M + [{"naptan": "Z9", "arrival": "09:40:00",
+                                  "departure": None}], 1)
+    writer.add_journey("OpB", "8", "outbound", "J7f", {"mon"},
+                       [{"naptan": "W1", "arrival": None, "departure": "09:15:00"},
+                        {"naptan": "B1", "arrival": "09:25:00", "departure": None}], 2)
+    writer.commit()
+    assert store.plan_one_change({"A1"}, {"B1"}, "mon", "10:00:00") == []
+
+
+# --- _parse_days: TransXChange encodes regular days as presence-only
+# EMPTY elements (<Monday/>); text is None there, not "true". Empty element
+# = day applies. Explicit text ("true"/"1") must keep working.
+def test_parse_days_presence_only_element_applies():
+    op = SafeET.fromstring(
+        "<OperatingProfile><RegularDayType><DaysOfWeek>"
+        "<Saturday/></DaysOfWeek></RegularDayType></OperatingProfile>")
+    assert _parse_days(op) == {"sat"}
+
+
+def test_parse_days_explicit_text_still_applies():
+    op = SafeET.fromstring(
+        "<OperatingProfile><RegularDayType><DaysOfWeek>"
+        "<Monday>true</Monday><Friday>1</Friday>"
+        "</DaysOfWeek></RegularDayType></OperatingProfile>")
+    assert _parse_days(op) == {"mon", "fri"}
+
+
+def test_parse_days_none_profile_all_days():
+    assert _parse_days(None) == {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
