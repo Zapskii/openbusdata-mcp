@@ -564,3 +564,55 @@ def test_get_fare_prices_distinguishes_no_extraction_from_no_match():
         assert "match the given zones" not in filtered
     finally:
         _reset()
+
+
+def _eta_with_capture(operator_ref, monkeypatch, content=VM_ONE):
+    """Run estimate_live_eta against a mock datafeed, returning (result, url)."""
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, content=content)
+
+    server.set_http_client(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    server._LIVE_CACHE = server.TTLCache(20.0)
+    monkeypatch.setattr(server, "datetime", FakeDateTime)
+    try:
+        out = asyncio.run(server.estimate_live_eta(
+            "Charlie Road", operator_ref, "12", day="mon"))
+    finally:
+        server.set_http_client(None)
+        server._LIVE_CACHE = server.TTLCache(20.0)
+    return out, seen.get("url", "")
+
+
+def test_estimate_live_eta_accepts_noc_input(seeded_route_named_noc, monkeypatch):
+    """The documented operator_ref contract is a NOC. The index keys routes by
+    the dataset operator NAME, so a NOC input must still find the route — and
+    reach the datafeed as-is."""
+    out, url = _eta_with_capture("OPX", monkeypatch)
+    assert "not in the timetable index" not in out
+    assert "400 Bad Request" not in out
+    assert json.loads(out)["vehicles"][0]["vehicle_id"] == "V1"
+    assert "operatorRef=OPX" in url
+
+
+def test_estimate_live_eta_accepts_name_input(seeded_route_named_noc, monkeypatch):
+    """The operator NAME resolves the index route, but BODS rejects it as an
+    operatorRef — so the NOC must be substituted for the fetch."""
+    out, url = _eta_with_capture("Op Express Ltd", monkeypatch)
+    assert "400 Bad Request" not in out
+    assert json.loads(out)["vehicles"][0]["vehicle_id"] == "V1"
+    assert "operatorRef=OPX" in url
+    assert "Express" not in url
+
+
+def test_estimate_live_eta_name_without_noc_asks_for_reindex(seeded_route_named_noc,
+                                                             writer, monkeypatch):
+    """A name input with no recorded NOC must say so, not silently send the
+    name to BODS and 400."""
+    writer.conn.execute("UPDATE loaded_datasets SET noc='' WHERE ds_id=1")
+    writer.commit()
+    out, url = _eta_with_capture("Op Express Ltd", monkeypatch)
+    assert "operatorRef" not in url, "no datafeed call once the NOC is unknown"
+    assert "force_refresh" in out
