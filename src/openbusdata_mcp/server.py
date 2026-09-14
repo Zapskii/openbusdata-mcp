@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
 from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
-from .fares import parse_fare_prices
+from .fares import parse_fare_prices, parse_fare_prices_all
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -1290,6 +1290,16 @@ async def plan_journey(stop_a: str, stop_b: str, arrive_by: str,
     if target_time is None:
         return f'Invalid time format: "{arrive_by}". Use HH:MM (24h).'
 
+    # Round-9 bug G: a journey from a stop to itself is not a bus trip. The
+    # planner's A-side/B-side seeds overlap when both sets resolve to the
+    # same stop, so one-change candidates become A->X->A round trips away
+    # from the origin and back (total_changes 1). Answer the trivial case
+    # directly instead.
+    if naptans_a & naptans_b:
+        plan = {"type": "none", "legs": [], "total_changes": 0,
+                "note": "origin and destination resolve to the same stop"}
+        return json.dumps([plan], indent=2, ensure_ascii=False)
+
     if day is None:
         day = datetime.now().strftime("%a").lower()
     day = day.lower()[:3]
@@ -1554,7 +1564,10 @@ async def get_fare_prices(dataset_id: str, origin_zone: Optional[str] = None,
                     f"catalogue metadata.")
         dl = await get_http_client().get(f"{download_url}?api_key={API_KEY}")
         dl.raise_for_status()
-        prices = parse_fare_prices(dl.content)
+        # Round-9 bug H: a fares dataset is a multi-file zip; parse EVERY
+        # .xml member, not just the first (ds 16583: 19 files / 2,857 rows
+        # vs the 171 a first-member-only parse reported).
+        prices = parse_fare_prices_all(dl.content)
     except Exception as e:
         return _redact(f"Error: {type(e).__name__}: {str(e)}")
 

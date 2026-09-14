@@ -81,6 +81,22 @@ def extract_xml_bytes(content: bytes) -> bytes:
     return content
 
 
+def extract_all_xml_bytes(content: bytes) -> list[bytes]:
+    """Unzip PK-magic payloads into EVERY .xml member, else pass the single
+    document through. Round-9 bug H: a BODS fares dataset is a MULTI-FILE
+    pack (ds 16583: 19 files / 2,857 price rows) and reading only the first
+    member silently dropped 18 of 19 files - which file is "first" varies
+    between serves, so any single-member count is arbitrary."""
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            docs = [z.read(name) for name in z.namelist()
+                    if name.lower().endswith(".xml")]
+        if not docs:
+            raise ValueError("zip archive contains no .xml member")
+        return docs
+    return [content]
+
+
 def _local(el) -> str:
     return el.tag.rsplit("}", 1)[-1]
 
@@ -179,6 +195,15 @@ def _row(amount, currency, start, end, zones, product) -> dict:
     return {"amount": amount, "currency": currency,
             "start_zones": start, "end_zones": end,
             "zones": zones, "product": product}
+
+
+def parse_fare_prices_all(content: bytes) -> list[dict]:
+    """parse_fare_prices over EVERY .xml member of a zip payload (round-9
+    bug H), concatenating rows; single-document payloads parse once."""
+    out = []
+    for doc in extract_all_xml_bytes(content):
+        out.extend(parse_fare_prices(doc))
+    return out
 
 
 def parse_fare_prices(content: bytes) -> list[dict]:
