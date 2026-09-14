@@ -173,3 +173,56 @@ def test_migration_rekeys_legacy_keys_and_dedupes_s2r(tmp_path):
     assert w.conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0] == 2
     assert w.conn.execute(
         "SELECT v FROM meta WHERE k='routes_rekeyed'").fetchone()
+
+
+def test_migration_rebuilds_legacy_s2r_table_with_pk(tmp_path):
+    # The live index's s2r table predates the PK: CREATE TABLE IF NOT EXISTS
+    # cannot retrofit one, so re-upserts duplicate rows again after a plain
+    # dedupe. The migration must rebuild the table with the PK.
+    db = tmp_path / "legacy_s2r.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE routes (key TEXT PRIMARY KEY, op TEXT, num TEXT,
+                             directions TEXT, stops TEXT, ds_id INT DEFAULT 0);
+        CREATE TABLE stop_to_routes (naptan TEXT, key TEXT);
+        CREATE TABLE journeys (id INTEGER PRIMARY KEY, ds_id INT, op TEXT,
+                               route TEXT, direction TEXT, code TEXT,
+                               days TEXT, json TEXT, days_mask INT DEFAULT 0);
+        CREATE TABLE stops (naptan TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL);
+        CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE loaded_datasets (ds_id INTEGER PRIMARY KEY, modified TEXT,
+                                      operator TEXT, noc TEXT DEFAULT '');
+        CREATE TABLE journey_stops (naptan TEXT, journey_id INT);
+        CREATE TABLE journey_stop_times (journey_id INT, seq INT, naptan TEXT,
+                                         dep TEXT, arr TEXT);
+        INSERT INTO routes VALUES ('Op|1','Op','1','[]','["010A"]',1);
+        INSERT INTO stop_to_routes VALUES ('010A','Op|1');
+        INSERT INTO stop_to_routes VALUES ('010A','Op|1');
+        INSERT INTO stop_to_routes VALUES ('010A','Op|1');
+    """)
+    conn.commit()
+    conn.close()
+    w = TimetableWriter(db)
+    w.ensure_schema()
+    shape = {(r[1], r[5]) for r in w.conn.execute(
+        "PRAGMA table_info(stop_to_routes)")}
+    assert shape == {("naptan", 1), ("key", 2)}, \
+        f"s2r still has no real PK: {shape}"
+    assert w.conn.execute("SELECT COUNT(*) FROM stop_to_routes").fetchone()[0] == 1
+    # With the PK in place, re-upserts must NOT duplicate rows again.
+    w.upsert_route("Op", "1", {"outbound"}, ["010A", "010B"], 1)
+    w.upsert_route("Op", "1", {"outbound"}, ["010A", "010B"], 1)
+    w.commit()
+    assert w.conn.execute(
+        "SELECT COUNT(*) FROM stop_to_routes WHERE key='Op|1|1'"
+    ).fetchone()[0] == 2, "PK-less table re-accumulated duplicates"
+    # A fresh DB (table born with the PK) never triggers the rebuild.
+    db2 = tmp_path / "fresh.db"
+    w2 = TimetableWriter(db2)
+    w2.ensure_schema()
+    assert w2.conn.execute(
+        "SELECT COUNT(*) FROM stop_to_routes").fetchone()[0] == 0
+    w2.upsert_route("Op", "2", {"outbound"}, ["010A"], 3)
+    w2.upsert_route("Op", "2", {"outbound"}, ["010A"], 3)
+    assert w2.conn.execute(
+        "SELECT COUNT(*) FROM stop_to_routes").fetchone()[0] == 1

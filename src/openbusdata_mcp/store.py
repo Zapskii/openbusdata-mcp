@@ -797,7 +797,14 @@ class TimetableWriter:
         legacy = self.conn.execute(
             "SELECT COUNT(*) FROM routes WHERE "
             "(LENGTH(key) - LENGTH(REPLACE(key, '|', ''))) = 1").fetchone()[0]
-        if legacy:
+        # stop_to_routes without a real PK duplicates rows again on every
+        # re-upsert (INSERT OR IGNORE is then a no-op guard). A legacy table
+        # shape (no PK in its CREATE) is rebuilt with the PK in the same
+        # migration — dedupe first so the new PK can take.
+        s2r_cols = {(r[1], r[5]) for r in self.conn.execute(
+            "PRAGMA table_info(stop_to_routes)")}
+        s2r_legacy = s2r_cols != {("naptan", 1), ("key", 2)}
+        if legacy or s2r_legacy:
             n_fts = self.conn.execute(
                 "SELECT COUNT(*) FROM routes").fetchone()[0]
             # Old→new mapping staged in a temp table BEFORE any rekey: the
@@ -839,6 +846,23 @@ class TimetableWriter:
             self.conn.execute(
                 "DELETE FROM stop_to_routes WHERE key NOT IN "
                 "(SELECT key FROM routes)")
+            # Legacy table shape (no PK): CREATE TABLE IF NOT EXISTS cannot
+            # retrofit one, so INSERT OR IGNORE stays a no-op guard and
+            # duplicates re-accumulate on every re-upsert. Rebuild the table
+            # with the PK — one DISTINCT copy collapses the dupes.
+            if s2r_legacy:
+                self.conn.execute("DROP INDEX IF EXISTS s2r_n")
+                self.conn.execute(
+                    "ALTER TABLE stop_to_routes RENAME TO stop_to_routes_legacy")
+                self.conn.execute(
+                    "CREATE TABLE stop_to_routes ("
+                    "naptan TEXT, key TEXT, PRIMARY KEY (naptan, key))")
+                self.conn.execute(
+                    "INSERT INTO stop_to_routes (naptan, key) "
+                    "SELECT DISTINCT naptan, key FROM stop_to_routes_legacy")
+                self.conn.execute("DROP TABLE stop_to_routes_legacy")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan)")
             # Rebuild the FTS index: triggers only fire on subsequent DML.
             self.conn.execute("DELETE FROM routes_fts")
             self.conn.execute(
