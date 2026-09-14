@@ -116,3 +116,46 @@ def test_next_departures_collapses_daymask_twins(writer, store):
     writer.commit()
     rows = store.next_departures({"A1"}, "mon", "08:00:00", 10)
     assert len(rows) == 1, f"day-mask twins must collapse to one row: {rows}"
+
+
+# --- Round 9 bug G: plan_journey(stop, same stop) must not plan round trips.
+# The store-level planner still returns its raw A->X->A candidates when both
+# stop sets overlap; the TOOL layer answers the trivial case directly.
+SAME_STOP_GRAPH = [{"naptan": "A1", "arrival": None, "departure": "09:00:00"},
+                   {"naptan": "M1", "arrival": "09:10:00", "departure": "09:12:00"},
+                   {"naptan": "A1", "arrival": "09:20:00", "departure": None}]
+BACK_TO_A = [{"naptan": "M1", "arrival": None, "departure": "09:15:00"},
+             {"naptan": "A1", "arrival": "09:25:00", "departure": None}]
+
+
+def test_plan_one_change_same_stop_is_empty(writer, store):
+    # Round-9 bug G (store level): with A == B the candidate seeds overlap and
+    # an A->M1->A away-and-back loop QUALIFIES as a "change" plan. The tool
+    # layer guards the caller (see the zero-leg test below); this test only
+    # pins the store behavior that makes the tool guard necessary - if a
+    # store-level fix lands later, this pin should be recut, not deleted.
+    _seed(writer)
+    writer.add_journey("OpC", "80", "outbound", "J80", {"mon"}, BACK_TO_A, 3)
+    writer.commit()
+    plans = store.plan_one_change({"A1"}, {"A1"}, "mon", "10:00:00")
+    assert plans and all(p["type"] == "change" for p in plans), (
+        "expected the unpinned round-trip behavior this guard exists for")
+
+
+def test_plan_journey_same_stop_returns_zero_leg_plan(writer, store):
+    # tool level: stop_a == stop_b resolves to a trivial zero-leg plan, never
+    # the 15 round-trip "change" plans the live build returned.
+    import asyncio, json
+    import openbusdata_mcp.server as server
+    _seed(writer)
+    writer.add_journey("OpC", "80", "outbound", "J80", {"mon"}, BACK_TO_A, 3)
+    writer.commit()
+    try:
+        out = json.loads(asyncio.run(server.plan_journey(
+            "A1", "A1", arrive_by="10:00", day="mon")))
+    finally:
+        server.set_http_client(None)
+    assert len(out) == 1, out
+    assert out[0]["type"] == "none" and out[0]["legs"] == []
+    assert out[0]["total_changes"] == 0
+    assert "same stop" in out[0]["note"]

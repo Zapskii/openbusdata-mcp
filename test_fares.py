@@ -5,7 +5,12 @@ import zipfile
 import pytest
 from defusedxml.ElementTree import ParseError
 
-from openbusdata_mcp.fares import extract_xml_bytes, parse_fare_prices
+from openbusdata_mcp.fares import (
+    extract_all_xml_bytes,
+    extract_xml_bytes,
+    parse_fare_prices,
+    parse_fare_prices_all,
+)
 
 # Profile-shaped NeTEx: the structure the published BODS NeTEx Fares Profile
 # v0.4 actually mandates (section 6.3.3 Table 11, section 7.2 Table 27,
@@ -214,3 +219,38 @@ def test_extract_xml_bytes_rejects_zip_without_xml_member():
 def test_parse_fare_prices_rejects_malformed_xml():
     with pytest.raises(ParseError):
         parse_fare_prices(b"<PublicationDelivery><unclosed>")
+
+
+# --- Round 9 bug H: a BODS fares dataset is a MULTI-FILE zip; the parse must
+# read EVERY .xml member, not just the first (ds 16583: 19 files / 2,857 rows
+# vs the 171 a first-member-only parse reported).
+def _zip(*docs) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for i, doc in enumerate(docs):
+            z.writestr(f"file_{i}.xml", doc)
+    return buf.getvalue()
+
+
+# A second, differently-zoned document: only visible when ALL members parse.
+NETEX_B = NETEX.replace(b'id="Z1"', b'ref="ZB1"').replace(b'ref="Z1"', b'ref="ZB1"') \
+    .replace(b"1.20", b"9.99")
+
+
+def test_parse_fare_prices_all_reads_every_zip_member():
+    docs = parse_fare_prices_all(_zip(NETEX, NETEX_B))
+    amounts = {p["amount"] for p in docs}
+    assert {"1.20", "2.50", "3.00", "9.99"} <= amounts, amounts
+
+
+def test_parse_fare_prices_all_single_document_passthrough():
+    assert [p["amount"] for p in parse_fare_prices_all(NETEX)] == \
+        ["1.20", "2.50", "3.00"]
+
+
+def test_extract_all_xml_bytes_rejects_zip_without_xml_member():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("fares.csv", b"not xml")
+    with pytest.raises(ValueError, match=r"no \.xml member"):
+        extract_all_xml_bytes(buf.getvalue())
