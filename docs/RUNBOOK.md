@@ -145,7 +145,9 @@ EOF
 
 # Passthrough API tools (fares/disruptions/AVL/cancellations) — must return JSON,
 # not HTML (HTML = the /api/v1 double-prefix regression, fixed in 1f3bea5):
-#   call tool timetables_api_v1_dataset {limit: 2} → expect {"count": 941, ...}
+#   call tool timetables_api_v1_dataset {kwargs: "limit=2"} → expect {"count": 941, ...}
+#   (generated tools accept named parameters ONLY inside the single `kwargs`
+#    string — the named form {limit: 2} is rejected by MCP schema validation)
 
 # New coverage tools — quick checks (replace args with real refs from the index):
 #   get_departures_board {stop: "<known stop name>"}           → ordered JSON board
@@ -176,7 +178,7 @@ Key-validity probe (200 vs 401, value never printed):
 
 - **Why SQLite:** the JSON cache needed the whole index in RAM (~9.4 GB peak;
   3× exit-137 OOMKills in a 7.7 GB cgroup). SQLite reads keep the container at
-  ~45 MB and make startup instant. Tool surface now 22 tools: the 17 passthrough/search/planning tools plus get_disruptions, get_cancellations, get_departures_board, estimate_live_eta and get_fare_prices; get_live_buses_on_route additionally accepts server-side filters (origin_ref, destination_ref, vehicle_ref, bounding_box).
+  ~45 MB and make startup instant. Tool surface now 22 tools: 13 hand-written tools in server.py (search, planning, boards, live, disruptions, fares) plus 9 generated at startup from the bundled OpenAPI specs (catalogue/metadata passthroughs and raw SIRI-VM / GTFS-RT / SIRI-SX feeds — parameters reach those nine only through the single `kwargs` string); get_live_buses_on_route additionally accepts server-side filters (origin_ref, destination_ref, vehicle_ref, bounding_box).
 - **Download quirks** (both fixed in the fork): not all BODS downloads are zips
   (many are bare TransXChange XML); parsed journey times are `datetime.time`
   and must be isoformat'd before JSON insertion.

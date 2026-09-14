@@ -19,8 +19,8 @@ programmatic call — `mcp.tool(name=tool_name)(tool_func)` — so any count der
 from the decorator is wrong by nine. This is the server's own recurring lesson:
 enumerate by the property (every registration site), not by a proxy for it.
 
-**The nine generated tools are registered but currently cannot be called with
-their parameters.** Read that section before relying on any of them.
+**The nine generated tools accept parameters only through a single `kwargs`
+string.** Read that section before relying on any of them.
 
 ## Which tool answers your question
 
@@ -130,7 +130,7 @@ the tool — a breaking change to anyone calling it.
 - The `api_key` is appended automatically. Never pass it yourself.
 - Responses always pass through credential redaction, success and failure alike.
 
-### These nine take no usable parameters
+### These nine take parameters only as one `kwargs` string
 
 Verified against the live registry under the pinned **mcp 1.30.0**. Every one of
 the nine advertises this schema:
@@ -139,27 +139,27 @@ the nine advertises this schema:
 properties={'kwargs': {'type': 'string'}}   required=['kwargs']
 ```
 
-Their real upstream parameters are **absent from the schema**, because the
-generated function's signature is `async def tool_func(**kwargs)`. A conforming
-MCP client therefore cannot pass `limit`, `noc`, `routeId`, or even the
-`{datasetID}` path parameter:
-
-Measured on the real registered tool, not a replica:
+Their real upstream parameters are **absent from the schema** (typed
+parameters remain the parked passthrough-tool-schemas fix — a fix that parses
+the string went in with the round-7 bug-C fix, but the schema itself is
+unchanged). A conforming MCP client therefore cannot pass `limit`, `noc`,
+`routeId`, or `datasetID` as named parameters:
 
 ```
 call_tool("timetables_api_v1_dataset", {"limit": 2})   → REJECTED
 call_tool("timetables_api_v1_dataset", {})             → REJECTED
-call_tool("timetables_api_v1_dataset", {"kwargs":"x"}) → ACCEPTED, and requests
-    https://data.bus-data.dft.gov.uk/api/v1/dataset?api_key=…
+call_tool("timetables_api_v1_dataset", {"kwargs": "limit=2"})
+    → ACCEPTED, and requests /api/v1/dataset?limit=2&api_key=…
 ```
 
-So the only accepted shape is `{"kwargs": "<string>"}`. It succeeds, and the
-request that leaves the process is the **bare path** — `kwargs` holds one string
-that matches no entry in the spec's parameter loop, so the tool contributes no
-query parameter of its own (the `api_key` is appended by the server, not by the
-caller). The two `_by_datasetID` tools never get that far: with no way to supply
-`datasetID`, they are rejected at validation, so they cannot address a dataset
-at all.
+The only accepted shape is `{"kwargs": "<string>"}`. The server parses that
+string back into parameters (`key=value` pairs separated by `,` or `&`,
+URL-encoding allowed), validates every key against the spec, rejects unknown
+ones with a loud error, and forwards the rest as query parameters; path
+parameters fill the path (`{"kwargs": "datasetID=42"}` requests
+`/api/v1/dataset/42`). The `api_key` is still appended by the server, never by
+the caller. The two `_by_datasetID` tools are addressable only through the
+string form. A string holding no recognized keys still requests the bare path.
 
 Hand-written tools are unaffected — `get_departures_board` advertises
 `stop, day, from_time, limit` with `required=['stop']`, exactly as documented.
@@ -169,20 +169,16 @@ What follows for callers:
 - **Prefer the hand-written tools.** `get_disruptions`, `get_cancellations`,
   `get_departures_board`, `estimate_live_eta`, `get_live_buses_on_route` and
   `get_fare_prices` all accept their documented parameters.
-- **`get_fare_prices` needs an id the server cannot give it.** The catalogue
-  tool that lists fares datasets is one of the nine, so ids must come from a
-  bare (unfiltered) call to it or from outside the server.
-- **The RUNBOOK smoke test does not work as written.**
-  `call tool timetables_api_v1_dataset {limit: 2}` fails validation in mcp 1.30.0.
+- **Filtering the generated catalogue tools works through the string:**
+  `Data_set_api_v1_fares_dataset(kwargs="noc=BLAC,limit=5")` returns Blackpool
+  only.
+- **Named parameters fail validation.** `{limit: 2}` is rejected; use
+  `{kwargs: "limit=2"}`. This is the shape the RUNBOOK smoke test should use.
 
-Attribution, so nobody misreads this as new: the `**kwargs` shape is unchanged
-from the release base, but `uv.lock` pinning mcp 1.30.0 arrived with the
-dependency-bound fix — so the breakage is plausibly a consequence of that
-upgrade rather than of the server code. Not proven here.
-
-Fix direction: give the generated function an explicit signature built from the
-spec's parameters (or attach a per-tool JSON schema) so FastMCP derives a real
-schema instead of the `**kwargs` placeholder.
+The parked full fix (spec `2026-09-12-passthrough-tool-schemas-design.md`)
+remains: give the generated function an explicit signature built from the
+spec's parameters so FastMCP derives a real typed schema instead of the
+`**kwargs` placeholder.
 
 ## Enumerating the surface yourself
 
@@ -209,7 +205,7 @@ and `test_robustness.py` resolves a generated tool by name from the live manager
 |---|---|
 | Counting tools by grepping `@mcp.tool()` | Yields 13. The other 9 are registered by a loop. |
 | Assuming a tool name from the upstream path | Names are `{tag}_{path}`; specs carry no `operationId`. |
-| Passing documented parameters to a generated tool | Its schema accepts only `kwargs`; validation fails. Use a hand-written tool. |
+| Passing documented parameters to a generated tool | Named params are rejected by the schema; pass them inside the single `kwargs` string. |
 | `json.loads` on every result | Misses and failures return prose, not JSON. |
 | Calling a timetable tool before loading | Returns a prose "call `load_timetable_index()` first" string. |
 | Passing `api_key` to a passthrough tool | Appended automatically; the caller never supplies it. |
@@ -223,6 +219,6 @@ well as failure.
 
 Spec-driven: add a GET operation to a `.yml` in `openapi-schema/`; it is
 registered at startup with no code change. Give it an `operationId` to control
-the tool name. Note it will inherit the `**kwargs` schema problem above —
-building the generated function with a real signature is what makes its
-parameters usable.
+the tool name. Note it will inherit the single-`kwargs`-string schema — its
+spec parameters are reachable through that string, but building the generated
+function with a real signature is what gives it a typed MCP schema.
