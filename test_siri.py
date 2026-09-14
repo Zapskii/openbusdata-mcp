@@ -211,3 +211,48 @@ def test_parse_cancellations_descendant_search_strips_scalars():
         "recorded_at": "2026-09-12T10:00:00Z",
         "vehicle_journey_ref": "J-42", "operator": "OPX", "line": "12",
         "origin": "010A", "destination": "010C", "reason": "breakdown"}]
+
+
+# --- Round 7 bug B: the DfT disruptions feed has no InfoMessage wrappers —
+# PtSituationElements sit directly under SituationExchangeDelivery > Situations.
+SX_NO_INFOMESSAGE = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <SituationExchangeDelivery>
+   <Situations>
+    <PtSituationElement>
+     <CreationTime>2026-09-14T09:00:00Z</CreationTime>
+     <ParticipantRef>TfGM</ParticipantRef>
+     <SituationNumber>SN1</SituationNumber>
+     <ValidityPeriod>
+      <StartTime>2026-09-14T09:00:00Z</StartTime>
+      <EndTime>2026-09-15T09:00:00Z</EndTime>
+     </ValidityPeriod>
+     <Severity>severe</Severity>
+     <Affects>
+      <Operators><AffectedOperator><OperatorRef>TfGM</OperatorRef></AffectedOperator></Operators>
+      <Networks><AffectedNetwork><AffectedLines>
+       <AffectedLine><LineRef>VL2</LineRef></AffectedLine>
+      </AffectedLines></AffectedNetwork></Networks>
+      <StopPoints><AffectedStopPoint>
+       <StopPointRef>9400XXX</StopPointRef></AffectedStopPoint></StopPoints>
+     </Affects>
+     <Description>Road closed</Description>
+    </PtSituationElement>
+   </Situations>
+  </SituationExchangeDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_parse_siri_sx_situations_without_infomessage():
+    msgs = siri.parse_siri_sx(SX_NO_INFOMESSAGE)
+    assert len(msgs) == 1, (
+        "zero InfoMessages must fall back to PtSituationElements, not an empty feed")
+    m = msgs[0]
+    assert m["recorded_at"] == "2026-09-14T09:00:00Z"
+    assert m["valid_until"] == "2026-09-15T09:00:00Z"
+    assert m["operators"] == ["TfGM"]
+    assert m["lines"] == ["VL2"]
+    assert m["stops"] == ["9400XXX"]
+    assert m["summary"] == "Road closed"

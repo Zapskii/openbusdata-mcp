@@ -130,6 +130,30 @@ def parse_siri_sx(content: bytes) -> list:
             "summary": summary,
             "description": _desc_text(info, "Description"),
         })
+    if not messages:
+        # The DfT disruptions feed carries no InfoMessage wrappers: situations
+        # sit directly under SituationExchangeDelivery > Situations. A
+        # successful parse of zero InfoMessages is therefore not an empty
+        # feed — fall back to the PtSituationElements (round-7 bug B).
+        for sit in root.iter(f"{{{SIRI_NS}}}PtSituationElement"):
+            summary = None
+            for tag in ("Summary", "Description"):
+                found = sit.find(f".//{{{SIRI_NS}}}{tag}")
+                if found is not None and found.text:
+                    summary = " ".join(found.text.split())
+                    break
+            messages.append({
+                "recorded_at": (_desc_text(sit, "RecordedAtTime")
+                                or _desc_text(sit, "CreationTime")),
+                "valid_until": _desc_text(sit, "EndTime"),
+                "channel": None,
+                "severity": _desc_text(sit, "Severity"),
+                "operators": _refs(sit, "OperatorRef"),
+                "lines": _refs(sit, "LineRef"),
+                "stops": _refs(sit, "StopPointRef"),
+                "summary": summary,
+                "description": _desc_text(sit, "Description"),
+            })
     return messages
 
 

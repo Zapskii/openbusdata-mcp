@@ -22,7 +22,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Iterator, Optional
-from urllib.parse import quote, urlencode, urljoin
+from urllib.parse import parse_qsl, quote, urlencode, urljoin
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
@@ -473,8 +473,8 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
             stops.append(Stop(naptan=naptan, name=name, lat=lat, lon=lon))
 
     # --- Extract JourneyPatternSections with timing ---
-    # jps_id -> list of (from_stop, to_stop, runtime)
-    jps_links: dict[str, list[tuple[str, str, timedelta]]] = {}
+    # jps_id -> list of (from_stop, to_stop, runtime, link_id)
+    jps_links: dict[str, list[tuple[str, str, timedelta, str]]] = {}
     for jps in root.iter(q("JourneyPatternSection")):
         jps_id = jps.get("id")
         if not jps_id:
@@ -488,7 +488,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
             to_ref = to_stop.find(q("StopPointRef")).text if to_stop is not None else None
             runtime = _parse_duration(runtime_elem.text if runtime_elem is not None else "")
             if from_ref and to_ref:
-                links.append((from_ref, to_ref, runtime))
+                links.append((from_ref, to_ref, runtime, link.get("id")))
         jps_links[jps_id] = links
 
     # --- Extract JourneyPatterns ---
@@ -521,7 +521,7 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
         seq = []
         for sid in jp_data["section_ids"]:
             if sid in jps_links:
-                for from_ref, to_ref, _ in jps_links[sid]:
+                for from_ref, to_ref, _, _ in jps_links[sid]:
                     if not seq or seq[-1] != from_ref:
                         seq.append(from_ref)
                     seq.append(to_ref)
@@ -577,18 +577,37 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
         current_seconds = h * 3600 + m * 60 + s
         journey_stops: list[JourneyStop] = []
 
+        # SCCM packs publish pattern-level RunTime placeholders (PT0M0S on
+        # every JourneyPatternTimingLink) and the real per-journey runtimes
+        # as VehicleJourneyTimingLink overrides keyed by that link's ref.
+        overrides: dict[str, timedelta] = {}
+        for vjtl in vj.iter(q("VehicleJourneyTimingLink")):
+            ref = vjtl.find(q("JourneyPatternTimingLinkRef"))
+            rt = vjtl.find(q("RunTime"))
+            if ref is not None and ref.text and rt is not None:
+                overrides[ref.text] = _parse_duration(rt.text or "")
+
         for sid in jp_data["section_ids"]:
             if sid not in jps_links:
                 continue
-            for i, (from_ref, to_ref, runtime) in enumerate(jps_links[sid]):
+            for i, (from_ref, to_ref, runtime, link_id) in enumerate(jps_links[sid]):
                 if i == 0 and not journey_stops:
                     # First stop
                     journey_stops.append(JourneyStop(
                         naptan=from_ref, departure=_fmt_seconds(current_seconds)))
                 # Travel to next stop
-                current_seconds += int(runtime.total_seconds())
+                current_seconds += int(
+                    overrides.get(link_id, runtime).total_seconds())
                 journey_stops.append(JourneyStop(
                     naptan=to_ref, arrival=_fmt_seconds(current_seconds)))
+
+        # A journey whose every stop carries one identical time cannot be
+        # boarded meaningfully — today it produces phantom planner rows
+        # (round-7 bug A). Drop it rather than publishing a phantom.
+        if (len(journey_stops) >= 3 and journey_stops[0].departure
+                and all(st.arrival == journey_stops[0].departure
+                        for st in journey_stops[1:])):
+            continue
 
         if len(journey_stops) >= 2:
             journeys.append(Journey(
@@ -1005,6 +1024,22 @@ def register_tools_from_specs(specs: dict[str, Any]):
 
                 def make_tool(path_tpl=path_template, bp=base_path, params_def=parameters):
                     async def tool_func(**kwargs) -> str:
+                        # A conforming MCP client sees this function's **kwargs
+                        # signature as a single `kwargs` string; parse it back
+                        # into named parameters or every query param is
+                        # dropped and the request goes out bare (round-7 bug C).
+                        raw = kwargs.get("kwargs")
+                        if isinstance(raw, str) and raw.strip():
+                            allowed = {p["name"] for p in params_def}
+                            pairs = parse_qsl(raw.replace(",", "&"),
+                                              keep_blank_values=True)
+                            unknown = sorted({k for k, _ in pairs
+                                              if k not in allowed})
+                            if unknown:
+                                return (f"Error: unknown parameter(s) "
+                                        f"{', '.join(unknown)}. Valid: "
+                                        f"{', '.join(sorted(allowed)) or 'none'}")
+                            kwargs.update(dict(pairs))
                         url_path = bp.rstrip("/") + path_tpl
                         for p in params_def:
                             if p["in"] == "path" and p["name"] in kwargs:

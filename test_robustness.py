@@ -270,6 +270,13 @@ def _dataset_tool():
     return None
 
 
+def _list_tool():
+    for t in server.mcp._tool_manager.list_tools():
+        if t.name == "timetables_api_v1_dataset":
+            return t.fn
+    return None
+
+
 # --- Test 1: spec-generated tools URL-encode path params
 def test_1_path_params_url_encoded():
     captured.clear()
@@ -1098,3 +1105,109 @@ def test_46_force_refresh_purges_legacy_ds0_orphans(writer):
     n = writer.conn.execute(
         "SELECT COUNT(*) FROM journeys WHERE ds_id=0").fetchone()[0]
     assert n == 0, "legacy ds_id=0 rows must be purged by force_refresh"
+
+
+# --- Round 7 bug A: SCCM placeholder runtimes + VJTL overrides
+_SCCM_XML = (
+    '<TransXChange xmlns="http://www.transxchange.org.uk/">'
+    '<StopPoints>'
+    '<AnnotatedStopPointRef><StopPointRef>S1</StopPointRef>'
+    '<CommonName>Alpha</CommonName></AnnotatedStopPointRef>'
+    '<AnnotatedStopPointRef><StopPointRef>S2</StopPointRef>'
+    '<CommonName>Beta</CommonName></AnnotatedStopPointRef>'
+    '<AnnotatedStopPointRef><StopPointRef>S3</StopPointRef>'
+    '<CommonName>Gamma</CommonName></AnnotatedStopPointRef>'
+    '</StopPoints>'
+    '<Services><Service>'
+    '<ServiceCode>PF1:1</ServiceCode>'
+    '<OperatingPeriod><StartDate>{start}</StartDate><EndDate></EndDate></OperatingPeriod>'
+    '</Service></Services>'
+    '<JourneyPatternSections>'
+    '<JourneyPatternSection id="jps1">'
+    '<JourneyPatternTimingLink id="jptl1">'
+    '<From><StopPointRef>S1</StopPointRef></From>'
+    '<To><StopPointRef>S2</StopPointRef></To>'
+    '<RunTime>PT0M0S</RunTime>'
+    '</JourneyPatternTimingLink>'
+    '<JourneyPatternTimingLink id="jptl2">'
+    '<From><StopPointRef>S2</StopPointRef></From>'
+    '<To><StopPointRef>S3</StopPointRef></To>'
+    '<RunTime>PT0M0S</RunTime>'
+    '</JourneyPatternTimingLink>'
+    '</JourneyPatternSection>'
+    '</JourneyPatternSections>'
+    '<JourneyPatterns><JourneyPattern id="jp1">'
+    '<Direction>outbound</Direction>'
+    '<JourneyPatternSectionRefs>jps1</JourneyPatternSectionRefs>'
+    '</JourneyPattern></JourneyPatterns>'
+    '{vjs}'
+    '</TransXChange>'
+)
+
+
+def test_47_vjtl_overrides_replace_placeholder_runtimes():
+    today = _date.today()
+    vj = ('<VehicleJourney><VehicleJourneyCode>VJ1</VehicleJourneyCode>'
+          '<JourneyPatternRef>jp1</JourneyPatternRef>'
+          '<DepartureTime>08:00:00</DepartureTime>'
+          '<VehicleJourneyTimingLink>'
+          '<JourneyPatternTimingLinkRef>jptl1</JourneyPatternTimingLinkRef>'
+          '<RunTime>PT5M0S</RunTime></VehicleJourneyTimingLink>'
+          '<VehicleJourneyTimingLink>'
+          '<JourneyPatternTimingLinkRef>jptl2</JourneyPatternTimingLinkRef>'
+          '<RunTime>PT10M0S</RunTime></VehicleJourneyTimingLink>'
+          '</VehicleJourney>')
+    xml = _SCCM_XML.format(start=(today - _timedelta(days=1)).isoformat(), vjs=vj)
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert len(journeys) == 1, "overridden journey must survive the flat guard"
+    times = [(s.naptan, s.departure, s.arrival) for s in journeys[0].stops]
+    assert times == [("S1", "08:00:00", None), ("S2", None, "08:05:00"),
+                     ("S3", None, "08:15:00")], (
+        "VehicleJourneyTimingLink overrides must replace the PT0M0S placeholders")
+
+
+def test_48_flat_journey_dropped():
+    today = _date.today()
+    # No overrides: every pattern runtime is a PT0M0S placeholder, so every
+    # stop lands on the departure time. That journey is unboardable and
+    # produced phantom planner rows (round-7 bug A) — it must be dropped.
+    vj = ('<VehicleJourney><VehicleJourneyCode>VJ2</VehicleJourneyCode>'
+          '<JourneyPatternRef>jp1</JourneyPatternRef>'
+          '<DepartureTime>06:16:00</DepartureTime></VehicleJourney>')
+    xml = _SCCM_XML.format(start=(today - _timedelta(days=1)).isoformat(), vjs=vj)
+    _, _, journeys = server.parse_transxchange(xml, "Op")
+    assert journeys == [], "all-identical-time journey must not be published"
+
+
+# --- Round 7 bug C: the generated tools' single kwargs string must be parsed
+def test_49_kwargs_string_params_forwarded():
+    captured.clear()
+    server.httpx.AsyncClient = _FakeClient
+    tool_fn = _list_tool()
+    assert tool_fn is not None, "generated dataset-list tool not found"
+    result = asyncio.run(tool_fn(kwargs="search=Stevenage,limit=3"))
+    assert result == "{}", f"unexpected tool result: {result}"
+    _check(lambda: len(captured) == 1, "expected exactly one request")
+    pre_key = captured[0].split("api_key")[0]
+    _check(lambda: "search=Stevenage" in pre_key and "limit=3" in pre_key,
+           "the kwargs string must be parsed into real query parameters")
+
+
+def test_50_kwargs_string_path_param():
+    captured.clear()
+    server.httpx.AsyncClient = _FakeClient
+    tool_fn = _dataset_tool()
+    asyncio.run(tool_fn(kwargs="datasetID=42"))
+    _check(lambda: len(captured) == 1, "expected exactly one request")
+    _check(lambda: "/api/v1/dataset/42" in captured[0],
+           "a path parameter inside the kwargs string must fill the path")
+
+
+def test_51_kwargs_string_unknown_param_rejected():
+    captured.clear()
+    server.httpx.AsyncClient = _FakeClient
+    tool_fn = _list_tool()
+    result = asyncio.run(tool_fn(kwargs="bogus=1"))
+    assert result.startswith("Error: unknown parameter(s) bogus."), result[:80]
+    _check(lambda: captured == [],
+           "a rejected kwargs string must not issue a request")

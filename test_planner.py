@@ -100,3 +100,19 @@ def test_parse_days_none_profile_is_empty_service_level_decides():
     # element; parse_transxchange falls back per-VJ -> Service -> all-days.
     # At this level, None simply means "nothing declared here".
     assert _parse_days(None) == set()
+
+
+def test_next_departures_collapses_daymask_twins(writer, store):
+    # Round 7 bug D: the same journey republished under two day-masks (and in
+    # two sibling datasets) shows as identical board rows. The board layer
+    # must collapse rows sharing (op, route, direction, code, dep, dest).
+    writer.add_stop("A1", "Alpha")
+    writer.add_stop("B1", "Beta")
+    stops = [{"naptan": "A1", "arrival": None, "departure": "09:00:00"},
+             {"naptan": "B1", "arrival": "09:10:00", "departure": None}]
+    writer.add_journey("OpA", "7", "outbound", "vj_1", {"mon", "tue"}, stops, 1)
+    writer.add_journey("OpA", "7", "outbound", "vj_1",
+                       {"mon", "wed", "thu", "fri"}, stops, 2)
+    writer.commit()
+    rows = store.next_departures({"A1"}, "mon", "08:00:00", 10)
+    assert len(rows) == 1, f"day-mask twins must collapse to one row: {rows}"
