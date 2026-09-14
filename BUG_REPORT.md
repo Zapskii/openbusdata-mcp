@@ -547,6 +547,34 @@ order, s2r discoverability both regions, multi-region get_route_stops,
 prefer_stops, resolve_operator across siblings, exact discard, legacy-DB
 migration + idempotence). 165 passed, secrets-stripped.
 
+## Round 6 E2E (live index post surgical reload, MCP stdio probe)
+
+- get_route_stops("Arriva UK Bus", "101"): 5 sibling rows returned
+  (ds 15766 Shires 38 stops incl. Stop L; ds 22528 the 3590* Telford
+  pack; ds 22533 49 stops; ds 22537 101A + 101) — every region
+  queryable, zero duplicate (op,route,ds) rows.
+- CORRECTION to this report's evidence: the 3590* Telford pack is ds
+  22528, not 22533 (22533's 101 is Stevenage-area 2490*/2400* — same
+  correction as the s2r prefixes). BODS has FOUR sibling packs for
+  101 (22528/22533/22537 + 15766).
+- find_routes_between_stops(210021203880, 210021200011): returns 100 +
+  SB9 (correct at pattern level). FURTHER CORRECTION to the report's
+  expectation: route 101 NEVER belonged in that answer — its 72
+  dual-stop journeys serve the pair at JOURNEY level, but neither stop
+  sits in any 101 JourneyPattern (source semantics, pre-collision).
+  The tool's answer is data-true against the healthy index.
+- estimate_live_eta(210021200011, ARHE, 101): returns the data-true
+  answer "not served by route Arriva UK Bus|101" (same reason: stop
+  not on any 101 pattern). With a stop ON the pattern (210021109740,
+  Stop L), the tool resolves the SHIRES region and returns real
+  vehicles with schedule-offset ETAs — verified directly against the
+  live index; the same call answers over MCP stdio when a prior live
+  call primed the session, but the FIRST SIRI-VM fetch inside a
+  one-shot stdio server session can hang (>300s). Not reproducible
+  outside the stdio session; not a regression of this fix (fix touches
+  no live-fetch path). OPEN: needs a repro against the persistent
+  gateway before treating it as a real defect.
+
 ## Round 6 follow-up (5372d2e): s2r table rebuild
 
 The live index's stop_to_routes table predated the PK — CREATE TABLE IF
