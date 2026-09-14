@@ -256,3 +256,100 @@ def test_parse_siri_sx_situations_without_infomessage():
     assert m["lines"] == ["VL2"]
     assert m["stops"] == ["9400XXX"]
     assert m["summary"] == "Road closed"
+
+
+# --- Round 8 bug F: the DfT /siri-sx/cancellations feed carries zero
+# VehicleJourneyCancellation-family tags — every record is a bare
+# PtSituationElement (one AffectedVehicleJourney per situation), the same
+# shape family as round-7 bug B. A successful parse of zero
+# cancellation-tag records must fall back, not return [].
+CXL_PSE = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <SituationExchangeDelivery>
+   <Situations>
+    <PtSituationElement>
+     <CreationTime>2026-09-14T17:00:00Z</CreationTime>
+     <ParticipantRef>SCEK</ParticipantRef>
+     <SituationNumber>SCEK-1</SituationNumber>
+     <Progress>open</Progress>
+     <ValidityPeriod>
+      <StartTime>2026-09-14T17:00:00Z</StartTime>
+      <EndTime>2026-09-14T20:00:00Z</EndTime>
+     </ValidityPeriod>
+     <MiscellaneousReason>unknown</MiscellaneousReason>
+     <Affects>
+      <VehicleJourneys>
+       <AffectedVehicleJourney>
+        <DatedVehicleJourneyRef>VJ-1001</DatedVehicleJourneyRef>
+        <Operator><OperatorRef> SCEK </OperatorRef>
+         <OperatorName>Stagecoach East</OperatorName></Operator>
+        <LineRef> 1 </LineRef><PublishedLineName>1A</PublishedLineName>
+        <DirectionRef>outbound</DirectionRef>
+        <OriginAimedDepartureTime>2026-09-14T17:05:00Z</OriginAimedDepartureTime>
+        <Calls>
+         <Call><StopPointRef> 010A </StopPointRef><StopPointName> Alpha Street </StopPointName>
+          <Order>1</Order><AimedDepartureTime>2026-09-14T17:05:00Z</AimedDepartureTime></Call>
+         <Call><StopPointRef>010B</StopPointRef><Order>2</Order>
+          <AimedDepartureTime>2026-09-14T17:15:00Z</AimedDepartureTime></Call>
+        </Calls>
+       </AffectedVehicleJourney>
+      </VehicleJourneys>
+     </Affects>
+    </PtSituationElement>
+    <PtSituationElement>
+     <CreationTime>2026-09-14T18:00:00Z</CreationTime>
+     <Progress>closed</Progress>
+     <ValidityPeriod>
+      <StartTime>2026-09-14T18:00:00Z</StartTime>
+      <EndTime>2026-09-14T19:00:00Z</EndTime>
+     </ValidityPeriod>
+     <Affects>
+      <VehicleJourneys>
+       <AffectedVehicleJourney>
+        <DatedVehicleJourneyRef>VJ-1002</DatedVehicleJourneyRef>
+        <Operator><OperatorRef>OPX</OperatorRef></Operator>
+        <LineRef>12</LineRef>
+       </AffectedVehicleJourney>
+      </VehicleJourneys>
+     </Affects>
+    </PtSituationElement>
+   </Situations>
+  </SituationExchangeDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_parse_cancellations_pse_fallback_fills_keys():
+    entries = siri.parse_cancellations(CXL_PSE)
+    assert len(entries) == 2, (
+        "zero cancellation-tag records must fall back to PtSituationElements")
+    open_e, closed_e = entries
+    assert open_e["recorded_at"] == "2026-09-14T17:00:00Z"
+    assert open_e["vehicle_journey_ref"] == "VJ-1001"
+    assert open_e["operator"] == "SCEK"
+    assert open_e["line"] == "1" and open_e["published_line"] == "1A"
+    assert open_e["origin"] == "2026-09-14T17:05:00Z"
+    assert open_e["reason"] == "unknown"
+    assert open_e["progress"] == "open"
+    assert open_e["valid_from"] == "2026-09-14T17:00:00Z"
+    assert open_e["valid_until"] == "2026-09-14T20:00:00Z"
+    # first Call only: the stop list is per-journey and can be long
+    assert open_e["first_stop"] == "010A"
+    assert open_e["first_stop_name"] == "Alpha Street"
+    # second AVJ has no Calls block and no PublishedLineName
+    assert closed_e["first_stop"] is None
+    assert closed_e["first_stop_name"] is None
+    assert closed_e["published_line"] is None
+    assert closed_e["line"] == "12" and closed_e["progress"] == "closed"
+    # keys the get_cancellations exact-match filter reads are always present
+    for e in entries:
+        assert e["operator"] is not None and e["line"] is not None
+
+
+def test_parse_cancellations_tag_records_win_over_fallback():
+    # the fallback must never fire when the feed DID carry cancellation tags
+    assert siri.parse_cancellations(CXL) == [{
+        "recorded_at": "2026-09-12T10:00:00Z",
+        "vehicle_journey_ref": "J-42", "operator": "OPX", "line": "12",
+        "origin": "010A", "destination": "010C", "reason": "breakdown"}]

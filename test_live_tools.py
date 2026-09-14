@@ -616,3 +616,76 @@ def test_estimate_live_eta_name_without_noc_asks_for_reindex(seeded_route_named_
     out, url = _eta_with_capture("Op Express Ltd", monkeypatch)
     assert "operatorRef" not in url, "no datafeed call once the NOC is unknown"
     assert "force_refresh" in out
+
+
+# --- Round 8 bug F: the live DfT /siri-sx/cancellations feed carries zero
+# VehicleJourneyCancellation-family tags — every record is a bare
+# PtSituationElement (one AffectedVehicleJourney per situation). The parser
+# falls back to those; the wrapped tool must return non-empty structured
+# entries whose keys its exact-match filter reads.
+CXL_PSE = b'''<?xml version="1.0"?>
+<Siri xmlns="http://www.siri.org.uk/siri">
+ <ServiceDelivery>
+  <SituationExchangeDelivery>
+   <Situations>
+    <PtSituationElement>
+     <CreationTime>2026-09-14T17:00:00Z</CreationTime>
+     <Progress>open</Progress>
+     <ValidityPeriod>
+      <StartTime>2026-09-14T17:00:00Z</StartTime>
+      <EndTime>2026-09-14T20:00:00Z</EndTime>
+     </ValidityPeriod>
+     <MiscellaneousReason>unknown</MiscellaneousReason>
+     <Affects>
+      <VehicleJourneys>
+       <AffectedVehicleJourney>
+        <DatedVehicleJourneyRef>VJ-1001</DatedVehicleJourneyRef>
+        <Operator><OperatorRef>SCEK</OperatorRef></Operator>
+        <LineRef>1</LineRef><PublishedLineName>1A</PublishedLineName>
+        <OriginAimedDepartureTime>2026-09-14T17:05:00Z</OriginAimedDepartureTime>
+        <Calls>
+         <Call><StopPointRef>010A</StopPointRef><Order>1</Order>
+          <AimedDepartureTime>2026-09-14T17:05:00Z</AimedDepartureTime></Call>
+         <Call><StopPointRef>010B</StopPointRef><Order>2</Order>
+          <AimedDepartureTime>2026-09-14T17:15:00Z</AimedDepartureTime></Call>
+        </Calls>
+       </AffectedVehicleJourney>
+      </VehicleJourneys>
+     </Affects>
+    </PtSituationElement>
+    <PtSituationElement>
+     <CreationTime>2026-09-14T18:00:00Z</CreationTime>
+     <Progress>closed</Progress>
+     <Affects>
+      <VehicleJourneys>
+       <AffectedVehicleJourney>
+        <DatedVehicleJourneyRef>VJ-1002</DatedVehicleJourneyRef>
+        <Operator><OperatorRef>OPX</OperatorRef></Operator>
+        <LineRef>12</LineRef>
+       </AffectedVehicleJourney>
+      </VehicleJourneys>
+     </Affects>
+    </PtSituationElement>
+   </Situations>
+  </SituationExchangeDelivery>
+ </ServiceDelivery>
+</Siri>'''
+
+
+def test_get_cancellations_pse_feed_filters_by_operator():
+    def handler(request):
+        # Inline raise, not assert: the operand is the request URL, key included.
+        if "/siri-sx/cancellations/" not in str(request.url):
+            raise AssertionError("cancellations tool must hit the cancellations path")
+        return httpx.Response(200, content=CXL_PSE)
+
+    _install(handler)
+    try:
+        out = json.loads(asyncio.run(server.get_cancellations()))
+        assert [e["vehicle_journey_ref"] for e in out] == ["VJ-1001", "VJ-1002"]
+        by_op = json.loads(asyncio.run(server.get_cancellations(operator="OPX")))
+        assert [e["vehicle_journey_ref"] for e in by_op] == ["VJ-1002"]
+        assert asyncio.run(server.get_cancellations(operator="NOPE")) == \
+            "No matching cancellation entries."
+    finally:
+        _reset()
