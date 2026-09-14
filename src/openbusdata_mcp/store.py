@@ -304,33 +304,34 @@ class TimetableStore:
         target_s = _parse_time(arrive_by)
         if target_s is None:
             return []
-        return list(self._find_buses_cached(
-            self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
-
-    @functools.lru_cache(maxsize=128)
-    def _find_buses_cached(self, key: tuple, a: frozenset, b: frozenset,
-                           day: str, target_s: str) -> list[dict]:
-        cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
-        names = self.stop_names_bulk(
-            [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
+        # Project fresh rows per call: this path never hands out the
+        # lru-cached plan dicts, so callers may mutate freely.
+        legs = [p["legs"][0] for p in self._direct_plans_cached(
+            self._data_key(), frozenset(naptans_a), frozenset(naptans_b),
+            day, target_s)]
         out = [{
-            "operator": c.operator, "route": c.route,
-            "direction": c.direction, "journey_code": c.code,
-            "board_at": names.get(c.naptan_a, "Unknown"),
-            "depart": c.depart_a,
-            "alight_at": names.get(c.naptan_b, "Unknown"),
-            "arrive": c.arrive_b} for c in cands]
+            "operator": leg["operator"], "route": leg["route"],
+            "direction": leg["direction"], "journey_code": leg["journey_code"],
+            "board_at": leg["board"], "depart": leg["depart"],
+            "alight_at": leg["alight"], "arrive": leg["arrive"]}
+            for leg in legs]
         out.sort(key=lambda x: x["arrive"] or "")
         return out[:20]
 
     def plan_direct(self, naptans_a: set, naptans_b: set, day: str,
                     target_s: str) -> list[dict]:
-        return list(self._plan_direct_cached(
+        return list(self._direct_plans_cached(
             self._data_key(), frozenset(naptans_a), frozenset(naptans_b), day, target_s))
 
     @functools.lru_cache(maxsize=128)
-    def _plan_direct_cached(self, key: tuple, a: frozenset, b: frozenset,
-                            day: str, target_s: str) -> list[dict]:
+    def _direct_plans_cached(self, key: tuple, a: frozenset, b: frozenset,
+                             day: str, target_s: str) -> list[dict]:
+        """One cached render for plan_direct and find_buses_by_arrival_time:
+        the twin caches previously held the same _candidate_journeys results
+        under two lru entries. Legs carry direction/journey_code beyond
+        plan_direct's historical shape; consumers read keys, never the whole
+        schema, and the shallow-copy contract in server.plan_journey is
+        unchanged (legs are only ever read, mutation is a top-level key)."""
         cands = list(self._candidate_journeys(set(a), set(b), day, target_s))
         names = self.stop_names_bulk(
             [c.naptan_a for c in cands] + [c.naptan_b for c in cands])
@@ -338,6 +339,7 @@ class TimetableStore:
             "type": "direct",
             "legs": [{
                 "operator": c.operator, "route": c.route,
+                "direction": c.direction, "journey_code": c.code,
                 "board": names.get(c.naptan_a, "Unknown"),
                 "depart": c.depart_a,
                 "alight": names.get(c.naptan_b, "Unknown"),
@@ -610,14 +612,6 @@ class TimetableStore:
         return profiles
 
     # -- provenance / maintenance (used by delta loader) --------------------
-    def dataset_meta(self, ds_id: int) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT v FROM meta WHERE k='dataset_meta'").fetchone()
-        if not row:
-            return None
-        meta = json.loads(row[0])
-        return meta.get(str(ds_id))
-
     def close(self):
         if self._conn:
             self._conn.close()
@@ -662,9 +656,10 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS loaded_datasets (
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT,
             noc TEXT DEFAULT '');
-        CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
-        CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
-        CREATE INDEX IF NOT EXISTS js_j ON journey_stops(journey_id);
+        -- journey_stops (naptan, journey_id) was written but never read by
+        -- any query; journey_stop_times(naptan) covers stop->journey lookups.
+        -- Legacy DBs carry the orphan table, so drop it here.
+        DROP TABLE IF EXISTS journey_stops;
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
@@ -694,19 +689,6 @@ class TimetableWriter:
             DELETE FROM routes_fts WHERE rowid = old.rowid;
         END;
         """)
-        # One-time backfill: journey_stops only gets populated by add_journey,
-        # so a DB upgraded in place (journeys already present) would have an
-        # empty index table and every stop->journey query would silently return
-        # nothing. Backfill from the stored stops JSON once, keyed on a meta
-        # flag so it never re-runs.
-        if not self.conn.execute(
-                "SELECT 1 FROM meta WHERE k='journey_stops_backfilled'").fetchone():
-            self.conn.execute(
-                "INSERT INTO journey_stops (naptan, journey_id) "
-                "SELECT json_extract(value, '$.naptan'), j.id "
-                "FROM journeys j, json_each(j.json, '$.stops')")
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta VALUES ('journey_stops_backfilled', '1')")
         # One-time backfill: stops_fts only gets populated by the triggers, so
         # a DB upgraded in place (stops already present) would have an empty
         # FTS index and every FTS search would silently return nothing.
@@ -1000,9 +982,6 @@ class TimetableWriter:
             (ds_id, op, num, direction, code, json.dumps(sorted(days)),
              _days_mask(days), json.dumps(j)))
         self.conn.executemany(
-            "INSERT INTO journey_stops VALUES (?,?)",
-            [(s["naptan"], cur.lastrowid) for s in stops])
-        self.conn.executemany(
             "INSERT INTO journey_stop_times (naptan, journey_id, seq, dep, arr) "
             "VALUES (?,?,?,?,?)",
             [(s["naptan"], cur.lastrowid, i,
@@ -1058,9 +1037,6 @@ class TimetableWriter:
         sibling datasets serving the same op|num keep theirs. The caller owns
         the transaction: purge + rewrite must commit together.
         """
-        self.conn.execute(
-            "DELETE FROM journey_stops WHERE journey_id IN "
-            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute(
             "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
