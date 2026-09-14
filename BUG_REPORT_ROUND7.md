@@ -225,6 +225,10 @@ container logs alone.
   should pass realistic deadlines or use `find_buses_by_arrival_time`.
 - SIRI-VM and GTFS-RT raw passthroughs still hit the BODS 403 bot wall (unchanged
   from prior builds; wrapped live tools are unaffected).
+  **[CORRECTED 2026-09-14, round 9:]** withdrawn — both passthroughs re-verified
+  WORKING on `c23f093` (SIRI-VM: VehicleMonitoringDelivery XML; GTFS-RT: 30 KB
+  protobuf); the historic failures match the kwargs comma trap +
+  trailing-slash 301, not a bot wall. Full note in BUG_REPORT_ROUND9.md.
 - `get_departures_board` Stop M (210021200780) having no rows: correct — the stop
   only appears as an `AnnotatedRef` declaration in ds 15766, no timing links.
 

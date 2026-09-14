@@ -95,10 +95,20 @@ must equal 2,857 (recompute at run time; the fixture guards the code path).
   763,290 journeys, 941 datasets; exact twins **0**; ds_id=0 orphans **0**;
   flat-journey guard **0**; stop_to_routes dup groups **0**; coord coverage
   125,963/253,646 = **49%** (source-data-bounded, unchanged family).
-- GTFS-RT passthrough → BODS 403 bot wall: unchanged from prior builds,
-  environment-level (same raw UA/key gets 403 via curl from the container);
-  not a tool defect. SIRI-VM passthrough works
-  (`boundingBox=0.1%2C51.0%2C0.2%2C51.1` → real VehicleMonitoringDelivery XML).
+- ~~GTFS-RT passthrough → BODS 403 bot wall~~ **WITHDRAWN 2026-09-14 post-deploy
+  retest on `c23f093`**: the passthrough **works**. Raw curl against
+  `/api/v1/gtfsrtdatafeed/?api_key=…` → 200 (30 KB protobuf), no 403 anywhere.
+  Via the registered MCP tool with kwargs-encoded args:
+  `GTFS_RT_Data_feed_api_v1_gtfsrtdatafeed` `kwargs="boundingBox=-2.930%2C53.374%2C-3.085%2C53.453"`
+  → 30,489 chars of real GTFS-RT protobuf (vehicle IDs, positions), key redacted;
+  `routeId=101` filter → valid (empty) 13-byte protobuf. The rounds-7/8 "403 bot
+  wall" claims were almost certainly the kwargs comma trap (raw commas die
+  client-side pre-HTTP, looking like an upstream rejection) plus the
+  trailing-slash 301 (`gtfsrtdatafeed` → `gtfsrtdatafeed/`). Not a bot wall, not
+  a fork bug; earlier claim withdrawn. SIRI-VM passthrough verified working the
+  same way. Registration wrinkle: hyphens become underscores in spec-derived
+  tool names (`SIRI-VM_Data_feed…` → "Unknown tool"; real name
+  `SIRI_VM_Data_feed_api_v1_datafeed`).
 - **kwargs comma trap re-confirmed on this build** (round-9 candidate G from
   the mid-round report): raw `boundingBox=0.1,51.0,0.2,51.1` →
   "unknown parameter(s) 0.2, 51.0, 51.2"; percent-encoded `%2C` → success.
@@ -125,7 +135,9 @@ must equal 2,857 (recompute at run time; the fixture guards the code path).
 ## Parked
 
 - Bug E (delta timeout/watermark): unchanged, parked ops.
-- Bug G, Bug H: awaiting Simon's verdict before any fix PR.
+- ~~Bug G, Bug H~~ FIXED in PR #20 (`c23f093`), merged + deployed + live-verified.
 - Optional `limit` param on `get_cancellations` (782 KB payload tonight):
   still a caller decision, not implemented.
-- GTFS-RT 403: upstream bot wall, not actionable in the fork.
+- ~~GTFS-RT 403~~ withdrawn — passthrough verified working on `c23f093`
+  (see the withdrawn claim above); nothing parked, no upstream action needed.
+- kwargs comma trap (LOW): doc-note candidate, open.
