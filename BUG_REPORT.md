@@ -588,3 +588,58 @@ orphans=0, PK verified in place. 166 tests pass. Cosmetic known issue: the
 migration's log line says "rekeyed N route rows" where N is the total
 routes count, not the rekeyed subset (rekey is a no-op when already
 migrated; the gate is column-driven so nothing re-corrupts).
+
+## Round 7 RETEST (PR #18, 06b1e54, deployed 2026-09-14)
+
+**Deploy:** merge commit 06b1e54 -> image -> tagged `latest`; gateway recreated
+(RestartCount=0, index ready). Surgical reload of all flat-journey datasets
+followed (obd-r7-reload): **290/290 done, 0 failed**.
+
+**A — flat journeys: FIXED.** Pre-reload census: 457,583 flat journeys across
+290 datasets (58.7% of the index). Post-reload: **0 across 0 datasets**
+(index 766,088 -> 763,279; -2,809 = dropped phantom rows + BODS churn).
+Per-dataset proof on real zips: ds 18512 8,354/8,462 (98.7%) -> 0; ds 20441
+44,619/44,623 (100.0%) -> 0; journey counts identical old->new (nothing
+legitimately dropped; all 290 reloaded packs retain journeys; loaded_datasets
+still 943). VJ1154: 71 stops all 07:00 -> 54 distinct real times. Live MCP
+repro from this report: find_buses_by_arrival_time(Stevenage Rail St ->
+Hitchin Asda, mon, arrive_by 16:00) now returns real 9A rows with real
+durations - phantom zero-duration rows gone.
+
+**B — get_disruptions always empty: FIXED.** Live DfT siri-sx feed parse:
+0 -> 421 messages (real severities/operators/lines).
+
+**C — passthrough kwargs ignored: FIXED.** fares(kwargs="noc=BLAC,limit=5"):
+old count 803 -> new count 2 (Blackpool only), matching direct BODS exactly.
+Path params fill the path (test_50); unknown params rejected before any
+request (test_51). search=Stevenage returns 0 at BODS itself - the report's
+own repro numbers were BODS-true all along.
+
+**D — board duplicate rows: FIXED.** Board on live index:
+`55 vj_1 14:45 Southfields` 2 rows -> 1 row; LIMIT applies after dedupe
+(15 unique rows). The report's "near-dupes" (56 @15:22/15:25) remain by
+design: different dep = different service; the dedupe key is
+(op, route, direction, code, dep, dest).
+
+**Integrity post-reload:** exact-twin groups 0; ds 18512 distinct arr times
+1,316; gateway healthy (restarts=0) throughout; routes 9,705 (report said
+9,706 - BODS-side dataset churn from the round-7 delta, not a regression).
+
+**Wrinkles found mid-verify:**
+1. PR body claim wrong: "get_cancellations was unaffected" is FALSE - live
+   cancellations feed carries 2,000 PtSituationElement (zero
+   VehicleJourneyCancellation tags), parse_cancellations returns 0/2,000 on
+   old AND new builds. Same shape-family as bug B -> round-8 candidate.
+2. BUG_REPORT_ROUND7.md was untracked on the main checkout; committed on
+   main (418b64d) immediately after merge.
+3. Stdio first-live-fetch quirk: timetables_api_v1_dataset over stdio never
+   answered even after priming (2 attempts); C was proved via in-container
+   direct tool-function calls + direct BODS checks instead.
+4. Probe hygiene: importing server.py outside a throwaway HOME once ran
+   ensure_schema + a route-key migration against the STALE host-side
+   ~/.cache index (132,700 stops / 246 datasets - disposable, not the live
+   volume). No live-index impact. Later probes pinned HOME to /tmp.
+5. One BODS read-only api_key value surfaced in the transcript once (shell
+   sourcing error). Read-only key; rotation optional.
+
+**Still open (bug E, ops):** delta timeout/watermark - unchanged, parked.
