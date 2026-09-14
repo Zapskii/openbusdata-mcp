@@ -120,7 +120,7 @@ that talks to the travel agent on Sunday (e.g. "run the weekly bus data delta")
 cleanup; pre-SQLite scripts live in `dev-legacy/`.)
 
 SQLite schema (created by `store.py`, migrated from the legacy JSON cache by
-`convert_to_sqlite.py`): `stops`, `routes`, `journeys` (+ `journey_stops`),
+`convert_to_sqlite.py`): `stops`, `routes`, `journeys`,
 `stop_to_routes`, `loaded_datasets` (provenance), `meta` (watermark + misc).
 Indexes on `journeys(ds_id)`, `stop_to_routes(naptan)`, `journeys(op, route)`.
 

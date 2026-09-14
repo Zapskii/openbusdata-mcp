@@ -1,5 +1,3 @@
-import tempfile
-from pathlib import Path
 
 import openbusdata_mcp.store as store_mod
 from openbusdata_mcp.store import TimetableWriter
@@ -194,20 +192,20 @@ def test_19_combined_in_clause_params_capped(writer, store):
     store.find_routes_between(a, b)  # must not raise "too many SQL variables"
 
 
-# --- Test 12: journey_stops table is populated and purged with its journeys
-def test_12_journey_stops_populated_and_purged(writer, store):
+# --- Test 12: purge leaves no orphaned journey_stop_times rows
+def test_12_purge_leaves_no_orphaned_stop_times(writer, store):
     writer.add_journey("Op", "12", "outbound", "J12", {"mon"},
                        [{"naptan": "12A", "arrival": None, "departure": "09:00:00"},
                         {"naptan": "12B", "arrival": "09:10:00", "departure": None}], 42)
     writer.commit()
     n = writer.conn.execute(
-        "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
-    assert n >= 1, "journey_stops not populated"
+        "SELECT COUNT(*) FROM journey_stop_times WHERE naptan='12A'").fetchone()[0]
+    assert n >= 1, "journey_stop_times not populated"
     writer.discard_dataset(42)
     writer.commit()
     n = writer.conn.execute(
-        "SELECT COUNT(*) FROM journey_stops WHERE naptan='12A'").fetchone()[0]
-    assert n == 0, "journey_stops not purged with dataset"
+        "SELECT COUNT(*) FROM journey_stop_times WHERE naptan='12A'").fetchone()[0]
+    assert n == 0, "journey_stop_times not purged with dataset"
 
 
 # --- Test 15: _candidate_journeys yields the same journeys both tools use
@@ -232,25 +230,6 @@ def test_20_discard_dataset_index_only_scan(writer):
     plan = writer.conn.execute(
         "EXPLAIN QUERY PLAN SELECT DISTINCT op, route FROM journeys").fetchall()
     assert any("j_oproute" in str(row) for row in plan), f"index not used: {plan}"
-
-
-# --- Test 21: ensure_schema backfills journey_stops for pre-existing journeys
-# A pre-Phase-2 DB has journeys but no journey_stops rows and no backfill flag;
-# ensure_schema must populate the index table once (in-place upgrade, no rebuild).
-def test_21_ensure_schema_backfills_journey_stops():
-    _bk = Path(tempfile.mkdtemp()) / "upgrade.db"
-    w2 = TimetableWriter(_bk)
-    w2.ensure_schema()
-    w2.add_journey("Op", "21", "outbound", "J21", {"mon"},
-                   [{"naptan": "010A", "arrival": None, "departure": "09:00:00"},
-                    {"naptan": "010B", "arrival": "09:10:00", "departure": None}], 5)
-    w2.conn.execute("DELETE FROM journey_stops")  # simulate a pre-Phase-2 DB
-    w2.conn.execute("DELETE FROM meta WHERE k='journey_stops_backfilled'")
-    w2.conn.commit()
-    w2.ensure_schema()  # must backfill
-    n = w2.conn.execute(
-        "SELECT COUNT(*) FROM journey_stops WHERE journey_id=1").fetchone()[0]
-    assert n == 2, f"backfill missing: {n}"
 
 
 # --- Test 16: get_route_stops direction filter matches parsed directions

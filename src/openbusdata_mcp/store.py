@@ -654,9 +654,10 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS loaded_datasets (
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT,
             noc TEXT DEFAULT '');
-        CREATE TABLE IF NOT EXISTS journey_stops (naptan TEXT, journey_id INT);
-        CREATE INDEX IF NOT EXISTS js_n ON journey_stops(naptan);
-        CREATE INDEX IF NOT EXISTS js_j ON journey_stops(journey_id);
+        -- journey_stops (naptan, journey_id) was written but never read by
+        -- any query; journey_stop_times(naptan) covers stop->journey lookups.
+        -- Legacy DBs carry the orphan table, so drop it here.
+        DROP TABLE IF EXISTS journey_stops;
         CREATE INDEX IF NOT EXISTS j_ds ON journeys(ds_id);
         CREATE INDEX IF NOT EXISTS s2r_n ON stop_to_routes(naptan);
         CREATE INDEX IF NOT EXISTS j_oproute ON journeys(op, route);
@@ -686,19 +687,6 @@ class TimetableWriter:
             DELETE FROM routes_fts WHERE rowid = old.rowid;
         END;
         """)
-        # One-time backfill: journey_stops only gets populated by add_journey,
-        # so a DB upgraded in place (journeys already present) would have an
-        # empty index table and every stop->journey query would silently return
-        # nothing. Backfill from the stored stops JSON once, keyed on a meta
-        # flag so it never re-runs.
-        if not self.conn.execute(
-                "SELECT 1 FROM meta WHERE k='journey_stops_backfilled'").fetchone():
-            self.conn.execute(
-                "INSERT INTO journey_stops (naptan, journey_id) "
-                "SELECT json_extract(value, '$.naptan'), j.id "
-                "FROM journeys j, json_each(j.json, '$.stops')")
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta VALUES ('journey_stops_backfilled', '1')")
         # One-time backfill: stops_fts only gets populated by the triggers, so
         # a DB upgraded in place (stops already present) would have an empty
         # FTS index and every FTS search would silently return nothing.
@@ -992,9 +980,6 @@ class TimetableWriter:
             (ds_id, op, num, direction, code, json.dumps(sorted(days)),
              _days_mask(days), json.dumps(j)))
         self.conn.executemany(
-            "INSERT INTO journey_stops VALUES (?,?)",
-            [(s["naptan"], cur.lastrowid) for s in stops])
-        self.conn.executemany(
             "INSERT INTO journey_stop_times (naptan, journey_id, seq, dep, arr) "
             "VALUES (?,?,?,?,?)",
             [(s["naptan"], cur.lastrowid, i,
@@ -1050,9 +1035,6 @@ class TimetableWriter:
         sibling datasets serving the same op|num keep theirs. The caller owns
         the transaction: purge + rewrite must commit together.
         """
-        self.conn.execute(
-            "DELETE FROM journey_stops WHERE journey_id IN "
-            "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute(
             "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
