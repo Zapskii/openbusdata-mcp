@@ -19,7 +19,7 @@ is a one-place fix. All parsing goes through defusedxml (safe against
 entity-expansion / billion-laughs in remote documents).
 """
 
-from typing import Optional
+from typing import Iterator, Optional
 
 from defusedxml import ElementTree as SafeET
 
@@ -161,13 +161,51 @@ CANCELLATION_TAGS = {"VehicleJourneyCancellation",
                      "EstimatedVehicleJourneyCancellations"}
 
 
+def _cancellation_from_situation(sit) -> Iterator[dict]:
+    """Flatten one PtSituationElement's AffectedVehicleJourney records into
+    cancellation entries (round-8 bug F: the DfT /siri-sx/cancellations feed
+    carries zero VehicleJourneyCancellation-family tags — every record is a
+    PtSituationElement, one AffectedVehicleJourney per situation)."""
+    entry = {
+        "recorded_at": (_desc_text(sit, "RecordedAtTime")
+                        or _desc_text(sit, "CreationTime")),
+        "origin": None,
+        "destination": None,
+        "reason": _desc_text(sit, "MiscellaneousReason"),
+    }
+    validity = sit.find(f".//{{{SIRI_NS}}}ValidityPeriod")
+    entry["valid_from"] = _desc_text(validity, "StartTime") if validity is not None else None
+    entry["valid_until"] = _desc_text(validity, "EndTime") if validity is not None else None
+    entry["progress"] = _desc_text(sit, "Progress")
+    first_call = sit.find(f".//{{{SIRI_NS}}}Call")
+    if first_call is not None:
+        entry["first_stop"] = _desc_text(first_call, "StopPointRef")
+        entry["first_stop_name"] = _desc_text(first_call, "StopPointName")
+    else:
+        entry["first_stop"] = None
+        entry["first_stop_name"] = None
+    for avj in sit.iter(f"{{{SIRI_NS}}}AffectedVehicleJourney"):
+        out = dict(entry)
+        out["vehicle_journey_ref"] = _desc_text(avj, "DatedVehicleJourneyRef")
+        out["operator"] = _desc_text(avj, "OperatorRef")
+        out["line"] = (_desc_text(avj, "LineRef")
+                       or _desc_text(avj, "PublishedLineName"))
+        out["published_line"] = _desc_text(avj, "PublishedLineName")
+        # Keeps the existing key's meaning (where/when the cancelled journey
+        # starts): OriginRef is not published on this feed.
+        out["origin"] = _desc_text(avj, "OriginAimedDepartureTime")
+        out["destination"] = (_desc_text(avj, "DestinationRef")
+                              or _desc_text(avj, "DestinationName"))
+        yield out
+
+
 def parse_cancellations(content: bytes) -> list:
     """Flatten the /siri-sx/cancellations document into one dict per
     cancelled-vehicle entry. Every scalar uses descendant search (stripped)
-    so the parser tolerates BODS's nesting. If the live probe (Step 1) shows
-    the feed carries InfoMessage-shaped records instead, replace this
-    traversal with parse_siri_sx and map the fields — the tool layer is
-    unaffected."""
+    so the parser tolerates BODS's nesting. A successful parse of zero
+    cancellation-tag records is not an empty feed: the live DfT document
+    carries PtSituationElement records instead (round-8 bug F, the same
+    shape family as round-7 bug B), so fall back to those."""
     root = SafeET.fromstring(content)
     out = []
     for el in root.iter():
@@ -188,4 +226,7 @@ def parse_cancellations(content: bytes) -> list:
                             or _desc_text(el, "DestinationName")),
             "reason": _desc_text(el, "CancellationReason") or _desc_text(el, "Reason"),
         })
+    if not out:
+        for sit in root.iter(f"{{{SIRI_NS}}}PtSituationElement"):
+            out.extend(_cancellation_from_situation(sit))
     return out
