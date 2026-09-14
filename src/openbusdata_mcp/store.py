@@ -499,17 +499,24 @@ class TimetableStore:
             return []
         marks = ",".join("?" * len(naptans))
         rows = self.conn.execute(f"""
-            SELECT j.op, j.route, j.direction, j.code,
-                   MIN(jst.dep) AS dep,
-                   COALESCE(NULLIF(s.name, ''), 'Unknown') AS dest
-            FROM journey_stop_times jst
-            JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
-            JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
-                 AND lastj.seq = (SELECT MAX(seq) FROM journey_stop_times
-                                  WHERE journey_id = jst.journey_id)
-            LEFT JOIN stops s ON s.naptan = lastj.naptan
-            WHERE jst.naptan IN ({marks}) AND jst.dep IS NOT NULL AND jst.dep >= ?
-            GROUP BY jst.journey_id
+            SELECT op, route, direction, code, dep, dest FROM (
+                SELECT j.op AS op, j.route AS route,
+                       j.direction AS direction, j.code AS code,
+                       MIN(jst.dep) AS dep,
+                       COALESCE(NULLIF(s.name, ''), 'Unknown') AS dest
+                FROM journey_stop_times jst
+                JOIN journeys j ON j.id = jst.journey_id AND j.days_mask & ? != 0
+                JOIN journey_stop_times lastj ON lastj.journey_id = jst.journey_id
+                     AND lastj.seq = (SELECT MAX(seq) FROM journey_stop_times
+                                      WHERE journey_id = jst.journey_id)
+                LEFT JOIN stops s ON s.naptan = lastj.naptan
+                WHERE jst.naptan IN ({marks}) AND jst.dep IS NOT NULL AND jst.dep >= ?
+                GROUP BY jst.journey_id
+            )
+            -- Collapse semantic duplicates: the same journey republished under
+            -- two day-masks or in two sibling datasets yields identical rows
+            -- (round-7 bug D). LIMIT applies after the dedupe.
+            GROUP BY op, route, direction, code, dep, dest
             ORDER BY dep
             LIMIT ?
         """, [DAY_BITS.get(day, 0)] + list(naptans) + [from_time, limit]).fetchall()
