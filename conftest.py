@@ -40,7 +40,7 @@ def _fresh_db(tmp_path):
 def _clear_plan_caches():
     """Empty the planner's process-global lru caches before every test.
 
-    TimetableStore._plan_direct_cached / _plan_one_change_cached are class
+    TimetableStore._direct_plans_cached / _plan_one_change_cached are class
     attributes, so they outlive the per-test store rebuild, and
     test_perf.py::test_36 asserts an ABSOLUTE cache_info().hits count without
     clearing the cache itself — so any earlier test that makes a plan-cache hit
@@ -53,7 +53,7 @@ def _clear_plan_caches():
     genuine failure above it cascades into a spurious test_36 failure and makes
     one real defect look like two.
     """
-    TimetableStore._plan_direct_cached.cache_clear()
+    TimetableStore._direct_plans_cached.cache_clear()
     TimetableStore._plan_one_change_cached.cache_clear()
     yield
 
