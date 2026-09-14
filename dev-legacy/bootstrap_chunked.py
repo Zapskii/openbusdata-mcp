@@ -66,7 +66,7 @@ async def main() -> None:
         chunk = todo[start:start + SLICE]
         for ds_id in chunk:
             try:
-                await server.load_dataset(ds_id)
+                await server._load_dataset(ds_id)
             except Exception as e:
                 print(f"  ds {ds_id}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         # Save + RELEASE: trim any non-essential object churn between slices.

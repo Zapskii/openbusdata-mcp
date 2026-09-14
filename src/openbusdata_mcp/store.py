@@ -610,14 +610,6 @@ class TimetableStore:
         return profiles
 
     # -- provenance / maintenance (used by delta loader) --------------------
-    def dataset_meta(self, ds_id: int) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT v FROM meta WHERE k='dataset_meta'").fetchone()
-        if not row:
-            return None
-        meta = json.loads(row[0])
-        return meta.get(str(ds_id))
-
     def close(self):
         if self._conn:
             self._conn.close()

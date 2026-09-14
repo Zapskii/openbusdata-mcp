@@ -28,7 +28,6 @@ from datetime import date, datetime, timedelta, timezone
 from .store import TimetableStore, TimetableWriter, _parse_time
 from .siri import parse_siri_vm, parse_siri_sx, parse_cancellations
 from .fares import parse_fare_prices
-from collections import defaultdict
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -296,7 +295,6 @@ class Journey:
     journey_code: str
     stops: list[JourneyStop] = field(default_factory=list)
     days: set[str] = field(default_factory=set)  # mon, tue, wed, thu, fri, sat, sun
-    dataset_id: int = 0  # BODS dataset this journey came from (enables surgical purge)
 
 
 # All queryable state lives in the SQLite store; the in-memory index that
@@ -309,10 +307,6 @@ writer = TimetableWriter()
 # ---------------------------------------------------------------------------
 # TransXChange XML parsing helpers
 # ---------------------------------------------------------------------------
-def _get_ns(tag: str, ns: str) -> str:
-    return f"{{{ns}}}{tag}" if ns else tag
-
-
 def _parse_duration(text: str) -> timedelta:
     """Parse ISO 8601 duration like PT5M or PT1H30M."""
     if not text:
@@ -445,7 +439,10 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 
     ns = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
 
-    q = lambda tag: _get_ns(tag, ns)
+    # Namespace-qualified lookup; bare (namespace-less) TransXChange docs
+    # (the loader's non-zip fallback path) must still parse, so the guard is
+    # load-bearing.
+    q = lambda tag: f"{{{ns}}}{tag}" if ns else tag
 
     stops: list[Stop] = []
     routes: list[Route] = []
@@ -606,18 +603,6 @@ def parse_transxchange(content: str, operator_name: str) -> tuple[list[Stop], li
 # ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
-async def load_dataset(ds_id: int, client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
-    """Download and parse a single timetable dataset. Returns metadata.
-
-    No-op when the dataset is already loaded (resume semantics); updating a
-    changed dataset goes through load_timetable_delta, which calls
-    _load_dataset(force_reload=True) directly.
-    """
-    if ds_id in writer.loaded_ids():
-        return {}
-    return await _load_dataset(ds_id, client=client)
-
-
 def _xml_contents(z: zipfile.ZipFile) -> Iterator[str]:
     """Yield each .xml member's decoded text, one at a time."""
     for name in z.namelist():
@@ -809,12 +794,10 @@ async def load_all_timetable_data(force_refresh: bool = False) -> str:
                 skipped += 1
                 continue
             try:
-                # force_refresh bypasses the resume guard in load_dataset: purge +
-                # rewrite through _load_dataset(force_reload=True) directly.
-                if force_refresh:
-                    result = await _load_dataset(ds_id, force_reload=True, client=client)
-                else:
-                    result = await load_dataset(ds_id, client=client)
+                # _load_dataset's own resume guard skips already-loaded
+                # datasets unless force_reload (purge + rewrite).
+                result = await _load_dataset(ds_id, force_reload=force_refresh,
+                                             client=client)
                 if result is None:
                     errors += 1
                     failed_ids.append(ds_id)
