@@ -694,9 +694,6 @@ async def _load_dataset(ds_id: int, force_reload: bool = False,
             for stop in acc_stops:
                 writer.add_stop(stop.naptan, stop.name, stop.lat, stop.lon)
             for route in acc_routes:
-                # Legacy (untagged) journeys for this op+route are superseded
-                # by this tagged write.
-                writer.discard_untagged_for(route.operator, route.route_num)
                 writer.upsert_route(route.operator, route.route_num,
                                     route.directions, route.stops, ds_id)
             # Same journeys ship under several registration variants AND in
@@ -1426,7 +1423,9 @@ async def estimate_live_eta(stop: str, operator_ref: str, line_ref: str,
                 f"index predates operator codes — re-run "
                 f"load_timetable_index(force_refresh=True) to rebuild it, then "
                 f"retry with the operator name or its NOC.")
-    coords = store.route_stop_coords(operator, line_ref)
+    # Several region packs can share (operator, route) — pick the one whose
+    # stop list actually contains the queried stop.
+    coords = store.route_stop_coords(operator, line_ref, prefer_stops=naptans)
     if coords is None:
         return (f"Route {operator}|{line_ref} is not in the timetable index. "
                 f"Try get_route_stops().")

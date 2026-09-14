@@ -333,3 +333,216 @@ of one zip. The round-4 dedupe ran per-file, so cross-file twins inside
 one dataset survived. Fix: loader accumulates all files of a dataset,
 then applies _dedupe_journeys at dataset scope (parse_transxchange no
 longer dedupes). Tests 157/157 (test_44 recut to the new contract).
+
+---
+
+# RETEST round 5 — build `openbusdata-mcp:latest` = orphans-clean 4def6eb (2026-09-13, ~21:30 BST)
+
+Scope: full functionality + live-tracking pass on the three-commit build
+(svc-days 90b48d8, dsdedupe 7443e95, orphans-clean 4def6eb) after the
+19:14:20Z delta. Index state: 758,490 journeys / 253,635 stops (125,963
+with coords) / 7,493 route rows / 0 orphan (ds_id=0) journeys /
+journey_stops 30,371,948 rows.
+
+## ✅ All previously-open items verified closed
+
+1. **Board double-emission (round-3 REMAINING 1)** — gone. A 50-departure
+   pull at Stevenage Bus Station Stop L contains zero duplicate
+   journey_codes; every journey appears exactly once.
+2. **Sunday SB4 times contradict the source (round-3 REMAINING 2)** —
+   resolved and now verified against the raw file, not just bustimes.org:
+   the current 2026-08-30→open Sunday file (…2409347.xml) yields Stop-L
+   times 09:09 / 10:11 / 11:11 / 12:11 / 13:11 / 14:11 / 15:11 / 16:11 /
+   17:11 / 18:10 / 19:10 / 20:10 / 21:10 / 22:09 (14 Sunday journeys,
+   08:45→21:45 hourly departures from the loop's first Bus Station stop),
+   and the board returns exactly those times. Day-split files are clean
+   in the index too: `route='SB4'` rows carry `[sun]`, `[sat]`,
+   `[mon..fri]` as three separate day sets (77 journeys), not mask=127.
+3. **Orphan journeys** — 0 rows with ds_id=0.
+4. **Dataset-scope dedupe (round-4 follow-up)** — journeys 1,076,103 →
+   758,490 after the delta re-parse; the residual cross-file twins are
+   gone. Boards/planner output is duplicate-free as a consequence.
+5. **One-change planner** — instant on empty results (PR #15's hang stays
+   fixed) and correct on the positive path: Bus Station→Poplars
+   (210021200005→210021201520, sun, by 13:00) returns 15 one-change plans
+   with correct transfer pairing (leg-2 always departs at/after leg-1's
+   mid arrival; SB4/SB5 → SB1 via ASDA/Rockingham Way).
+   Two of its "No journey found" answers were verified data-true against
+   the DB (mids_a ∩ mids_b empty at SQL level): 210021200011 is a Sunday
+   TERMINUS in this dataset (all Sunday journeys touching it end there),
+   so Sunday one-change plans via Stop L are structurally impossible —
+   not a planner defect.
+6. **Live tracking** — `get_live_buses_on_route(ARHE, SB4)` returns
+   multiple vehicles with lat/lon/bearing; `estimate_live_eta` matches
+   all of them (distance_km 0.0–0.1) with schedule-offset ETAs carrying
+   journey refs. Raw passthrough `SIRI_VM_Data_feed_api_v1_datafeed`
+   still hits BODS's 403 bot wall (the wrapped tools are the interface).
+
+## ❌ NEW BUG (HIGH): cross-region route-row collision — `routes` keyed `op|num` globally while `operatorName` is not region-unique
+
+`upsert_route` (store.py:838) keys route rows `key = f"{op}|{num}"` with
+`op` = the BODS dataset `operatorName`, GLOBALLY unique across datasets.
+But operatorName is not a region-unique identifier: every Arriva region
+publishes as `"Arriva UK Bus"` — and BODS's `noc` metadata is
+operator-level too, so ds 15766 (Herts/Shires) and ds 22533 (Telford/
+Shropshire) carry BYTE-IDENTICAL 40+-NOC lists. The merge rule "union
+directions, keep the longest stop sequence" (store.py:850-856) then lets
+one region's route row evict another's, and `ds_id` records the winner
+only.
+
+Live evidence (index post 19:14Z delta):
+
+```sql
+SELECT key, ds_id FROM routes WHERE key IN (...)
+  Arriva UK Bus|101 -> ds_id=22533   -- Telford pack (stops 3590E*),
+                                     -- 12,220 unique journey stops
+  Arriva UK Bus|301 -> ds_id=15766   -- correct (its row is longest today)
+  Arriva UK Bus|SB4 -> ds_id=15766
+-- stop_to_routes composition for 'Arriva UK Bus|101':
+--   101 rows, ALL '3590%' (Telford), ZERO '2100%' (Shires)
+-- yet ds 15766 still has 72 journeys for route 101, all serving
+--   Stevenage stops (210021203880 AND 210021200011 on every one)
+-- benign contrast: 'Arriva UK Bus|55' -> ds 15954, whose 55 journeys
+--   use 2100* stops too — a same-family registration merge, working
+--   as designed.
+```
+
+So ds 15766's Shires 101 `routes` + `stop_to_routes` rows are displaced
+index-wide by the Telford pack, while its 72 journeys (serving Stop L 72
+times) remain intact — the two layers disagree.
+
+**User-facing impact (all verified):**
+
+- `get_route_stops("Arriva UK Bus", "101")` returns the TELFORD stop
+  list (Princess Royal Hospital → Madeley Centre) — wrong answer with no
+  error; the Shires 101 is unqueryable.
+- `find_routes_between_stops` loses every pair that only the Shires 101
+  serves (returns "No single route serves both") even when
+  `plan_journey` finds direct 101 journeys between the same stops —
+  contradictory answers between tools on the same input.
+- `estimate_live_eta` resolves the route via `routes` → wrong/missing
+  region stop list for `route_stop_coords` → wrong nearest-stop matching
+  or a false "not in the timetable index".
+- **NOT affected** (journey-level, keyed by ds_id): `get_departures_board`,
+  `plan_journey` (direct + one-change), `find_buses_by_arrival_time`.
+
+**Same family, minor:** `stop_to_routes(naptan, key)` has no unique
+constraint/PK, so `INSERT OR IGNORE` is a no-op guard and duplicate rows
+accumulate (e.g. 16 rows for Arriva SB4×stop 210021200005). Cosmetic but
+inflates scans and dedupe work.
+
+## Root cause (file/line refs, HEAD 4def6eb)
+
+1. `server.py:700-701` — `writer.upsert_route(route.operator, …, ds_id)`;
+   `route.operator` is the dataset's `operatorName` (parse_transxchange
+   passes it through; the TXC operator *code* is present in the files but
+   unused for route identity).
+2. `store.py:841` — `key = f"{op}|{num}"`, and `routes.key` is the table's
+   PRIMARY KEY → one row per name+number worldwide.
+3. `store.py:850-856` — cross-dataset merge keeps the longest stop list,
+   silently overwriting `directions`/`stops` (and leaving `ds_id` on the
+   longest-writer) instead of treating different regions as different
+   routes.
+
+## Suggested fix
+
+1. **Make route identity per-dataset(-group).** Key `(op, num, ds_id)` —
+   journeys already carry ds_id, so the planner/boards need no change.
+   NOTE: keying by NOC is NOT viable — 15766 and 22533 share the
+   identical 40+-NOC `loaded_datasets.noc` list, so NOC cannot separate
+   the regions (BODS publishes the NOC list at operator level, not
+   dataset level).
+2. **Merge only within a same-region family** (same op + overlapping
+   stop corpus, or same ds lineage across refreshes): union directions,
+   keep longest sequence — as today. Across regions, keep separate rows.
+   A cheap discriminator: only merge when the incoming stop list shares
+   a meaningful fraction of stops with the stored one (e.g. ≥50%
+   Jaccard), else insert a sibling row.
+3. **Query side:** `get_route_stops`, `find_routes_between`,
+   `resolve_operator`/`route_stop_coords` should treat (op, num) as
+   possibly multi-region: return all matches grouped by region/ds, or
+   prefer the region whose dataset actually contains the queried stops,
+   with an explicit multi-region note rather than a silent pick.
+4. **Add `UNIQUE`/PK on `stop_to_routes(naptan, key)`** and dedupe
+   existing rows in the migration.
+5. **Migration:** existing indexes need re-upserting (delta of affected
+   datasets, or force_refresh) once the key changes; journey data is
+   already correct so boards/planner need nothing.
+
+Regression test sketch:
+
+```python
+# Shires 101 must survive a Telford 101 pack regardless of load order
+out = await get_route_stops(operator="Arriva UK Bus", route="101")
+assert any(s["naptan"].startswith("2100212")
+           for m in out for s in m["stops"]), "Shires 101 displaced"
+
+out = await find_routes_between_stops("210021203880", "210021200011")
+assert any(r["route"] == "101" for r in out), "stop_to_routes lost 101"
+
+# estimate_live_eta must resolve the region that contains the stop
+out = await estimate_live_eta(stop="210021200011",
+                              operator_ref="ARHE", line_ref="101", day="sun")
+assert "not in the timetable index" not in out
+```
+
+## Ops caveat observed during testing (unproven mechanism, low priority)
+
+While the 19:14Z delta was settling (604 MB WAL, last write 20:15), the
+same board query returned different results minutes apart; the current
+gateway's answers are stable and match the raw data. A long-lived MCP
+process pinning a WAL read snapshot can answer from pre-delta state while
+a delta is mid-flight — worth either restarting containers after load
+jobs or documenting that boards can straddle a concurrent delta. (Not
+investigated further per request; flagged for awareness only.)
+
+## Test-log integrity notes (methods used this round)
+
+- Ground truth computed by parsing dataset 15766's TXC directly. Two
+  pitfalls worth recording for future rounds: (a) SB4's day-variant files
+  REUSE `JourneyPatternSection` ids (js_1…) with different runtimes —
+  parse one file at a time or times corrupt; (b) Stop 210021200780
+  (Railway Stop M) appears in the current files ONLY as an
+  `AnnotatedStopPointRef` declaration, never inside timing links → zero
+  board rows at M is CORRECT; any M departures observed earlier were
+  served from pre-delta state (see ops caveat above).
+
+---
+
+# FIX round 6 — cross-region route-row collision (2026-09-14)
+
+`upsert_route` keys route rows per dataset now: `key = op|num|ds_id`
+(store.py). One (operator, route) can carry sibling rows — every Arriva
+region publishes as "Arriva UK Bus", and NOC lists are operator-level
+(byte-identical for ds 15766 vs 22533), so they cannot discriminate the
+regions. Merge semantics (union directions, longest sequence) apply only
+WITHIN one dataset's pack (registration variants across its files).
+
+- `get_route_stops` reports every region sibling (each with `ds_id`).
+- `route_stop_coords(prefer_stops=...)` picks the sibling containing the
+  queried stop (`estimate_live_eta` passes the resolved stop).
+- `resolve_operator` matches on (op, num) columns — identical (name, NOC)
+  across siblings since both are dataset-level metadata.
+- `discard_dataset` purges routes exactly (`routes WHERE ds_id=?` + their
+  s2r refs); the merged-state self-heal workaround and
+  `discard_untagged_for` are gone (untagged journeys purge via
+  `discard_dataset(0)`, as the force_refresh reconcile already did).
+- `stop_to_routes(naptan, key)` gained its PK; ensure_schema runs a
+  one-time, column-gated migration: rekey legacy `op|num` rows via a temp
+  mapping table, drop ds_id=0 rows, rekey s2r, collapse duplicates, sweep
+  orphans, rebuild routes_fts.
+- Migration is intentionally NOT lossless across multi-ds families: only
+  the longest-writer's stop list survived the old merge, so each affected
+  dataset is re-upserted (surgical reload) to restore its own region row.
+
+Live-index blast radius (read-only probe, post 19:14Z delta): 1,164
+(op,route) families shared one row across 328 ds_ids (worst: Stagecoach|1
+merged 12 datasets, First Bus|1 merged 10); stop_to_routes carried 695,022
+rows vs 265,035 distinct pairs (429,987 surplus); Arriva|101 s2r refs were
+2490*/2400* (Shires-area codes) while routes.stops JSON held Telford
+3590* stops — the two layers disagreed ACROSS regions.
+
+Tests: test_region_collision.py (8 regressions: sibling rows either load
+order, s2r discoverability both regions, multi-region get_route_stops,
+prefer_stops, resolve_operator across siblings, exact discard, legacy-DB
+migration + idempotence). 165 passed, secrets-stripped.

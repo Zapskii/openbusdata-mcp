@@ -37,6 +37,18 @@ def test_2_discard_dataset_surgical_purge(writer, store):
     assert 42 not in ids, "ds42 survived purge"
     assert 99 in ids, "collateral damage: ds99 purged too"
     assert store.loaded_dataset_count() == 1
+    # Per-ds route purge: a route row that only ds42 wrote goes, and any
+    # sibling dataset's row survives untouched.
+    writer.upsert_route("Op", "42-only", {"outbound"}, ["010A"], 42)
+    writer.upsert_route("Op", "shared", {"outbound"}, ["010A"], 99)
+    writer.upsert_route("Op", "shared", {"outbound"}, ["010A"], 42)
+    writer.commit()
+    writer.discard_dataset(42)
+    writer.commit()
+    assert not writer.conn.execute(
+        "SELECT 1 FROM routes WHERE key='Op|42-only|42'").fetchone()
+    assert writer.conn.execute(
+        "SELECT 1 FROM routes WHERE key='Op|shared|99'").fetchone()
 
 
 # --- Test 3: purge persists across a fresh connection (restart semantics)
@@ -101,10 +113,11 @@ def test_7_resolve_stop_capped(writer, store):
     assert store.resolve_stop("90599") == {"90599"}, "literal NaPTAN path broken"
 
 
-# --- Test 8: discard keeps routes served by other datasets, self-heals dead ones
+# --- Test 8: discard is exact per dataset — siblings keep their route row
 def test_8_discard_route_semantics(writer, store):
     writer.add_journey("Op", "Shared", "outbound", "JS", {"mon"}, stops(), 99)
     writer.add_journey("Op", "Shared", "outbound", "JS2", {"mon"}, stops(), 42)
+    writer.upsert_route("Op", "Shared", {"outbound"}, ["010A", "010B"], 99)
     writer.upsert_route("Op", "Shared", {"outbound"}, ["010A", "010B"], 42)
     writer.upsert_route("Op", "Gone", {"outbound"}, ["010A"], 42)
     writer.add_journey("Op", "Gone", "outbound", "JG", {"mon"}, stops(), 42)
@@ -112,17 +125,21 @@ def test_8_discard_route_semantics(writer, store):
     writer.commit()
     writer.discard_dataset(42)
     writer.commit()
+    # Route rows are per-ds: ds42's rows go (both of them), ds99's survive.
     assert writer.conn.execute(
-        "SELECT 1 FROM routes WHERE key='Op|Shared'").fetchone(), \
+        "SELECT 1 FROM routes WHERE key='Op|Shared|99'").fetchone(), \
         "route row deleted though ds99 still serves it"
+    assert not writer.conn.execute(
+        "SELECT 1 FROM routes WHERE key='Op|Shared|42'").fetchone()
     assert writer.conn.execute(
-        "SELECT COUNT(*) FROM stop_to_routes WHERE key='Op|Shared'").fetchone()[0] == 2, \
+        "SELECT COUNT(*) FROM stop_to_routes WHERE key='Op|Shared|99'"
+    ).fetchone()[0] == 2, \
         "discoverability lost for a surviving shared route"
     assert writer.conn.execute(
-        "SELECT 1 FROM routes WHERE key='Op|Gone'").fetchone(), \
-        "dead route row should self-heal via re-download, not delete"
+        "SELECT 1 FROM routes WHERE key='Op|Gone|42'").fetchone() is None, \
+        "ds42's dead route row must be purged with its dataset"
     assert not writer.conn.execute(
-        "SELECT 1 FROM stop_to_routes WHERE key='Op|Gone'").fetchone(), \
+        "SELECT 1 FROM stop_to_routes WHERE key='Op|Gone|42'").fetchone(), \
         "dead route still discoverable"
 
 
@@ -256,7 +273,7 @@ def test_17_upsert_route_prunes_stale_refs(writer, store):
     writer.upsert_route("Op", "18", {"outbound"}, ["010A"], 99)
     writer.commit()
     refs = {r[0] for r in writer.conn.execute(
-        "SELECT naptan FROM stop_to_routes WHERE key='Op|18'").fetchall()}
+        "SELECT naptan FROM stop_to_routes WHERE key='Op|18|99'").fetchall()}
     assert refs == {"010A"}, f"stale refs not pruned: {refs}"
 
 

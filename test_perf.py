@@ -43,7 +43,9 @@ def test_27_journey_stop_times_purged_on_discard(writer, store):
     assert writer.conn.execute(
         "SELECT COUNT(*) FROM journey_stop_times WHERE journey_id IN "
         "(SELECT id FROM journeys WHERE ds_id=0)").fetchone()[0] == 1
-    writer.discard_untagged_for("Op2", "27b")
+    # Untagged (ds_id=0) journeys are purged via discard_dataset(0) since the
+    # reconcile pass adopted it; there is no per-op+route entry point anymore.
+    writer.discard_dataset(0)
     assert writer.conn.execute("SELECT COUNT(*) FROM journey_stop_times").fetchone()[0] == 0
 
 
@@ -106,15 +108,15 @@ def test_31_routes_fts_backfill_and_trigger_sync():
     # Drift the index, then re-fire the UPDATE path: routes_fts_au must repair it.
     w2.conn.execute(
         "UPDATE routes_fts SET num='99' WHERE rowid="
-        "(SELECT rowid FROM routes WHERE key='Metrolink|12')")
+        "(SELECT rowid FROM routes WHERE key='Metrolink|12|1')")
     w2.conn.commit()
     w2.upsert_route("Metrolink", "12", {"outbound", "inbound"}, ["010A"], 1)  # UPDATE path
     au = w2.conn.execute(
         "SELECT num, key FROM routes_fts WHERE routes_fts MATCH '12'").fetchall()
-    assert au == [("12", "Metrolink|12")], f"update trigger missing: {au}"
-    # DELETE trigger: discard_dataset leaves route rows in place by design, so
+    assert au == [("12", "Metrolink|12|1")], f"update trigger missing: {au}"
+    # DELETE trigger: discard_dataset purges its own ds's route rows, so
     # delete the route row directly and assert the FTS row follows.
-    w2.conn.execute("DELETE FROM routes WHERE key='Metrolink|12'")
+    w2.conn.execute("DELETE FROM routes WHERE key='Metrolink|12|1'")
     w2.conn.commit()
     assert w2.conn.execute(
         "SELECT COUNT(*) FROM routes_fts WHERE routes_fts MATCH '12'").fetchone()[0] == 0, \

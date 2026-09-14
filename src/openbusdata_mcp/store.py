@@ -220,10 +220,13 @@ class TimetableStore:
 
     def get_route_stops(self, operator: str, route: str,
                         direction: Optional[str] = None) -> list[dict]:
+        """Matches across ALL datasets for (operator, route) — several
+        regions can publish the same name+number (per-ds route rows), and
+        each sibling is reported with its ds_id rather than deduped."""
         fts = _fts_query(f"{route} {operator}".strip())
         if fts:
             rows = self.conn.execute(
-                "SELECT r.op, r.num, r.directions, r.stops FROM routes_fts f "
+                "SELECT r.op, r.num, r.directions, r.stops, r.ds_id FROM routes_fts f "
                 "JOIN routes r ON r.rowid = f.rowid "
                 "WHERE routes_fts MATCH ? ORDER BY rank LIMIT 50", (fts,)).fetchall()
         else:
@@ -231,17 +234,24 @@ class TimetableStore:
         if not rows:  # FTS returned nothing (or query had no tokenizable terms) -> LIKE substring fallback
             q = (f"%{route.lower()}%", f"%{operator.lower()}%")
             rows = self.conn.execute(
-                "SELECT op, num, directions, stops FROM routes "
+                "SELECT op, num, directions, stops, ds_id FROM routes "
                 "WHERE LOWER(num) LIKE ? AND LOWER(op) LIKE ?", q).fetchall()
         matches = []
-        for op, num, directions, stops in rows:
+        seen = set()
+        for op, num, directions, stops, ds_id in rows:
             dirs = json.loads(directions)
             if direction and direction.lower() not in [d.lower() for d in dirs]:
                 continue
             stop_list = json.loads(stops)
+            # FTS can surface several rows of one dataset's pack; collapse
+            # those, but keep every dataset sibling distinct.
+            marker = (op, num, ds_id)
+            if marker in seen:
+                continue
+            seen.add(marker)
             names = self.stop_names_bulk(stop_list)
             matches.append({
-                "operator": op, "route": num,
+                "operator": op, "route": num, "ds_id": ds_id,
                 "directions": sorted(dirs),
                 "stops": [{"naptan": n, "name": names.get(n, "Unknown")}
                           for n in stop_list]})
@@ -518,12 +528,15 @@ class TimetableStore:
         The NOC list is empty for an index built before NOCs were recorded —
         callers must report that rather than sending the name to the datafeed,
         which rejects it with a 400."""
-        row = self.conn.execute(
-            "SELECT r.op, d.noc FROM routes r "
+        rows = self.conn.execute(
+            "SELECT DISTINCT r.op, d.noc FROM routes r "
             "LEFT JOIN loaded_datasets d ON d.ds_id = r.ds_id "
-            "WHERE r.key=?", (f"{operator}|{route}",)).fetchone()
-        if row is not None:
-            return row[0], _split_nocs(row[1])
+            "WHERE r.op=? AND r.num=?", (operator, route)).fetchall()
+        if rows:
+            # One (op, num) can carry several datasets (Arriva regions publish
+            # as one name), but they share the dataset-level operatorName and
+            # NOC list, so the resolution is identical across siblings.
+            return rows[0][0], _split_nocs(rows[0][1])
         # Not a known name: read the input as a NOC. A NOC belongs to a
         # dataset; its routes carry that dataset's operator name. The
         # ','||noc||',' guard makes the LIKE an exact membership test.
@@ -541,15 +554,31 @@ class TimetableStore:
             return None
         return rows[0][0], _split_nocs(rows[0][1])
 
-    def route_stop_coords(self, operator: str, route: str) -> Optional[list]:
+    def route_stop_coords(self, operator: str, route: str,
+                          prefer_stops: Optional[set] = None) -> Optional[list]:
         """The route's ordered stop list with names and coordinates (the
         routes.stops JSON joined to stops). None when the route is unknown.
-        The list is direction-merged (upsert_route keeps the longest sequence)."""
-        row = self.conn.execute(
-            "SELECT stops FROM routes WHERE key=?", (f"{operator}|{route}",)).fetchone()
-        if row is None:
+        The list is direction-merged (upsert_route keeps the longest sequence).
+
+        Route rows are per-dataset, and one (operator, route) can carry
+        several region packs (Arriva regions publish as one operatorName).
+        With several siblings, `prefer_stops` (when given) picks the row
+        whose stop list actually contains one of the queried stops — the
+        region the caller is asking about. Without a preference the choice
+        is ambiguous and the caller reports it."""
+        rows = self.conn.execute(
+            "SELECT stops FROM routes WHERE op=? AND num=?",
+            (operator, route)).fetchall()
+        if not rows:
             return None
-        naptans = json.loads(row[0])
+        stop_lists = [json.loads(r[0]) for r in rows]
+        chosen = stop_lists[0]
+        if len(stop_lists) > 1 and prefer_stops:
+            for lst in stop_lists:
+                if prefer_stops & set(lst):
+                    chosen = lst
+                    break
+        naptans = chosen
         if not naptans:
             return []
         marks = ",".join("?" * len(naptans))
@@ -627,7 +656,8 @@ class TimetableWriter:
         CREATE TABLE IF NOT EXISTS routes (
             key TEXT PRIMARY KEY, op TEXT, num TEXT, directions TEXT,
             stops TEXT, ds_id INT DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS stop_to_routes (naptan TEXT, key TEXT);
+        CREATE TABLE IF NOT EXISTS stop_to_routes (
+            naptan TEXT, key TEXT, PRIMARY KEY (naptan, key));
         CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
         CREATE TABLE IF NOT EXISTS loaded_datasets (
             ds_id INTEGER PRIMARY KEY, modified TEXT, operator TEXT,
@@ -758,6 +788,67 @@ class TimetableWriter:
         if "ds_id" not in cols:
             self.conn.execute(
                 "ALTER TABLE routes ADD COLUMN ds_id INT DEFAULT 0")
+        # Migration: route keys move from global `op|num` (one row per
+        # name+number worldwide — let one region's pack evict another's,
+        # e.g. every Arriva region publishes as "Arriva UK Bus") to
+        # per-dataset `op|num|ds_id`. Column-driven gate (like the v2
+        # journey_stop_times backfill): a legacy key parses as exactly one
+        # '|' with a non-empty, parseable ds_id on the right.
+        legacy = self.conn.execute(
+            "SELECT COUNT(*) FROM routes WHERE "
+            "(LENGTH(key) - LENGTH(REPLACE(key, '|', ''))) = 1").fetchone()[0]
+        if legacy:
+            n_fts = self.conn.execute(
+                "SELECT COUNT(*) FROM routes").fetchone()[0]
+            # Old→new mapping staged in a temp table BEFORE any rekey: the
+            # UPDATE must not read the table it is rewriting (self-referential
+            # UPDATE behavior on the same btree is not something to bet an
+            # 11 GB index on). Single-ds rows keep their recorded ds_id
+            # exactly. Multi-ds families keep the row under the ds_id that
+            # owns it (its longest-writer; that region's stop list survives)
+            # and DROP the sibling regions' rows — their stop lists are
+            # already corrupted by the merge, so re-upserting each affected
+            # dataset (see loader) is what restores the other regions.
+            self.conn.execute(
+                "CREATE TEMP TABLE rekey_map "
+                "(old_key TEXT PRIMARY KEY, new_key TEXT UNIQUE)")
+            self.conn.execute(
+                "INSERT INTO rekey_map (old_key, new_key) "
+                "SELECT key, op || '|' || num || '|' || ds_id FROM routes "
+                "WHERE (LENGTH(key) - LENGTH(REPLACE(key, '|', ''))) = 1")
+            self.conn.execute(
+                "UPDATE routes SET key = "
+                "(SELECT new_key FROM rekey_map WHERE old_key = routes.key) "
+                "WHERE key IN (SELECT old_key FROM rekey_map)")
+            self.conn.execute("DELETE FROM routes WHERE ds_id = 0")
+            # s2r keys follow the rekey; rows with no matching route row are
+            # orphans (stale refs) and are swept below rather than rekeyed.
+            self.conn.execute(
+                "UPDATE OR IGNORE stop_to_routes SET key = "
+                "(SELECT new_key FROM rekey_map WHERE old_key = stop_to_routes.key) "
+                "WHERE key IN (SELECT old_key FROM rekey_map)")
+            self.conn.execute("DROP TABLE rekey_map")
+            self.conn.execute(
+                "DELETE FROM stop_to_routes WHERE key LIKE '%|0'")
+            # Duplicates were legal under the old schema (INSERT OR IGNORE
+            # was a no-op guard) — collapse them.
+            self.conn.execute(
+                "DELETE FROM stop_to_routes WHERE rowid NOT IN "
+                "(SELECT MIN(rowid) FROM stop_to_routes GROUP BY naptan, key)")
+            # Orphan sweep: refs to keys no route row carries.
+            self.conn.execute(
+                "DELETE FROM stop_to_routes WHERE key NOT IN "
+                "(SELECT key FROM routes)")
+            # Rebuild the FTS index: triggers only fire on subsequent DML.
+            self.conn.execute("DELETE FROM routes_fts")
+            self.conn.execute(
+                "INSERT INTO routes_fts(rowid, num, op, key) "
+                "SELECT rowid, num, op, key FROM routes")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('routes_rekeyed', '1')")
+            print(f"[OpenBusData MCP] Route-key migration: rekeyed {n_fts} "
+                  "route rows to per-dataset keys (op|num|ds_id); reload "
+                  "affected datasets to restore their region siblings.")
         # Legacy DBs: loaded_datasets predates NOC storage. Old rows keep the
         # '' default, so resolve_operator reports "no NOC on record" (the
         # caller then asks for a force_refresh) rather than inventing one.
@@ -837,8 +928,17 @@ class TimetableWriter:
 
     def upsert_route(self, op: str, num: str, directions: set, stop_list: list,
                      ds_id: int):
-        """Merge semantics: union directions, keep the longest stop sequence."""
-        key = f"{op}|{num}"
+        """One row per (operator, route number, dataset).
+
+        The BODS `operatorName` is not region-unique (every Arriva region
+        publishes as "Arriva UK Bus", with byte-identical operator-level NOC
+        lists), so keying `op|num` globally let one region's route row evict
+        another's. Merged state (union directions, longest stop sequence)
+        applies only WITHIN a dataset — the loader's repeated calls for one
+        pack are registration variants across its files. Across datasets the
+        rows are siblings, never merged.
+        """
+        key = f"{op}|{num}|{ds_id}"
         dirs_json = json.dumps(sorted(directions))
         stops_json = json.dumps(stop_list)
         row = self.conn.execute(
@@ -925,36 +1025,14 @@ class TimetableWriter:
         self.conn.execute("INSERT INTO stops_fts(stops_fts) VALUES('optimize')")
         self.conn.execute("INSERT INTO routes_fts(routes_fts) VALUES('optimize')")
 
-    def discard_untagged_for(self, op: str, route_num: str):
-        """Remove pre-SQLite-era journeys (ds_id=0) for one operator+route.
-
-        Used when a legacy (untagged) dataset is refreshed: the fresh tagged
-        insert supersedes the old rows, which cannot be purged by ds_id.
-        """
-        self.conn.execute(
-            "DELETE FROM journey_stops WHERE journey_id IN "
-            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
-            (op, route_num))
-        self.conn.execute(
-            "DELETE FROM journey_stop_times WHERE journey_id IN "
-            "(SELECT id FROM journeys WHERE ds_id=0 AND op=? AND route=?)",
-            (op, route_num))
-        self.conn.execute(
-            "DELETE FROM journeys WHERE ds_id=0 AND op=? AND route=?",
-            (op, route_num))
-
     def discard_dataset(self, ds_id: int):
-        """Purge one dataset's journeys + route discoverability (no commit).
+        """Purge one dataset's journeys + route rows exactly (no commit).
 
         Journeys are tagged with their source dataset, so they purge exactly.
-        Route *rows* are merged state across datasets — the ds_id column only
-        records the LAST contributor — so deleting by ds_id would drop routes
-        still served by a surviving dataset. Instead, route rows are left in
-        place and a route with no surviving journeys becomes undiscoverable
-        (its stop_to_routes refs go); it self-heals when a replacement
-        dataset is re-downloaded (upsert keeps the longest stop sequence),
-        and is fully removed by the next full rebuild. The caller owns the
-        transaction: purge + rewrite must commit together.
+        Route rows are per-dataset too (key = op|num|ds_id), so their purge is
+        exact as well: this dataset's rows and stop_to_routes refs go, and
+        sibling datasets serving the same op|num keep theirs. The caller owns
+        the transaction: purge + rewrite must commit together.
         """
         self.conn.execute(
             "DELETE FROM journey_stops WHERE journey_id IN "
@@ -963,9 +1041,12 @@ class TimetableWriter:
             "DELETE FROM journey_stop_times WHERE journey_id IN "
             "(SELECT id FROM journeys WHERE ds_id=?)", (ds_id,))
         self.conn.execute("DELETE FROM journeys WHERE ds_id=?", (ds_id,))
-        # Surviving route keys via an index-only scan on journeys(op, route)
-        # (j_oproute index) instead of a full-table scan + expression eval.
+        # Route rows are per-dataset (key = op|num|ds_id), so the route purge
+        # is exact: this dataset's rows go, sibling datasets serving the same
+        # op|num keep theirs. No merged state, so the old "leave rows in
+        # place and let them self-heal" workaround is gone.
         self.conn.execute(
-            "DELETE FROM stop_to_routes WHERE key NOT IN ("
-            "SELECT op || '|' || route FROM (SELECT DISTINCT op, route FROM journeys))")
+            "DELETE FROM stop_to_routes WHERE key IN "
+            "(SELECT key FROM routes WHERE ds_id=?)", (ds_id,))
+        self.conn.execute("DELETE FROM routes WHERE ds_id=?", (ds_id,))
         self.conn.execute("DELETE FROM loaded_datasets WHERE ds_id=?", (ds_id,))
