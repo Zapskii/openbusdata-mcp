@@ -546,3 +546,17 @@ Tests: test_region_collision.py (8 regressions: sibling rows either load
 order, s2r discoverability both regions, multi-region get_route_stops,
 prefer_stops, resolve_operator across siblings, exact discard, legacy-DB
 migration + idempotence). 165 passed, secrets-stripped.
+
+## Round 6 follow-up (5372d2e): s2r table rebuild
+
+The live index's stop_to_routes table predated the PK — CREATE TABLE IF
+NOT EXISTS cannot retrofit one, so after the first migration's dedupe the
+surgical reload re-accumulated 117,812 duplicate groups (INSERT OR IGNORE
+stayed a no-op guard). Caught by post-reload verification, fixed in
+5372d2e: the migration detects the legacy shape via PRAGMA table_info pk
+flags and rebuilds the table (rename -> create with PK -> DISTINCT copy ->
+drop -> reindex). Live re-run: 695k+ rows -> 357,119 distinct, dup_groups=0,
+orphans=0, PK verified in place. 166 tests pass. Cosmetic known issue: the
+migration's log line says "rekeyed N route rows" where N is the total
+routes count, not the rekeyed subset (rekey is a no-op when already
+migrated; the gate is column-driven so nothing re-corrupts).
